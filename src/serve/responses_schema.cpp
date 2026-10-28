@@ -690,20 +690,6 @@ void reject_server_managed_features(const Json& body) {
                             "text_option_not_supported");
             }
         }
-        if (body.at("text").contains("format") && !body.at("text").at("format").is_null()) {
-            const Json& format = body.at("text").at("format");
-            if (!format.is_object() || !format.contains("type") || !format.at("type").is_string() ||
-                format.at("type").get<std::string>() != "text") {
-                bad_request("only text.format {type:'text'} is supported", "text",
-                            "structured_outputs_not_supported");
-            }
-            for (auto it = format.begin(); it != format.end(); ++it) {
-                if (it.key() != "type") {
-                    bad_request("only text.format {type:'text'} is supported", "text",
-                                "structured_outputs_not_supported");
-                }
-            }
-        }
     }
 }
 
@@ -743,6 +729,13 @@ ResponsesRequest parse_request_impl(const Json& body, const RequestLimits& limit
     parse_tool_choice(body, out);
     parse_reasoning(body, out);
     out.generation.preserve_thinking = parse_openai_preserve_thinking(body);
+    if (body.contains("text") && !body.at("text").is_null() &&
+        body.at("text").contains("format") && !body.at("text").at("format").is_null()) {
+        const Json& format = body.at("text").at("format");
+        out.generation.structured_output =
+            parse_structured_output_format(format, "text.format", false);
+        out.text_format = format;
+    }
 
     if (const std::optional<double> temperature = optional_number(body, "temperature")) {
         if (*temperature < 0.0 || *temperature > 2.0) {
@@ -832,7 +825,7 @@ Json response_common(const std::string& id, std::int64_t created_at,
         {"service_tier", "default"},
         {"store", request.store},
         {"temperature", runtime.temperature},
-        {"text", Json{{"format", Json{{"type", "text"}}}}},
+        {"text", Json{{"format", request.text_format}}},
         {"tool_choice", request.tool_choice},
         {"tools", request.tools},
         {"top_logprobs", 0},

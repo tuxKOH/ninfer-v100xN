@@ -102,6 +102,9 @@ struct ExecutionCore {
     const PeerCore* pipeline = nullptr;
     TokenId* pipeline_upload = nullptr;
     bool volta_long_attention = false;
+    // Structured-output rows for this context's target selection: decode rounds bind row 0 and
+    // prefill binds its own row. Bound into captured graphs; unconstrained rows cost one flag read.
+    TokenConstraintView token_constraints{};
 };
 
 template <class Body>

@@ -271,6 +271,7 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                          &state.mtp_cache, std::span(tp).first(state.execution.peers.size()));
         card.set_pipeline(pipeline_execution(state.execution));
         card.set_volta_long_attention(state.execution.volta_long_attention);
+        card.set_token_constraints(state.execution.token_constraints);
 
         MtpRoundView v = slice_mtp_frame(frame, batch_size);
 

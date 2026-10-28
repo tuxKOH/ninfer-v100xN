@@ -130,6 +130,26 @@ set(BLA_SIZEOF_INTEGER 4)
 set(BLA_PREFER_PKGCONFIG ON)
 find_package(BLAS REQUIRED)
 
+# Grammar-constrained decoding for structured output. Only xgrammar's C++ core is compiled, as a
+# private static library; its own build script (Python bindings, -flto, -Werror) is not used.
+include(FetchContent)
+FetchContent_Declare(xgrammar
+  GIT_REPOSITORY https://github.com/mlc-ai/xgrammar.git
+  GIT_TAG v0.2.8
+  GIT_SHALLOW TRUE
+  GIT_SUBMODULES 3rdparty/dlpack 3rdparty/picojson
+  SOURCE_SUBDIR include)
+FetchContent_MakeAvailable(xgrammar)
+file(GLOB_RECURSE NINFER_XGRAMMAR_SOURCES CONFIGURE_DEPENDS "${xgrammar_SOURCE_DIR}/cpp/*.cc")
+list(FILTER NINFER_XGRAMMAR_SOURCES EXCLUDE REGEX "/cpp/tvm_ffi/.*\\.cc$")
+add_library(xgrammar STATIC ${NINFER_XGRAMMAR_SOURCES})
+target_include_directories(xgrammar PUBLIC "${xgrammar_SOURCE_DIR}/include")
+target_include_directories(xgrammar SYSTEM PUBLIC
+  "${xgrammar_SOURCE_DIR}/3rdparty/picojson"
+  "${xgrammar_SOURCE_DIR}/3rdparty/dlpack/include")
+target_compile_definitions(xgrammar PUBLIC XGRAMMAR_ENABLE_CPPTRACE=0)
+set_target_properties(xgrammar PROPERTIES CXX_STANDARD 17 POSITION_INDEPENDENT_CODE ON)
+
 # --- Subdirectories ----------------------------------------------------------
 add_subdirectory(src)
 if(NINFER_BUILD_APPS)

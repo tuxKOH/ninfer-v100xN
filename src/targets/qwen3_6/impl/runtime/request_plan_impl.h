@@ -106,6 +106,7 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     base->summary.transient_bytes        = 0;
     base->sampling                       = translate_sampling(options.sampling);
     base->allow_prefix_reuse             = options.allow_prefix_reuse;
+    base->grammar                        = options.grammar;
     base->capture_prefix_checkpoints = options.allow_prefix_reuse && prompt.identity.reusable &&
         !prompt.has_media() && ram_kv.gpu_tokens == 0 &&
         speculative_backend != SpeculativeBackend::DFlash &&
@@ -199,6 +200,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     auto plan                         = std::make_unique<RequestPlanImpl>();
     plan->summary                     = base.summary;
     plan->sampling                    = base.sampling;
+    plan->grammar                     = base.grammar;
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
     plan->capture_prefix_checkpoints = base.capture_prefix_checkpoints;

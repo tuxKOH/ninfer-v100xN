@@ -104,6 +104,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/scatter.cu
   ops/launcher/sigmoid_gate_mul.cu
   ops/launcher/silu_and_mul.cu
+  ops/launcher/token_bitmask.cu
   ops/launcher/vision_attention.cu
   ops/launcher/vision_pos_embed.cu
   # Gated DeltaNet Linear Attention core.
@@ -276,6 +277,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/sigmoid_mul.cpp
   ops/wrapper/silu_mul.cpp
   ops/wrapper/sparse_moe.cpp
+  ops/wrapper/token_bitmask.cpp
   ops/wrapper/vision_attention.cpp
   ops/wrapper/vision_pos_embed.cpp)
 if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
@@ -390,7 +392,8 @@ endif()
 add_library(ninfer_engine STATIC
   targets/registry.cpp
   runtime/contract/sampling.cpp
-  runtime/engine/engine.cpp)
+  runtime/engine/engine.cpp
+  runtime/generation/token_grammar.cpp)
 ninfer_internal_includes(ninfer_engine)
 target_include_directories(ninfer_engine PUBLIC ${PROJECT_SOURCE_DIR}/include)
 
@@ -404,7 +407,8 @@ target_link_libraries(ninfer_engine
     ninfer_core
     ninfer_ops
     ninfer_text
-    ninfer_media_decode)
+    ninfer_media_decode
+    xgrammar)
 add_library(ninfer::engine ALIAS ninfer_engine)
 
 if(NINFER_BUILD_SERVE)

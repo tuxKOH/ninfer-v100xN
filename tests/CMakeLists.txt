@@ -94,6 +94,9 @@ ninfer_add_test(ninfer_admission_policy_test SOURCES test_admission_policy.cpp)
 ninfer_add_test(ninfer_kv_capacity_test SOURCES test_kv_capacity.cpp)
 # Host-only: no artifact, no device, no Engine construction. tp2 per-device KV pool sizing (4.1).
 ninfer_add_test(ninfer_kv_capacity_tp2_test SOURCES test_kv_capacity_tp2.cpp)
+ninfer_add_test(ninfer_token_grammar_test
+  SOURCES test_token_grammar.cpp
+  LIBRARIES ninfer_engine)
 ninfer_add_test(ninfer_sampling_defaults_test
   SOURCES test_sampling_defaults.cpp
   LIBRARIES ninfer_engine)
@@ -366,6 +369,7 @@ set(ninfer_op_tests
   scalar
   cast
   scatter
+  token_bitmask
   position)
 foreach(op IN LISTS ninfer_op_tests)
   ninfer_add_op_test(ninfer_${op}_test

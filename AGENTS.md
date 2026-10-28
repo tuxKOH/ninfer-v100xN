@@ -153,6 +153,8 @@ preserving packed bytes alone does not prove absence of end-to-end quality loss.
 
 The five published identities retain Text, image/video Vision, MTP, prefix reuse, CLI,
 OpenAI/Anthropic serving, and measurement through the same public `.ninfer` Engine route.
+OpenAI `response_format` and Responses `text.format` JSON object/schema output is enforced by
+xgrammar grammar masks applied before every None/MTP target selection; DFlash rejects it.
 The GGUF-derived identity uses this same route for Text/MTP and rejects Vision; its retained
 Vision objects are validation-only. The 35B-A3B target additionally supports text-only DFlash.
 Qwen3.8-27B artifacts containing the optional DFlash2 package also support text-only DFlash,

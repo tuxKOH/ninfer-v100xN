@@ -211,6 +211,8 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         limits.default_max_tokens = options_.default_max_tokens;
         limits.max_output_tokens = options_.max_output_tokens;
         request                   = parse_responses_request(parse_json_body(req), limits);
+        restore_schema_order(request.generation.structured_output, req.body,
+                             {"text", "format", "schema"});
         validate_model(request.generation.model, public_model_id_);
         if (request.previous_response_id) {
             const std::shared_ptr<const StoredResponse> previous =

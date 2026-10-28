@@ -217,6 +217,8 @@ The endpoint supports:
 - non-streaming responses and server-sent event streams;
 - `stream_options.include_usage`;
 - function tools, tool choices, assistant tool-call history, and tool-result messages;
+- `response_format` of type `text`, `json_object`, or `json_schema` (see
+  [Structured output](#structured-output));
 - the top-level `reasoning_effort` field;
 - the `enable_thinking` extension;
 - `chat_template_kwargs.preserve_thinking` and the top-level `preserve_thinking` alias.
@@ -233,7 +235,8 @@ artifact template's existing tool/reasoning-instruction composition.
 At startup, NInfer resolves prompt capabilities from the exact `frontend/chat_template.jinja`
 resource embedded in the loaded artifact. It does not infer them from the request's `model` field,
 the artifact identity, or a target profile. A recognized effort-capable template exposes `low`,
-`medium`, and `xhigh`; omitting effort uses that template's declared default. After any
+`medium`, and `xhigh`; omitting effort uses the server's `--reasoning-effort`, or else that
+template's declared default. After any
 protocol-specific mapping described below, an effort not exposed by the loaded template
 returns HTTP 400 with code `reasoning_effort_not_supported` before prompt preparation.
 
@@ -272,6 +275,46 @@ responses return this field in `usage`; streaming clients must request
 
 The token cache-hit rate for this request is `900 / 1000 = 90%`. It is not the fraction of requests
 with a hit. The Responses API reports the same reuse as `usage.input_tokens_details.cached_tokens`.
+
+### Structured output
+
+`response_format` restricts the generated content with grammar-constrained decoding:
+
+```json
+{"type": "json_object"}
+```
+
+```json
+{
+  "type": "json_schema",
+  "json_schema": {
+    "name": "answer",
+    "schema": {
+      "type": "object",
+      "properties": {"city": {"type": "string"}, "population": {"type": "integer"}},
+      "required": ["city", "population"]
+    },
+    "strict": true
+  }
+}
+```
+
+Before every token selection the server masks the vocabulary to tokens that continue a valid
+document, so content is a JSON object (`json_object`) or an instance of the schema (`json_schema`)
+unless the output-token budget ends it first (`finish_reason: "length"`). Every schema is enforced
+regardless of `strict`, properties absent from `properties` are rejected, and properties are
+generated in the schema's order. Whitespace between JSON tokens follows the model, at most 64
+characters per gap. An unusable schema returns HTTP 400 with code `invalid_response_format` before
+prompt preparation. xgrammar compiles masks on the submitting thread; the first structured request
+also builds the tokenizer index once.
+
+Reasoning is not constrained: with thinking enabled, the grammar starts after the model closes its
+reasoning channel, and reasoning still appears in `reasoning_content`. With MTP, drafts the grammar
+rejects are dropped before verification and every verified column is masked, so speculative output
+remains exactly the constrained result. Structured output is unavailable with `--spec dflash`
+(`invalid_response_format`): DFlash drafts are produced and verified inside one device round.
+Decode CUDA Graphs are captured with and without the mask; rounds without a constrained request
+replay the unmasked graphs, so unconstrained throughput is unchanged.
 
 ### Multimodal request
 
@@ -377,7 +420,7 @@ wire response contains typed `output` Items.
 | `reasoning.effort` | `none` disables thinking. On graded Qwen templates, `minimal`/`low` map to `low`, `medium` to `medium`, and `high`/`xhigh`/`max` to `xhigh`. On toggle-only templates, every non-`none` value enables thinking without a graded budget. |
 | `chat_template_kwargs.preserve_thinking` | optional boolean controlling whether closed-turn reasoning remains in reconstructed prompts |
 | `preserve_thinking` | top-level alias for the same option; conflicting values are rejected |
-| `text.format` | omitted or `{"type":"text"}` only |
+| `text.format` | `text`, `json_object`, or flat `json_schema` with `name`, `schema`, `strict`, and `description`; see [Structured output](#structured-output). The response echoes the requested format. |
 | `tools` | flat Responses function definitions; see below |
 | `tool_choice` | `auto` or `none` |
 | `parallel_tool_calls` | omitted or `true` |
@@ -553,9 +596,9 @@ curl http://127.0.0.1:8080/v1/responses/input_tokens \
 ```
 
 Unsupported Create fields include Conversations, prompt templates, context management, hosted
-moderation, prompt-cache controls, safety/user identifiers, Structured Outputs/JSON mode,
-non-empty `include`, background execution, compaction, files/audio, and OpenAI-hosted/MCP/custom
-tools. These are compatibility boundaries, not silently accepted placeholders.
+moderation, prompt-cache controls, safety/user identifiers, non-empty `include`, background
+execution, compaction, files/audio, and OpenAI-hosted/MCP/custom tools. These are compatibility
+boundaries, not silently accepted placeholders.
 
 ## Anthropic Messages
 
@@ -668,6 +711,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--no-thinking` | disable thinking by default | thinking on |
+| `--reasoning-effort low\|medium\|xhigh` | effort for thinking requests that omit one; must be exposed by the loaded template; excludes `--no-thinking` | template default |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--cors` | permissive browser CORS headers | off |
 | `--temperature F` | process-level temperature override | unset |

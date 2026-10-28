@@ -98,3 +98,8 @@ Vendored dependencies retain their own license files under third_party/.
 
 CPU visual encoding uses BLAS (OpenBLAS in the Linux prebuilt package), BSD 3-Clause.
 Copyright (c) 2011-2014, The OpenBLAS Project. License: third_party/licenses/OpenBLAS.txt.
+
+Structured output statically links the C++ core of XGrammar v0.2.8
+(https://github.com/mlc-ai/xgrammar), Copyright (c) 2024 by XGrammar Contributors,
+Apache License, Version 2.0, with its picojson (BSD 2-Clause) and DLPack (Apache-2.0)
+headers. The sources are fetched at configure time and are not modified.

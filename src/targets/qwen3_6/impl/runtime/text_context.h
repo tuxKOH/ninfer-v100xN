@@ -188,6 +188,20 @@ struct PeerExecution {
     }
 };
 
+// Structured-output constraint rows in mapped page-locked host memory, readable by every rank.
+// Row r applies to logit column r of the selection that binds the view.
+struct TokenConstraintView {
+    const std::int32_t* constrained = nullptr; // [rows]
+    const std::uint32_t* bitmask    = nullptr; // [rows, words]
+    std::int32_t words              = 0;
+
+    [[nodiscard]] TokenConstraintView from_row(std::int32_t row) const noexcept {
+        return {constrained + row, bitmask + static_cast<std::size_t>(row) * words, words};
+    }
+
+    [[nodiscard]] explicit operator bool() const noexcept { return constrained != nullptr; }
+};
+
 class TextContext {
 public:
     // `rope_frequency` is the per-RANK YaRN rotary override (see `rope_frequency_` below). It has
@@ -224,6 +238,8 @@ public:
 
     void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }
     void set_volta_long_attention(bool enabled) noexcept { volta_long_attention_ = enabled; }
+    // Applies to target-token selection only: prefill's final token and MTP verification.
+    void set_token_constraints(TokenConstraintView view) noexcept { token_constraints_ = view; }
     void set_rope_delta(std::int32_t delta) noexcept { rope_delta_ = delta; }
     void set_retrieval_query_capture(bool enabled) noexcept { capture_retrieval_query_ = enabled; }
     void set_pipeline(std::optional<PeerExecution> stage, TokenId* upload = nullptr) {
@@ -570,6 +586,10 @@ private:
     const Tensor* active_backend_kv_table_rows_           = nullptr;
     const ops::GqaExecutionEnvelope* active_gqa_envelope_ = nullptr;
     bool volta_long_attention_ = false;
+    TokenConstraintView token_constraints_{};
+    // Masks rows [row_offset,row_offset+valid_rows) of every bound logit column. No-op unbound.
+    void constrain_logits(const Tensor& logits, std::int32_t row_offset, std::int32_t valid_rows,
+                          cudaStream_t stream) const;
     [[nodiscard]] ops::GqaExecutionEnvelope attention_envelope(ops::GqaExecutionEnvelope value) const {
         value.volta_long_attention = volta_long_attention_;
         return value;

@@ -32,6 +32,8 @@ struct ResponsesRequest {
     nlohmann::json metadata    = nlohmann::json::object();
     nlohmann::json tools       = nlohmann::json::array();
     nlohmann::json tool_choice = "auto";
+    // Echoed in the Response object exactly as requested.
+    nlohmann::json text_format = {{"type", "text"}};
     bool store                 = true;
     bool stream                = false;
 };

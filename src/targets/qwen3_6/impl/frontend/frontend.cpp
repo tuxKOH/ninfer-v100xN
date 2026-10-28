@@ -8,6 +8,7 @@
 #include "targets/qwen3_6/impl/frontend/processor.h"
 #include "targets/qwen3_6/impl/frontend/test_access.h"
 #include "targets/qwen3_6/impl/frontend/tokenizer.h"
+#include "runtime/generation/token_grammar.h"
 #include "text/unicode.h"
 
 #include <nlohmann/json.hpp>
@@ -20,6 +21,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -674,6 +676,28 @@ public:
     std::shared_ptr<fi::MediaPreprocessCache> media_cache;
     StopPolicy defaults;
     bool vision_enabled = true;
+
+    // Built on first structured-output request; most Engines never pay for the vocabulary index.
+    [[nodiscard]] const runtime::TokenGrammarCompiler& grammar_compiler() const {
+        std::call_once(grammar_once, [this] {
+            runtime::TokenGrammarVocabulary vocabulary;
+            vocabulary.token_bytes.resize(kTokenDomain);
+            for (int id = 0; id < static_cast<int>(kTokenDomain); ++id) {
+                if (tokenizer->is_valid_token(id) && !tokenizer->is_added_token(id)) {
+                    vocabulary.token_bytes[static_cast<std::size_t>(id)] =
+                        tokenizer->decode_token_bytes(id);
+                }
+            }
+            vocabulary.stop_token_ids = defaults.token_ids;
+            const std::vector<int> close = tokenizer->encode(kThinkClose);
+            if (close.size() == 1) { vocabulary.reasoning_end = close.front(); }
+            grammar = std::make_unique<const runtime::TokenGrammarCompiler>(vocabulary);
+        });
+        return *grammar;
+    }
+
+    mutable std::once_flag grammar_once;
+    mutable std::unique_ptr<const runtime::TokenGrammarCompiler> grammar;
 };
 
 class OutputSession::Impl {
@@ -1086,5 +1110,10 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }
+
+std::shared_ptr<const runtime::CompiledTokenGrammar>
+Frontend::compile_structured_output(const StructuredOutput& output) const {
+    return impl_->grammar_compiler().compile(output);
+}
 
 } // namespace ninfer::targets::qwen3_6

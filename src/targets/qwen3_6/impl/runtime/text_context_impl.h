@@ -26,6 +26,7 @@
 #include "ninfer/ops/mtp_pack.h"
 #include "ninfer/ops/position.h"
 #include "ninfer/ops/proposal_argmax.h"
+#include "ninfer/ops/token_bitmask.h"
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/rope.h"
@@ -826,6 +827,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         Tensor flat_tokens = target_tokens.view({columns});
         ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, flat_hidden, stream);
         ops::linear(flat_hidden, *lm_head_, flat_logits, stream);
+        constrain_logits(flat_logits, 0, kCfg.token_domain, stream);
         ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, stream);
     }
     work_.reset();
@@ -1382,6 +1384,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 Tensor last_xf = xf.slice(1, len - 1, 1);
                 Tensor logits  = matrix_window(io_.logits, 1);
                 ops::linear(last_xf, *lm_head_, logits, s);
+                constrain_logits(logits, 0, kCfg.token_domain, s);
                 // Set io_.pos to the bonus token's absolute position (base + T) before picking so
                 // the sampler RNG is keyed by it (prefill purpose keeps it distinct from the first
                 // decode step, which reuses the same io_.pos).
@@ -2141,6 +2144,14 @@ void TextContext::logits_tp2(
     }
 }
 
+void TextContext::constrain_logits(const Tensor& logits, std::int32_t row_offset,
+                                   std::int32_t valid_rows, cudaStream_t stream) const {
+    if (!token_constraints_) { return; }
+    Tensor view = logits;
+    ops::apply_token_bitmask(view, valid_rows, row_offset, token_constraints_.constrained,
+                             token_constraints_.bitmask, token_constraints_.words, stream);
+}
+
 void TextContext::target_argmax_tp2(
     const std::array<Tensor, kMaximumExecutionDevices>& hidden,
     const std::array<Tensor, kMaximumExecutionDevices>& target_tokens) {
@@ -2186,6 +2197,7 @@ void TextContext::head_argmax_tp(
             if (valid <= 0) { throw std::logic_error("vocabulary shard does not cover token domain"); }
             Tensor value = values[rank].view({columns});
             Tensor index = indices[rank].view({columns});
+            constrain_logits(shards[rank], rank * rows, valid, stream_for(rank));
             ops::argmax_with_value(shards[rank], value, index, valid, stream_for(rank));
         });
     }
@@ -2371,6 +2383,7 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
             CUDA_CHECK(cudaSetDevice(ctx_.device));
             ops::set_i32_scalar(io_.pos, base_i + T, ctx_.stream);
             ops::set_i32_scalar(io_.rope_pos, base_i + T + rope_delta_, ctx_.stream);
+            constrain_logits(logits, 0, kCfg.token_domain, ctx_.stream);
             if (sampling_config_ != nullptr) {
                 ops::sample(logits, io_.token, kCfg.token_domain, sampling_config_, io_.pos,
                             ops::kSamplePurposePrefill, work_, ctx_.stream);
@@ -2931,6 +2944,7 @@ void TextContext::target_verify_batch(const std::array<Tensor, kMaximumExecution
             for_each_rank(execution, [&](int rank) {
                 const auto r       = static_cast<std::size_t>(rank);
                 Tensor flat_tokens = target_tokens[r].view({columns});
+                constrain_logits(flat_logits[r], 0, kCfg.token_domain, stream_for(rank));
                 ops::argmax(flat_logits[r], flat_tokens, kCfg.token_domain, stream_for(rank));
             });
         }
