@@ -1275,6 +1275,23 @@ MTP autoregressively 推进 proposal positions，每个 position 都在全部 ac
 DFlash 通过一次 batched block forward 产生 proposal block。二者的区别只存在于选定的 decode graph
 内部，不改变 slot、admission、scheduling 或 active-batch formation。
 
+SM70 TP2 NVFP4 的 dense projections 可把 verifier 的 request/column 维展平为 `T` 行，共享一次
+packed activation supply。现有 QPN 权重布局的 attention/GDN input、gate/up 和 contraction shapes
+在 `9 <= T <= 64` 使用批量 kernel；gate/up 在同一 CTA 中完成 SwiGLU，不为这个批次展开整块权重。
+kernel 保留八个 logical K partitions，以较少 physical warps 分阶段执行，并按 logical partition
+顺序进行 FP32 归约。normal/fast scale profile 和 BF16 projection/SwiGLU 边界保持原有定义。
+T33..40 的 paired gate/up 由 output owner 在寄存器保留跨 phase 的 carry，使四个 physical
+K warps 在每 block 48 KiB shared 上限内执行；它不改变八个 logical partitions 的求和顺序。
+这不合并各请求的 KV、GDN state 或 acceptance；`T <= 8` 和其他 TP geometry 继续使用各自的
+既有 kernel。此前 `T > 32` 的部分路径使用 CUTLASS，其归约顺序与本批量 kernel 不同；不能据此
+宣称跨实现的 logits 或生成输出逐位一致。
+
+Direct-P2P SM70 TP2 为这个批次固定预留每 channel 640 KiB 的双 epoch mailbox，覆盖
+`D5120/T1..64`。Row-parallel contraction 先保留 projection 的 BF16 舍入，rank 0 再加入
+residual 并舍入到 BF16，随后直接发布 contribution；消费者保持 BF16 sum 边界并融合 RMSNorm。
+Mailbox、epoch 和 activation scratch 均由启动时的 domain/workspace 持有；round 内不分配存储。
+TP4 和 mapped-host TP2 仍使用各自原有的 80 KiB channel，不继承这个 TP2 容量。
+
 MTP 与 DFlash 保留各自的 proposal frame、proposal state 和 graph topology；它们只共用 non-owning target
 verify/accept view、per-row accepted-prefix result 和 target state transaction。并发层不建立隐藏 backend
 差异的 virtual interface，也不为两个 backend 维护两套 membership 或 commit loop。

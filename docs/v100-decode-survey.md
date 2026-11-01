@@ -1,6 +1,6 @@
 # V100 decoding 优化：公开项目调研与借鉴清单
 
-调研日期：2026-10-18；源码与试验更新至 2026-10-23。对象是本工作区的 **2 × V100-SXM2 16 GB、CUDA 12.8、SM70、单请求 decoding**；本机使用 **PCIe P2P，没有 NVLink**。远端 TP4/NVLink 单独看待。
+调研日期：2026-10-18；源码与试验更新至 2026-11-02。对象是本工作区的 **2 × V100-SXM2 16 GB、CUDA 12.8、SM70**，本轮新增 QUASAR/MTP4 的 TP2 并发优化；本机使用 **PCIe P2P，没有 NVLink**。远端 TP4/NVLink 单独看待。
 
 本报告回答“读哪些项目、借鉴什么、落到哪里、如何判断值得保留”。它是研究结论，不修改现行产品契约，也不表示候选已经移植或在本机测得收益。检索覆盖 GitHub 仓库搜索、公开搜索引擎、上游引用及相关分支；下列为本轮能够核实的公开项目，不作全网穷尽声明。
 
@@ -73,6 +73,35 @@ GDN 小 value tile 初测 197.308、复测 197.614 / 197.698，已与尾部融�
 QPN 和 packet 变体均在第 130 个输出首次发生差异，因此也不作为无损方案推荐。
 本轮没有运行 GPQA。整数映射融合没有新增浮点运算；GDN 保留逐列 FP32 状态更新、
 归约与 BF16 边界，没有引入新的低精度配置。原有实验性 profile 的数值影响仍然存在。
+
+### TP2 并发源码借鉴（2026-11-02）
+
+本轮实际读取 1Cat 的 `csrc/sm70_turbomind/ops/nvfp4_qpn2_sm70.cu`、
+`csrc/custom_all_reduce.cuh` 和 `docs/design/sm70_dflash2_long_batch_20260927.md`，
+并将适合本地 TP2/MTP4 的机制落到算子层：
+
+- **批次共享 activation supply**：BF16 activation 一次打包为 K-major FP16，供 output CTAs
+  复用；权重仍直接消费已有 QPN codes/scales，没有整块 FP16 权重展开或第二份常驻权重。
+- **分阶段 K 调度及 gate/up 配对**：T9..64 的真实 TP2 attention/GDN、MLP 和 contraction
+  shapes 使用八个 logical K partitions，物理 warps 按形状选择；gate/up 在同 CTA 输出 SwiGLU。
+  保留 normal/fast scale profile、原有 BF16 输出边界，各请求的状态和 acceptance 独立。
+- **批量 projection→packet→sum/norm**：direct-P2P TP2 的双 epoch channel 扩到 640 KiB，
+  使 D5120/T1..64 不再因原 80 KiB 上限退回多步路径。生产者保留 BF16 contribution 边界，
+  直接发布 mailbox，消费者融合 sum/RMSNorm；其他 TP domain 和 mapped-host 容量保持原值。
+
+独立 FP64 算子 oracle、输入/权重只读与 guard 检查、changing-input Graph、真实模型 C2/C4/C8
+的 normal/longfast、greedy/mixed Graph/eager 完整输出及投机计数检查均通过。
+T>32 的旧 CUTLASS 路径与新 batch 归约不同，八并发实测已出现输出/acceptance 差异；
+不能称为逐位无损，也不能把全部吞吐变化归因于纯 kernel 时间。当前组合未跑新 GPQA。
+[前后吞吐、共同 decode 窗口与完整条件](performance.md#tp2-concurrent-packed-batch-decode-2026-11-02)。
+
+1Cat 文档中的 C1/C4/C8 为 159.324/429.134/624.863 tok/s，扩展倍率约 2.69×/3.92×，
+但它使用四张 32 GB V100、TP4、DFlash2 q7、FP16/E4M3 KV、32K 输入及 client all-live 窗口；
+本轮为双张 16 GB、TP2/MTP4、BF16/INT8-G64。这里只借鉴机制与扩展趋势，没有实际运行
+同机 1Cat，不将异条件数字作为已追平的结论。来源及 MIT/Apache notice 记录在 `NOTICE`。
+
+批量 attention 的 KV/head 复用、GDN 周边、W8 proposal/head 以及混合 prefill/decode 调度仍可
+继续优化；本轮采用 batch projection 和 packet 并不表示这些方向已经耗尽。
 
 ### TP4 源码复核（2026-10-23）
 

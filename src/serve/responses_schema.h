@@ -29,6 +29,10 @@ struct ResponsesRequest {
 
     std::optional<std::string> instructions;
     std::optional<std::string> previous_response_id;
+    // Client affinity/display hints. Cache correctness is still determined by
+    // actual prompt tokens; Qwen emits raw reasoning, not an extra summary.
+    std::optional<std::string> prompt_cache_key;
+    std::optional<std::string> reasoning_summary;
     nlohmann::json metadata    = nlohmann::json::object();
     nlohmann::json tools       = nlohmann::json::array();
     nlohmann::json tool_choice = "auto";

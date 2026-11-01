@@ -17,6 +17,24 @@ benchmark-report, and external protocol behavior. Repository verification princi
 
 ## Organization
 
+`ninfer_tokenizer_control_test` is a self-contained CPU regression for #6. It interrupts live
+repetitive BPE work with both cancellation and deadlines, exercises `prepare`, retrieval-query,
+`count_tokens` and the processor's text encoder, and checks unchanged successful token IDs.
+`ninfer_responses_schema_test` includes DSH's cache/reasoning hints, raw reasoning replay and SSE
+Item lifecycle alongside the existing tools, continuation and capability-rejection contracts.
+
+`ninfer_nvfp4_volta_batch_test` checks TP2 dense batch projections and paired SwiGLU against
+independent FP64 oracles, covering T=9..64 tile boundaries and normal/fast scale profiles.
+`ninfer_nvfp4_row_add_sm70_test` checks the contraction/packet/sum/norm path through T=64,
+including changing-input Graph replay, guards and exact composition at its BF16 boundaries.
+The opt-in `ninfer_qwen3_8_27b_v100x2_real_test --mtp-batches` mode checks real QUASAR MTP4
+C2/C4/C8, normal and long/fast, greedy and mixed sampling, with complete Graph/eager output IDs
+and speculative counters. It also requires the requested full batch to have executed.
+`ninfer_gdn_tp4_decode_test` additionally covers prepacked TP4 normal/fast projection at
+T=1/2/4/5/6/8 and masked record/convolution at T>=2. Its FP64 oracle applies the record
+interface's observable BF16 projection boundary; exact composed-route, read-only state,
+record/history and masked-zero checks supplement that oracle. It requires four CUDA devices.
+
 SM70 NVFP4 input checks use independent host QPN encoding and FP64 logical projection oracles
 at TP1/TP2 shapes, including QPN/wide-CUTLASS boundaries and graph replay. Run
 `ctest -R '^ninfer_nvfp4_(input_sm70|gdn_.*)_test$'` for projection, snapshot-state, masked

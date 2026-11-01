@@ -18,10 +18,14 @@ def main():
     parser.add_argument('--corpus', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--output-tokens', type=int, default=512)
+    parser.add_argument('--input-tokens', type=int, nargs='+', default=[2048, 16384, 85000],
+                        choices=[2048, 16384, 85000])
+    parser.add_argument('--concurrency', type=int, nargs='+', default=[1, 2, 4, 8],
+                        choices=[1, 2, 4, 8])
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
-    for length in (2048, 16384, 85000):
-        for concurrency in (1, 2, 4, 8):
+    for length in args.input_tokens:
+        for concurrency in args.concurrency:
             key = f'{length}-c{concurrency}'
             report = args.output / f'{key}.json'
             if report.exists():

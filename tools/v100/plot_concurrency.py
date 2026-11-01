@@ -3,6 +3,7 @@
 import argparse
 import json
 from pathlib import Path
+import textwrap
 
 import matplotlib
 matplotlib.use('Agg')
@@ -14,6 +15,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--input', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--baseline', type=Path,
+                        help='Compare matching saved cases from a preceding implementation')
     parser.add_argument('--incomplete-reason',
                         help='Allow missing cases and publish this explanation alongside the chart')
     args = parser.parse_args()
@@ -43,6 +46,29 @@ def main():
             row['accepted_drafts'] = sum(request['accepted'] for request in source['requests'])
             row['proposed_drafts'] = sum(request['drafted'] for request in source['requests'])
             row['cached_tokens'] = sum(request['cached_tokens'] for request in source['requests'])
+            if args.baseline:
+                baseline = json.loads((args.baseline / path.name).read_text())
+                for key in ('input_tokens', 'concurrency', 'output_tokens_per_request', 'tp',
+                            'kv_capacity', 'mtp_drafts', 'graphs', 'prefill_chunk',
+                            'prefill_decode_rounds', 'long_attention', 'fast_decode', 'prefix_reuse'):
+                    if baseline[key] != source[key]:
+                        raise ValueError(f'baseline configuration mismatch for {key} in {path}')
+                if len(baseline['requests']) != concurrency:
+                    raise ValueError(f'incomplete baseline in {path}')
+                pairs = list(zip(source['requests'], baseline['requests']))
+                row['baseline'] = {
+                    'total_decode_tok_s': baseline['total_decode_tok_s'],
+                    'all_live_sampled_tok_s': baseline.get('all_live_sampled_tok_s'),
+                    'group_output_tok_s': baseline['group_output_tok_s'],
+                    'mean_decode_batch': baseline['mean_decode_batch'],
+                    'accepted_drafts': sum(request['accepted'] for request in baseline['requests']),
+                    'proposed_drafts': sum(request['drafted'] for request in baseline['requests']),
+                }
+                row['decode_speedup'] = source['total_decode_tok_s'] / baseline['total_decode_tok_s']
+                row['output_ids_equal'] = all(
+                    actual['generated_token_ids'] == old['generated_token_ids'] for actual, old in pairs)
+                row['speculative_counters_equal'] = all(
+                    actual[key] == old[key] for actual, old in pairs for key in ('accepted', 'drafted'))
             rows.append(row)
     summary = {
         'hardware': '2 x Tesla V100-SXM2 16 GB, PCIe P2P, no NVLink',
@@ -53,6 +79,9 @@ def main():
                   'committed tokens excluding each first output divided by summed executor '
                   'decode-round wall time, including commit/publication and excluding prefill. '
                   'Group output throughput includes prefill and queue time. '
+                  'All-live sampled throughput uses complete 10ms sample intervals inside all '
+                  'requests\' common decode lifetime, including any intervening stalls; it is '
+                  'not HTTP streaming timing. '
                   '180000 shared KV tokens can limit actual active requests.',
         'quality': 'Speed only; long attention and fast decode can change output. No new GPQA.',
         'completed_cases': len(rows),
@@ -60,6 +89,11 @@ def main():
         'missing_cases': missing,
         'cases': rows,
     }
+    if args.baseline:
+        summary['comparison'] = 'Same-host preceding implementation, one cold group per case. '
+        summary['comparison'] += ('Changed output IDs or draft acceptance prevent attributing the entire '
+                                  'speed difference to kernel execution alone. The new T>32 batch '
+                                  'reduction differs from the former CUTLASS path. No new GPQA.')
     (args.output / 'quasar-concurrency.json').write_text(json.dumps(summary, indent=2) + '\n')
     plt.rcParams.update({'font.family': 'DejaVu Sans', 'font.size': 10,
                          'axes.spines.top': False, 'axes.spines.right': False,
@@ -72,8 +106,16 @@ def main():
         x = [row['concurrency'] for row in cases]
         y = [row['total_decode_tok_s'] for row in cases]
         axes[0].plot(x, y, 'o-', label=label, color=color, linewidth=2)
+        if args.baseline:
+            axes[0].plot(x, [row['baseline']['total_decode_tok_s'] for row in cases],
+                         '--', color=color, linewidth=1.3, alpha=0.65)
         for a, b in zip(x, y):
             offset = -16 if (length == 16384 and a == 1) or (length == 85000 and a == 2) else 10
+            if args.baseline:
+                if length == 16384 and a in (1, 2):
+                    offset = -18
+                elif length == 85000:
+                    offset = 28 if a == 1 else -30
             axes[0].annotate(f'{b:.1f}', (a, b), xytext=(0, offset),
                              textcoords='offset points', ha='center', fontsize=9, color=color)
         axes[1].plot(x, [row['group_output_tok_s'] for row in cases], 'o-',
@@ -95,9 +137,12 @@ def main():
         axis.legend(frameon=False)
     fig.suptitle('QUASAR NVFP4 / TP2 / MTP4 — 2 × V100 16 GB', fontsize=14)
     footer = '180K shared KV · 512 output tokens/request · long attention + fast decode · one cold group/case'
+    if args.baseline:
+        footer += '\nSolid: current · Dashed: preceding implementation · output/acceptance may differ'
     if missing:
-        footer += '\nIncomplete: ' + ', '.join(
-            f"{row['input_tokens'] / 1000:g}K/c{row['concurrency']}" for row in missing) + ' unavailable; ' + args.incomplete_reason
+        note = 'Not measured in this campaign: ' + ', '.join(
+            f"{row['input_tokens'] / 1000:g}K/c{row['concurrency']}" for row in missing) + '; ' + args.incomplete_reason
+        footer += '\n' + '\n'.join(textwrap.wrap(note, width=140))
     fig.supxlabel(footer,
                   fontsize=9)
     svg = args.output / 'quasar-concurrency.svg'

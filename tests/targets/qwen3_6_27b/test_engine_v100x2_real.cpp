@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -33,6 +34,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -193,26 +195,50 @@ void compare_rounds(const ninfer::GenerationResult& captured,
 }
 
 void exercise_mtp_batches(const char* artifact, ninfer::SpeculativeOptions profile,
-                           const std::array<Tokens, kProbes>& inputs) {
-    std::array<std::array<ninfer::GenerationResult, 2>, 2> captured;
+                           const std::array<Tokens, kProbes>& inputs,
+                           unsigned concurrency = 2, bool long_fast = false) {
+    std::array<std::array<ninfer::GenerationResult, 8>, 2> captured;
+    const unsigned outputs = concurrency > 2 ? 128 : kOutputs;
     for (bool graphs : {true, false}) {
         auto options = engine_options(artifact, true, graphs, profile);
-        options.max_concurrency = 2;
-        options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(2 * kContext);
+        options.max_concurrency = concurrency;
+        options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(concurrency * kContext);
+        options.volta_long_attention = long_fast;
+        options.volta_fast_decode = long_fast;
         ninfer::Engine engine(options);
         engine.debug_enable_peer_egress_check(true);
         for (std::size_t mixed = 0; mixed < 2; ++mixed) {
-            auto first = engine.prepare_tokens(inputs[0], false);
-            auto second = engine.prepare_tokens(inputs[1], false);
+            std::vector<ninfer::PreparedPrompt> prepared;
+            for (unsigned lane = 0; lane < concurrency; ++lane) {
+                prepared.push_back(engine.prepare_tokens(inputs[lane % inputs.size()], false));
+            }
             const auto before = engine.runtime_stats();
-            auto a = engine.submit(std::move(first), request_options(kOutputs));
-            auto b = engine.submit(std::move(second), mixed ? sampled_options() : request_options(kOutputs));
-            std::array<ninfer::GenerationResult, 2> results{a.wait(), b.wait()};
+            std::vector<ninfer::GenerationHandle> handles;
+            for (unsigned lane = 0; lane < concurrency; ++lane) {
+                auto request = mixed && lane % 2 ? sampled_options() : request_options(outputs);
+                request.execution.requested_output_tokens = outputs;
+                handles.push_back(engine.submit(std::move(prepared[lane]),
+                                                request));
+            }
+            unsigned peak_ready = 0;
+            std::jthread observer([&](std::stop_token stop) {
+                while (!stop.stop_requested()) {
+                    peak_ready = std::max(peak_ready, engine.runtime_stats().decode_ready_requests);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            });
+            std::vector<ninfer::GenerationResult> results;
+            for (auto& handle : handles) { results.push_back(handle.wait()); }
+            observer.request_stop();
+            observer.join();
             const auto after = engine.runtime_stats();
+            require(peak_ready == concurrency, "MTP batch probe did not reach its full batch");
             require(after.decode_row_rounds - before.decode_row_rounds >
                         after.decode_rounds - before.decode_rounds,
                     "greedy/mixed MTP probe did not execute a multi-row decode round");
-            for (std::size_t lane = 0; lane < 2; ++lane) {
+            for (unsigned lane = 0; lane < concurrency; ++lane) {
+                require(results[lane].generated_token_ids.size() == outputs,
+                        "MTP batch probe ended before its output budget");
                 require_speculation(results[lane], profile);
                 if (graphs) {
                     captured[mixed][lane] = std::move(results[lane]);
@@ -223,7 +249,8 @@ void exercise_mtp_batches(const char* artifact, ninfer::SpeculativeOptions profi
         }
         v100x2_test::check_peer_egress(engine, profile.backend);
     }
-    std::cout << "MTP B=2 greedy/mixed graph/eager outputs and acceptance PASS" << std::endl;
+    std::cout << "MTP B=" << concurrency << (long_fast ? " long/fast" : " normal")
+              << " greedy/mixed graph/eager outputs and acceptance PASS" << std::endl;
 }
 
 int exercise(const char* artifact, ninfer::SpeculativeOptions profile) {
@@ -469,7 +496,8 @@ int exercise_long_attention(const char* artifact, ninfer::SpeculativeOptions pro
 int main(int argc, char** argv) {
     const bool long_attention = argc == 2 && std::string(argv[1]) == "--long-attention";
     const bool long_fast = argc == 2 && std::string(argv[1]) == "--long-fast-decode";
-    if (argc != 1 && !long_attention && !long_fast) { return 2; }
+    const bool batches = argc == 2 && std::string(argv[1]) == "--mtp-batches";
+    if (argc != 1 && !long_attention && !long_fast && !batches) { return 2; }
     const char* artifact = std::getenv("NINFER_V100X2_ARTIFACT");
     if (artifact == nullptr || *artifact == '\0') {
         std::cout << "skip: NINFER_V100X2_ARTIFACT is not set\n";
@@ -483,6 +511,23 @@ int main(int argc, char** argv) {
     }
     try {
         const auto profile = v100x2_test::profile(ninfer::ProposalHead::Full);
+        if (batches) {
+            require(v100x2_test::tp() == 2 && v100x2_test::pp() == 1 &&
+                        profile.backend == ninfer::SpeculativeBackend::Mtp,
+                    "batch gate requires TP2/PP1 MTP");
+            std::array<Tokens, kProbes> inputs;
+            {
+                ninfer::Engine engine(engine_options(artifact, true, false, profile));
+                v100x2_test::check_identity(engine);
+                inputs = prompts(engine);
+            }
+            for (bool fast : {false, true}) {
+                for (unsigned concurrency : {2U, 4U, 8U}) {
+                    exercise_mtp_batches(artifact, profile, inputs, concurrency, fast);
+                }
+            }
+            return 0;
+        }
         return long_attention || long_fast
             ? exercise_long_attention(artifact, profile, long_fast) : exercise(artifact, profile);
     } catch (const std::exception& error) {

@@ -478,7 +478,7 @@ void linear_add_row_parallel(std::span<const Tensor> x, std::span<const Weight> 
         return;
     }
     bool out_of_place_qpn = ec.device_count == 2 && policy == LinearPolicy::A16Only &&
-                            x[0].ne[1] <= 8;
+                            x[0].ne[1] <= 64;
     for (int rank = 0; rank < ec.device_count; ++rank) {
         out_of_place_qpn &= ec.dev[rank]->sm() == 70 && w[rank].qtype == QType::NVFP4 &&
                             w[rank].layout == QuantLayout::VoltaQpnPrepacked &&
@@ -495,7 +495,8 @@ void linear_add_row_parallel(std::span<const Tensor> x, std::span<const Weight> 
             }
         }
         bool publish = norm != nullptr && norm->weight.size() == 2 &&
-                       norm->output.size() == 2 && events.packet_storage(0) != nullptr;
+                       norm->output.size() == 2 && events.packet_storage(0) != nullptr &&
+                       staging[0].bytes() <= events.packet_capacity_bytes();
         if (publish) {
             for (int rank = 0; rank < 2; ++rank) {
                 publish &= aligned_to(staging[rank].data, 16) &&
@@ -509,7 +510,7 @@ void linear_add_row_parallel(std::span<const Tensor> x, std::span<const Weight> 
                 detail::nvfp4_linear_add_qpn_publish(x[rank], w[rank],
                     rank == 0 ? residual[rank] : Tensor{}, staging[rank], *workspace[rank],
                     events.packet_storage(rank), events.packet_storage(1 - rank),
-                    PeerEvents::kPacketMaxBytes, ec.dev[rank]->stream);
+                    events.packet_capacity_bytes(), ec.dev[rank]->stream);
             } else if (rank == 0) {
                 detail::nvfp4_linear_add_qpn_to(x[rank], w[rank], residual[rank], staging[rank],
                                                *workspace[rank], ec.dev[rank]->stream);

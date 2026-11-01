@@ -368,6 +368,7 @@ wire response contains typed `output` Items.
 | `input` | required string or non-empty typed Item array |
 | `instructions` | optional string, inserted before the reconstructed conversation for this request only |
 | `previous_response_id` | optional ID of a retained local Response |
+| `prompt_cache_key` | optional string/null, echoed as a client affinity hint; actual reuse still requires matching prompt tokens and complete state |
 | `max_output_tokens` | integer at least `16`; default is `--default-max-tokens` |
 | `stream` | boolean; `true` selects Responses SSE rather than a JSON body |
 | `store` | boolean, default `true`; controls local retrieval and continuation state |
@@ -375,6 +376,7 @@ wire response contains typed `output` Items.
 | `top_p` | finite number in `[0,1]` |
 | `metadata` | at most 16 string pairs; keys at most 64 characters and values at most 512 |
 | `reasoning.effort` | `none` disables thinking. On graded Qwen templates, `minimal`/`low` map to `low`, `medium` to `medium`, and `high`/`xhigh`/`max` to `xhigh`. On toggle-only templates, every non-`none` value enables thinking without a graded budget. |
+| `reasoning.summary` | optional `auto`, `concise`, `detailed`, or null; accepted/echoed as a client preference. Local Qwen emits raw `reasoning_text` with an empty summary, without a separate summarization pass. |
 | `chat_template_kwargs.preserve_thinking` | optional boolean controlling whether closed-turn reasoning remains in reconstructed prompts |
 | `preserve_thinking` | top-level alias for the same option; conflicting values are rejected |
 | `text.format` | omitted or `{"type":"text"}` only |
@@ -385,7 +387,7 @@ wire response contains typed `output` Items.
 | `top_logprobs` | omitted or `0` |
 | `service_tier` | omitted, `auto`, or `default`; the response reports `default` |
 | `background` | omitted or `false` |
-| `include` | omitted or an empty array |
+| `include` | omitted, empty, or containing `reasoning.encrypted_content`; local reasoning Items report `encrypted_content:null` and remain replayable through raw content |
 | `stream_options` | omitted or `{"include_obfuscation":false}` |
 
 Unknown top-level fields fail with `unknown_parameter`. Recognized but unsupported features fail
@@ -393,7 +395,14 @@ with a field-specific 400 error instead of being silently ignored.
 
 For example, use `"reasoning":{"effort":"high"}` in a Responses request. This is a local
 mapping to the checkpoint's template controls, not an OpenAI-equivalent reasoning token budget.
-The response echoes the requested effort. `reasoning.summary` remains unsupported.
+The response echoes the requested effort and optional summary preference. DSH's Responses
+provider can send `prompt_cache_key`, `reasoning.summary:auto` and
+`include:["reasoning.encrypted_content"]` without a capability error. NInfer supplies raw Qwen
+reasoning; it does not generate a separate summary or OpenAI encrypted state. Clients must replay
+the raw reasoning Item for stateless `store:false` continuations. Non-null incoming ciphertext and
+non-empty incoming summaries remain unsupported. `prompt_cache_key` neither partitions the local
+cache nor bypasses exact-prefix/state validation; omission/null and empty strings are accepted.
+Retention is still governed by the server's prefix-cache budgets, not by this hint.
 
 ### Input Item contract
 
@@ -766,6 +775,11 @@ CPU/media preparation and completed model results whose response has not yet bee
 capacity returns HTTP 429 with code `server_overloaded`. The absolute
 `--pending-timeout-ms` deadline starts before preparation, covers media acquisition and Engine FIFO
 waiting, and returns HTTP 503 with code `request_queue_timeout` if admission does not occur in time.
+Tokenization cooperatively polls this same deadline and client cancellation during added-token,
+word/byte and BPE candidate scans, including retrieval-query and rewrite-prefix encoding.
+An interrupted preparation unwinds immediately without submitting partial tokens to the GPU;
+it does not wait for a degenerate BPE word to finish. This is cooperative cancellation, not a
+hard real-time bound on allocations or individual Unicode-library calls.
 There is no admission ETA or unbounded overflow queue.
 
 When prefill and decode are both runnable, `--prefill-decode-rounds N` runs up to `N`

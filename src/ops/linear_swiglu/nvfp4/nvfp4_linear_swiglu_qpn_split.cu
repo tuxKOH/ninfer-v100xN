@@ -1,6 +1,7 @@
 #include "core/device.h"
 #include "core/tensor.h"
 #include "ops/linear/nvfp4/nvfp4_launch.h"
+#include "ops/linear/nvfp4/nvfp4_volta_batch.cuh"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_qpn_split.cuh"
 
 #include <cuda_bf16.h>
@@ -23,6 +24,20 @@ __global__ void bf16_to_fp16_kernel(const __nv_bfloat16* __restrict__ input,
 bool nvfp4_linear_swiglu_qpn_split_supported(std::int32_t n, std::int32_t k,
                                               std::int32_t t) noexcept {
     return n > 0 && (n % 256) == 0 && nvfp4_volta_qpn_supported(n / 2, k, t);
+}
+
+void nvfp4_linear_swiglu_batch_launch(const Tensor& x, const Weight& weight, Tensor& out,
+                                      WorkspaceArena& workspace, cudaStream_t stream) {
+    const int intermediate = weight.n / 2;
+    if (out.dtype == DType::FP16) {
+        launch_nvfp4_volta_batch_output<true>(
+            x, weight, Nvfp4PairedSwiGluOutput<true>{out.data, intermediate},
+            intermediate, workspace, stream);
+    } else {
+        launch_nvfp4_volta_batch_output<true>(
+            x, weight, Nvfp4PairedSwiGluOutput<false>{out.data, intermediate},
+            intermediate, workspace, stream);
+    }
 }
 
 void nvfp4_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight, Tensor& out,

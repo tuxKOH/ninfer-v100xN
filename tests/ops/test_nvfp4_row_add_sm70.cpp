@@ -194,8 +194,13 @@ int run(const ExecutionContext& ec, const ops::PeerEvents& events, int k, int to
                         (1.0 + double(r.norm_weight[row]));
                 }
             }
+            // Use the collective RMSNorm contract: BF16 round-to-nearest alone
+            // can incur up to 1/256 relative error. The old 0.0034 gross bound
+            // rejected even the nearest representable output for wide fixtures
+            // (for example 4.17179 -> 4.15625). Keep the existing L2 bound and
+            // exact comparison with the separately composed BF16 sum/norm below.
             failures += verify_reduction((label + " norm FP64").c_str(), norm_values,
-                                           norm_oracle, ReductionCriterion{1.85e-3, 1e-5, 3.4e-3});
+                                           norm_oracle, ReductionCriterion{1.85e-3, 1e-5, 1.0 / 256});
             if constexpr (Width == 2) {
                 failures += verify_exact((label + " norm composition").c_str(),
                     from_device<std::uint16_t>(normalized[rank].data, N * tokens), reference_norm[rank]);
@@ -224,7 +229,7 @@ int run(const ExecutionContext& ec, const ops::PeerEvents& events, int k, int to
     };
     auto expected = reference_bits();
     reset(); invoke(); sync(); verify(expected);
-    if (tokens == 5 || (Width == 4 && tokens == 8)) {
+    if (tokens == 5 || (Width == 2 && tokens >= 10) || (Width == 4 && tokens == 8)) {
         cuda_check(cudaSetDevice(ec.dev[0]->device), "select capture origin");
         std::array<std::unique_ptr<DecodeGraphPeerBridge>, Width - 1> bridges;
         std::array<DecodeGraphPeerCapture, Width - 1> peers;
@@ -290,7 +295,9 @@ int main(int argc, char** argv) {
     if (!image_only) for (bool selected : {false, true}) {
         fp32_scale = selected;
         for (int k : {3072, 8704}) {
-            for (int tokens : {1, 5, 8, 9}) { failures += run<2>(ec, events, k, tokens); }
+            for (int tokens : {1, 5, 8, 9, 10, 20, 40, 64}) {
+                failures += run<2>(ec, events, k, tokens);
+            }
         }
     }
     if (count >= 4) {

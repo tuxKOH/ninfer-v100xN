@@ -50,7 +50,8 @@ int exercise(bool attention, int tp) {
     cudaStream_t stream;
     cuda_check(cudaStreamCreate(&stream), "projection test stream");
     int failures = 0;
-    for (const int tokens : {1, 3, 4, 5, 6, 8, 9, 32, 33, 127, 128, 129}) {
+    for (const int tokens : {1, 3, 4, 5, 6, 8, 9, 10, 16, 17, 20, 32, 33, 40, 41, 64,
+                             127, 128, 129}) {
         const auto x_host = make_bf16_activation(5120, tokens, 449U + tokens);
         auto device_x = to_device_bf16(x_host);
         Tensor x(device_x.p, DType::BF16, {5120, tokens});

@@ -120,7 +120,8 @@ struct EncodedChat {
     std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
 };
 
-EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered);
+EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered,
+                                 const PreparationControl& control = {});
 
 class Processor {
 public:

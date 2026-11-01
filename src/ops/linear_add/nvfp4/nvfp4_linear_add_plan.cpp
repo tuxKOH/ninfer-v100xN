@@ -6,6 +6,7 @@
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #ifdef NINFER_VOLTA_BUILD
 #include "ops/linear/nvfp4/nvfp4_cutlass_sm70.h"
+#include "ops/linear/nvfp4/nvfp4_launch.h"
 #endif
 
 #include <algorithm>
@@ -50,7 +51,7 @@ Nvfp4LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_r
 #ifdef NINFER_VOLTA_BUILD
         // Volta's loader pre-packs NVFP4 MLP weights for QPN. The fused row-major decode/small-T
         // kernels cannot consume that layout, so use the ordinary linear route (QPN for narrow T,
-        // CUTLASS materialization for wide T) and add the residual afterward at every width.
+        // packed batch for T9..64, then CUTLASS) and add the residual afterward.
         return Nvfp4LinearAddRoute::LinearThenAdd;
 #else
         return Nvfp4LinearAddRoute::A16;
@@ -91,7 +92,8 @@ void launch_linear_then_add(const Tensor& x, const Weight& weight, Tensor& resid
                             WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope         = workspace.scope();
     Tensor projected    = allocate_projected(workspace, weight.n, x.ne[1]);
-    if (x.ne[1] >= 33) {
+    if (x.ne[1] >= 33 && !(weight.layout == QuantLayout::VoltaQpnPrepacked &&
+                          nvfp4_volta_batch_supported(weight.n, weight.k, x.ne[1]))) {
         nvfp4_cutlass_sm70_launch(x, weight, projected, workspace, stream);
     } else {
         const std::size_t linear_bytes = std::max<std::size_t>(
@@ -108,7 +110,8 @@ std::size_t linear_then_add_workspace_bytes(std::int32_t output_rows, std::int32
                                             std::int32_t tokens) {
     WorkspaceLayoutBuilder layout;
     (void)allocate_projected(layout, output_rows, tokens);
-    const std::size_t linear_bytes = tokens >= 33
+    const std::size_t linear_bytes = tokens >= 33 &&
+        !nvfp4_volta_batch_supported(output_rows, input_rows, tokens)
         ? nvfp4_cutlass_sm70_workspace_bytes(output_rows, input_rows, tokens)
         : std::max<std::size_t>(
               linear_workspace_capacity_bytes(QType::NVFP4, output_rows, input_rows,

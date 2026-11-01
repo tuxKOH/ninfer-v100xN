@@ -122,17 +122,6 @@ MediaPreparationPermit& MediaPreparationPermit::operator=(MediaPreparationPermit
     return *this;
 }
 
-void check_preparation_control(const PreparationControl& control, std::string_view stage) {
-    if (control.cancellation.requested()) {
-        throw RequestError(RequestErrorKind::Cancelled,
-                           "inference request was cancelled during " + std::string(stage));
-    }
-    if (control.deadline != Clock::time_point{} && Clock::now() >= control.deadline) {
-        throw RequestError(RequestErrorKind::QueueTimeout,
-                           "inference request expired during " + std::string(stage));
-    }
-}
-
 struct MediaPreprocessCache::Impl {
     struct Ready {
         PreparedMedia media;

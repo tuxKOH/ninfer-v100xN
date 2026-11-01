@@ -1,4 +1,4 @@
-# NInfer V100X2
+# ninfer-v100xN
 
 [English](README.md) · [GUI](docs/gui.md) · [TUI](docs/tui.md) · [Docker](docs/docker.md) · [详细测评](docs/performance.md) · [HTTP API](docs/serving.md)
 
@@ -26,6 +26,26 @@ Graph/eager 状态检查已通过。Split-D 和实验数值路径可能改变输
 维护者个人实际体验是跟 FP8 一档的。作者公布的源模型 GPQA-D 为 90.91%，BF16 为
 91.41%；AIME'26 两者均为 100%。这些是外部源模型成绩，不是本机转换后的质量分数，
 也不代表数学无损。[公开来源、独立对比和限制](docs/model-quality.md)。
+
+## v0.2.1：TP2 并发与接口修复
+
+QUASAR NVFP4 / MTP4 新增批量 packed 投影与 TP2 packet/norm 融合。本机双张 16 GB V100 实测：
+
+| 每请求输入 | 单并发 | 两并发 | 四并发 | 八并发 |
+|---|---:|---:|---:|---:|
+| 2K | 183.2 | 246.0 | 357.1 | **493.1** |
+| 16K | 181.4 | 237.4 | 323.0 | **408.0** |
+| 85K | 199.5 | 213.3 | — | — |
+
+单位为排除 prefill 的总 committed decode tok/s。相比改动前源码，2K / 16K 八并发分别提升
+约 **203.6% / 109.5%**，单流基本不变。180K 共享 KV 只能同时容纳两个 85K 请求；
+长输入的冷请求整组耗时仍主要由 prefill 决定。替换 T>32 的归约可能改变输出/接受率，八并发实测已有差异，
+未跑新 GPQA。这些改动包含在 v0.2.1 源码、Linux SM70 预编译包与 Docker 附件中。
+[完整条件、前后对照与图表](docs/performance.md#tp2-concurrent-packed-batch-decode-2026-11-02)。
+
+同时修复分词期间的超时/取消（#6），以及 DSH Responses 的 `prompt_cache_key`
+和思考选项兼容（#4）。
+
 
 ## v0.2.0：四卡 TP4、模型热卸载与 Docker 成品
 

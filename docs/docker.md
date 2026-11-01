@@ -4,15 +4,15 @@
 的 `qwen3_8_27b_nvfp4.ninfer`，完成后打开 TUI。按 `s` 加载模型并启动 API，
 再按 `s` 停止；`q` 停止服务并退出。首次下载需要足够的磁盘空间。
 
-## v0.2.0 成品镜像
+## v0.2.1 成品镜像
 
-Release 附件包含 `ninfer-0.2.0-docker-linux-amd64.tar.gz`。下载后直接加载，无需编译：
+Release 附件包含 `ninfer-0.2.1-docker-linux-amd64.tar.gz`。下载后直接加载，无需编译：
 
 ```bash
-docker load -i ninfer-0.2.0-docker-linux-amd64.tar.gz
+docker load -i ninfer-0.2.1-docker-linux-amd64.tar.gz
 docker run --rm -it --gpus all --ipc=host -p 8080:8080 \
   -v ninfer-models:/Models/ninfer-V100X2 \
-  -v ninfer-data:/data ninfer-v100:0.2.0
+  -v ninfer-data:/data ninfer-v100:0.2.1
 ```
 
 该镜像直接使用同版 Linux SM70 预编译包中的程序和依赖，默认下载 QUASAR v3 并打开 TUI。
@@ -25,7 +25,7 @@ docker run --rm -it --gpus all --ipc=host -p 8080:8080 \
 ```bash
 docker run --rm --name ninfer-tp4 --gpus '"device=0,1,2,3"' --ipc=host \
   -p 8080:8080 -v /path/to/quasar-v3:/models:ro \
-  --entrypoint /opt/ninfer/bin/ninfer-serve ninfer-v100:0.2.0 \
+  --entrypoint /opt/ninfer/bin/ninfer-serve ninfer-v100:0.2.1 \
   /models/qwen3_8_27b_nvfp4.ninfer --host 0.0.0.0 --port 8080 \
   --tp 4 --devices 0,1,2,3 --max-context 262144 --kv-dtype int8 \
   --prefill-chunk 2560 --max-concurrency 1 \
@@ -55,10 +55,10 @@ Vision 和两个数值实验关闭。API 在容器内监听 `0.0.0.0:8080`，映
 无需 Compose 的等价命令：
 
 ```bash
-docker build -t ninfer-v100:0.2.0 .
+docker build -t ninfer-v100:0.2.1 .
 docker run --rm -it --gpus all --ipc=host -p 8080:8080 \
   -v ninfer-models:/Models/ninfer-V100X2 \
-  -v ninfer-data:/data ninfer-v100:0.2.0
+  -v ninfer-data:/data ninfer-v100:0.2.1
 ```
 
 构建并行度默认 2，可用 `NINFER_BUILD_JOBS=2 docker compose build` 调低；
@@ -93,7 +93,7 @@ NINFER_MODEL=https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer \
 ```bash
 docker run --rm -it --gpus all --ipc=host -p 8080:8080 \
   -v /Models/ninfer-V100X2:/Models/ninfer-V100X2 \
-  -v ninfer-data:/data ninfer-v100:0.2.0 \
+  -v ninfer-data:/data ninfer-v100:0.2.1 \
   --model /Models/ninfer-V100X2/qwen3_8_27b_q4_k_m.ninfer --profile q4-mtp3
 ```
 

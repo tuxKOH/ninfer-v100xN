@@ -4,6 +4,113 @@ Local hardware: 2 × Tesla V100-SXM2 16 GB, SXM2-to-PCIe adapters, PCIe 3.0 ×16
 
 [llama.cpp / LM Studio controls](llama-comparison.md) · [Other V100 profiles](performance-v100.md) · [TP4/NVLink](tp4.md) · [RAM-KV/PP2](experiments.md) · [Inherited upstream campaigns](performance-upstream.md)
 
+## TP2 concurrent packed-batch decode (2026-11-02)
+
+Release **v0.2.1** targets QUASAR NVFP4 v3 / TP2 / optimized-head MTP4 on the
+local two 16 GB V100s, with direct PCIe P2P and no NVLink. It uses complete INT8 group-64 KV,
+180000 shared KV tokens, chunk 1024, CUDA Graphs, both experimental long-attention/fast-decode
+flags, greedy sampling, zero penalties and disabled model stops. Every request independently
+consumes the same first 2048, 16384 or 85000 IDs from `v100-code-85000-iommu-pt.ids` and emits
+512 tokens. Prefix reuse and historical retention are off. There is no shared-prefix compute
+reuse between these cold requests. Loading and a short graph-path warmup are outside timing.
+
+The preceding implementation was frozen before the batch/packet changes and measured on the
+same host and workload. These are one cold group per case, not statistical estimates. **Total
+decode throughput** counts each compact executor round once: committed tokens excluding each
+request's first output divided by summed decode-round wall time, including commit/publication
+and excluding prefill and between-round waits. **All-live sampled throughput** instead uses
+complete nominal 10 ms sample intervals within all requests' common decode lifetime; its wall
+time includes intervening stalls. It is not a timestamped HTTP streaming measurement. **Mean
+batch** is request rows divided by decode rounds. Neither metric is the sum of per-request rates.
+
+![TP2 concurrent decode before and after, whole-group throughput and actual batch](assets/tp2-concurrency-batch/quasar-concurrency.svg)
+
+| Input tokens | Requests | Before decode tok/s | Current decode tok/s | Change | All-live sampled tok/s | Mean batch |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2048 | 1 | 183.069 | 183.165 | +0.05% | 183.368 | 1.00 |
+| 2048 | 2 | 176.987 | 246.020 | +39.00% | 251.398 | 1.93 |
+| 2048 | 4 | 247.096 | 357.131 | +44.53% | 369.930 | 3.81 |
+| 2048 | 8 | 162.422 | 493.095 | +203.59% | 528.301 | 7.31 |
+| 16384 | 1 | 181.326 | 181.355 | +0.02% | 180.493 | 1.00 |
+| 16384 | 2 | 174.796 | 237.406 | +35.82% | 247.825 | 1.83 |
+| 16384 | 4 | 230.601 | 323.013 | +40.07% | 355.821 | 3.05 |
+| 16384 | 8 | 194.733 | 407.952 | +109.49% | 504.014 | 4.62 |
+| 85000 | 1 | 199.481 | 199.549 | +0.03% | 199.175 | 1.00 |
+| 85000 | 2 | 196.554 | 213.274 | +8.51% | 248.676 | 1.18 |
+
+Single-request differences are at most 0.05%; no single-stream gain is claimed. At 2K, C8
+reaches 2.69× C1 in total-round throughput, or 2.88× using the common sampled window. At 16K,
+the mean C8 batch is only 4.62 because cold prefill and staggered completion leave fewer than
+eight requests decode-ready for much of the group. At 85K the 180K shared KV pool admits only
+two full requests. C4/C8 would queue in two-request waves and were not repeated in this
+ten-case campaign; the [earlier twelve-case matrix](#experimental-long-context-concurrency-2026-10-20)
+retains those wave measurements. The 85K C2 common window is only 1.194 s, so its sampled rate
+must not be read as a long steady-state result.
+
+Cold whole-group time at 2K/C8 changes from **34.856 to 17.999 s**, and at 16K/C8 from
+**102.955 to 92.265 s**. At 85K/C2 it remains **142.278 vs 142.214 s**: cold prefill dominates,
+so the decode gain does not imply a comparable improvement in full-request latency.
+[Compact measurements, baseline comparison and equality flags](assets/tp2-concurrency-batch/quasar-concurrency.json)
+also retain whole-group rates and acceptance totals.
+
+The retained mechanisms are shared K-major activation supply, shape-selected physical phases
+over eight logical K partitions, paired gate/up SwiGLU, and direct TP2 projection publication
+into enlarged 640 KiB two-epoch channels followed by sum/RMSNorm. No extra expanded weight
+image is kept. The implementation preserves original codes/scales, normal/fast scaling profiles,
+BF16 projection/contribution/SwiGLU boundaries and per-request KV/GDN/acceptance ownership.
+T<=8 and other TP geometries keep their existing projection paths. See the
+[architecture](maintainer/concurrent-inference-architecture.md#10-speculative-decoding) and
+[source review](v100-decode-survey.md#tp2-并发源码借鉴2026-11-02); provenance and license notices
+are in `NOTICE`.
+
+The final T33..40 paired gate/up tuning keeps cross-phase carry in output-owner registers,
+allowing four physical K warps within the 48 KiB shared-memory block limit. Relative to the
+preceding packed-batch/packet stage, C8 improves **462.152 → 493.095** at 2K and
+**396.428 → 407.952** at 16K, retaining every output ID and draft counter in both cases.
+Only these two affected performance cases were repeated; the eight other measurements are
+retained from the preceding stage, whose relevant projection dispatch is unchanged.
+The compact report identifies each measurement's source stage.
+
+**Numerical limits:** T>32 previously used CUTLASS in some projections; the new batch reduction
+has a different association. This also applies to short prefill tails at those shapes, including
+a single active request; unchanged measured C1 fixtures do not imply universal bitwise parity.
+All measured C1/C2/C4 cases retain every output ID and accepted/
+drafted counter of the preceding implementation. Both C8 cases change output IDs and
+acceptance, so their entire speedup cannot be attributed to equal-output kernel execution.
+Independent FP64 linear/SwiGLU/row-add/norm oracles, read-only inputs/weights, guards and
+changing-input Graph checks pass. Real QUASAR C2/C4/C8 normal and long/fast, greedy and mixed
+sampling pass complete Graph/eager output/counter and peer-egress checks. These are numerical
+and state-transition checks, **not model-quality qualification; no new GPQA was run**.
+
+The [1Cat reference experiment](https://github.com/1CatAI/1Cat-vLLM/blob/HEAD/docs/design/sm70_dflash2_long_batch_20260927.md)
+reports about 2.69× C4/C1 and 3.92× C8/C1. That uses four 32 GB V100s, TP4, DFlash2 q7,
+FP16/E4M3 KV, 32K inputs, sampling, prefix hits and a client all-live decode window. This
+campaign does not run 1Cat locally or establish equal-condition scaling parity.
+
+Reproduce in a fresh SM70 Release build with `NINFER_BUILD_BENCHMARKS=ON`; the benchmark calls
+only the public Engine. Use an empty output directory to collect a new campaign:
+
+```bash
+cmake --build build-v100-concurrency --target ninfer_v100_concurrency_bench -j4
+python3 tools/v100/bench_concurrency.py \
+  --binary build-v100-concurrency/bench/ninfer_v100_concurrency_bench \
+  --artifact /Models/ninfer-V100X2/quasar-v3/qwen3_8_27b_nvfp4.ninfer \
+  --corpus profiles/bench/v100-code-85000-iommu-pt.ids \
+  --output profiles/bench/tp2-concurrency-repro \
+  --input-tokens 2048 16384 --concurrency 1 2 4 8
+python3 tools/v100/bench_concurrency.py \
+  --binary build-v100-concurrency/bench/ninfer_v100_concurrency_bench \
+  --artifact /Models/ninfer-V100X2/quasar-v3/qwen3_8_27b_nvfp4.ninfer \
+  --corpus profiles/bench/v100-code-85000-iommu-pt.ids \
+  --output profiles/bench/tp2-concurrency-repro \
+  --input-tokens 85000 --concurrency 1 2
+```
+
+Full local results and detailed GPU/host health logs are under
+`profiles/bench/tp2-concurrency-20261102/`. GPU clocks and limits are unchanged; completed
+retained-matrix runs reach at most 56 °C GPU and 63 °C memory, with zero volatile uncorrected
+ECC errors reported. This does not establish a hardware performance ceiling.
+
 ## v0.1.2: visual long attention and CPU Vision (2026-10-23)
 
 This release adds Vision to the default-off long-attention profile and optionally moves the

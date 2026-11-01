@@ -70,6 +70,16 @@ The TP4 long-attention direct split combine also uses 1Cat's grouped-attention
 combine as a design reference. This adaptation retains NInfer's packed INT8
 group-64 KV, BF16 partials, FP32 split summation order and denominator.
 
+The TP2 NVFP4 batch projection in src/ops/linear/nvfp4/nvfp4_volta_batch.cuh
+uses the activation-supply and phased-reduction approach from 1Cat-vLLM's
+csrc/sm70_turbomind/ops/nvfp4_qpn2_sm70.cu as a reference (Apache-2.0).
+It consumes NInfer's existing QPN codes/scales, preserves eight logical K
+partitions and the normal/fast scale profiles, and emits the existing BF16
+projection and SwiGLU boundaries without an expanded resident weight image.
+The QPN layout and MMA mapping originate in dnv2003/v100-skinny (MIT), as
+credited by that source. Its retained notice is in
+third_party/licenses/v100-skinny.txt.
+
 The TP4 wide-message reduce-scatter/allgather in src/ops/common/allreduce.cu
 uses 1Cat's cross_device_reduce_2stage as a reference. Projection epilogues in
 src/ops/linear_add/nvfp4 publish represented BF16 contributions directly to

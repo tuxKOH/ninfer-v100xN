@@ -1,4 +1,5 @@
 #include "targets/qwen3_6/impl/frontend/tokenizer.h"
+#include "targets/qwen3_6/impl/frontend/preparation_control.h"
 
 #include "text/unicode.h"
 
@@ -25,6 +26,21 @@ using Json    = nlohmann::json;
 namespace uni = ninfer::text::unicode_internal;
 
 constexpr std::int64_t kMaxTokenId = 1'000'000;
+
+// Count candidate work, not just completed merges: a single BPE scan can itself
+// be very long. The same guard covers added-token, pretokenizer and byte scans.
+class EncodeControl {
+public:
+    explicit EncodeControl(const PreparationControl& control) : control_(control) { check(); }
+    void check() const { check_preparation_control(control_, "tokenization"); }
+    void step() {
+        if ((++work_ & 1023U) == 0) { check(); }
+    }
+
+private:
+    const PreparationControl& control_;
+    std::size_t work_ = 0;
+};
 
 struct VocabMetadata {
     std::vector<std::string> id_to_token;
@@ -413,11 +429,12 @@ std::size_t span_end_offset(std::string_view text, const std::vector<uni::Codepo
     return spans.at(end).offset;
 }
 
-std::vector<std::string_view> qwen_split_words(std::string_view text) {
+std::vector<std::string_view> qwen_split_words(std::string_view text, EncodeControl& control) {
     const std::vector<uni::CodepointSpan> spans =
         uni::utf8_codepoints(text, "Tokenizer::encode input");
     std::vector<std::string_view> words;
     for (std::size_t i = 0; i < spans.size();) {
+        control.step();
         const std::size_t begin_offset = spans[i].offset;
         const std::int32_t cp          = spans[i].value;
 
@@ -443,7 +460,10 @@ std::vector<std::string_view> qwen_split_words(std::string_view text) {
              is_letter_or_mark(spans[i + 1].value))) {
             std::size_t end = i;
             if (!is_letter_or_mark(spans[end].value)) { ++end; }
-            while (end < spans.size() && is_letter_or_mark(spans[end].value)) { ++end; }
+            while (end < spans.size() && is_letter_or_mark(spans[end].value)) {
+                control.step();
+                ++end;
+            }
             words.emplace_back(
                 text.substr(begin_offset, span_end_offset(text, spans, end) - begin_offset));
             i = end;
@@ -462,9 +482,13 @@ std::vector<std::string_view> qwen_split_words(std::string_view text) {
             std::size_t end = i;
             if (spans[end].value == ' ') { ++end; }
             while (end < spans.size() && is_non_space_non_letter_mark_number(spans[end].value)) {
+                control.step();
                 ++end;
             }
-            while (end < spans.size() && is_newline(spans[end].value)) { ++end; }
+            while (end < spans.size() && is_newline(spans[end].value)) {
+                control.step();
+                ++end;
+            }
             words.emplace_back(
                 text.substr(begin_offset, span_end_offset(text, spans, end) - begin_offset));
             i = end;
@@ -475,6 +499,7 @@ std::vector<std::string_view> qwen_split_words(std::string_view text) {
             std::size_t run_end      = i;
             std::size_t last_newline = std::string_view::npos;
             while (run_end < spans.size() && uni::is_whitespace(spans[run_end].value)) {
+                control.step();
                 if (is_newline(spans[run_end].value)) { last_newline = run_end; }
                 ++run_end;
             }
@@ -514,21 +539,25 @@ std::vector<std::string_view> qwen_split_words(std::string_view text) {
     return words;
 }
 
-std::string byte_level_encode(std::string_view text) {
+std::string byte_level_encode(std::string_view text, EncodeControl& control) {
     static const std::unordered_map<unsigned char, std::string> byte_encoder =
         build_byte_level_encoder();
     std::string encoded;
     encoded.reserve(text.size());
-    for (const unsigned char byte : text) { encoded += byte_encoder.at(byte); }
+    for (const unsigned char byte : text) {
+        control.step();
+        encoded += byte_encoder.at(byte);
+    }
     return encoded;
 }
 
-std::vector<std::string> byte_level_symbols(std::string_view text) {
+std::vector<std::string> byte_level_symbols(std::string_view text, EncodeControl& control) {
     const std::vector<uni::CodepointSpan> spans =
         uni::utf8_codepoints(text, "Tokenizer::encode byte-level text");
     std::vector<std::string> symbols;
     symbols.reserve(spans.size());
     for (const uni::CodepointSpan& span : spans) {
+        control.step();
         symbols.emplace_back(text.substr(span.offset, span.length));
     }
     return symbols;
@@ -545,19 +574,21 @@ bool is_stop_token_id(std::span<const int> stop_token_ids, int id) {
 
 void append_symbol_id(std::vector<int>& ids,
                       const std::unordered_map<std::string, int>& token_to_id,
-                      std::string_view symbol) {
+                      std::string_view symbol, EncodeControl& control) {
+    control.step();
     const auto direct = token_to_id.find(std::string(symbol));
     if (direct != token_to_id.end()) {
         ids.push_back(direct->second);
         return;
     }
 
-    const std::vector<std::string> bytes = byte_level_symbols(symbol);
+    const std::vector<std::string> bytes = byte_level_symbols(symbol, control);
     if (bytes.size() <= 1) {
         throw std::invalid_argument("Tokenizer::encode produced token outside vocabulary: " +
                                     std::string(symbol));
     }
     for (const std::string& byte_symbol : bytes) {
+        control.step();
         const auto byte_id = token_to_id.find(byte_symbol);
         if (byte_id == token_to_id.end()) {
             throw std::invalid_argument(
@@ -569,7 +600,9 @@ void append_symbol_id(std::vector<int>& ids,
 
 void append_bpe_ids(std::vector<int>& ids, std::string_view text, bool has_bpe_merges,
                     const std::unordered_map<std::string, int>& merge_ranks,
-                    const std::unordered_map<std::string, int>& token_to_id) {
+                    const std::unordered_map<std::string, int>& token_to_id,
+                    EncodeControl& control) {
+    control.check();
     if (text.empty()) { return; }
     if (!has_bpe_merges) {
         throw std::invalid_argument(
@@ -577,12 +610,17 @@ void append_bpe_ids(std::vector<int>& ids, std::string_view text, bool has_bpe_m
     }
 
     const std::string normalized = uni::normalize_nfc(text);
-    for (const std::string_view word : qwen_split_words(normalized)) {
-        std::vector<std::string> symbols = byte_level_symbols(byte_level_encode(word));
+    control.check();
+    for (const std::string_view word : qwen_split_words(normalized, control)) {
+        control.check();
+        std::vector<std::string> symbols =
+            byte_level_symbols(byte_level_encode(word, control), control);
         while (symbols.size() > 1) {
+            control.check();
             int best_rank              = std::numeric_limits<int>::max();
             std::size_t best_pair_left = symbols.size();
             for (std::size_t i = 0; i + 1 < symbols.size(); ++i) {
+                control.step();
                 const auto rank = merge_ranks.find(merge_pair_key(symbols[i], symbols[i + 1]));
                 if (rank != merge_ranks.end() && rank->second < best_rank) {
                     best_rank      = rank->second;
@@ -593,8 +631,11 @@ void append_bpe_ids(std::vector<int>& ids, std::string_view text, bool has_bpe_m
             symbols[best_pair_left] += symbols[best_pair_left + 1];
             symbols.erase(symbols.begin() + static_cast<std::ptrdiff_t>(best_pair_left + 1));
         }
-        for (const std::string& symbol : symbols) { append_symbol_id(ids, token_to_id, symbol); }
+        for (const std::string& symbol : symbols) {
+            append_symbol_id(ids, token_to_id, symbol, control);
+        }
     }
+    control.check();
 }
 
 } // namespace
@@ -640,10 +681,11 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
 }
 
 std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options) const {
+    EncodeControl control(options.control);
     if (text.empty()) { return {}; }
     if (!options.parse_added_tokens) {
         std::vector<int> ids;
-        append_bpe_ids(ids, text, has_bpe_merges_, bpe_merge_ranks_, vocab_token_to_id_);
+        append_bpe_ids(ids, text, has_bpe_merges_, bpe_merge_ranks_, vocab_token_to_id_, control);
         return ids;
     }
 
@@ -651,9 +693,11 @@ std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options)
     std::size_t ordinary_begin = 0;
     std::size_t pos            = 0;
     while (pos < text.size()) {
+        control.step();
         const AddedToken* match_token = nullptr;
         const auto& candidates = added_token_candidates_[static_cast<unsigned char>(text[pos])];
         for (const std::size_t index : candidates) {
+            control.step();
             const AddedToken& token = added_tokens_[index];
             if (token.content.size() <= text.size() - pos &&
                 text.compare(pos, token.content.size(), token.content) == 0) {
@@ -669,7 +713,7 @@ std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options)
 
         if (pos > ordinary_begin) {
             append_bpe_ids(ids, text.substr(ordinary_begin, pos - ordinary_begin), has_bpe_merges_,
-                           bpe_merge_ranks_, vocab_token_to_id_);
+                           bpe_merge_ranks_, vocab_token_to_id_, control);
         }
 
         ids.push_back(match_token->id);
@@ -678,8 +722,9 @@ std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options)
     }
     if (ordinary_begin < text.size()) {
         append_bpe_ids(ids, text.substr(ordinary_begin), has_bpe_merges_, bpe_merge_ranks_,
-                       vocab_token_to_id_);
+                       vocab_token_to_id_, control);
     }
+    control.check();
     return ids;
 }
 

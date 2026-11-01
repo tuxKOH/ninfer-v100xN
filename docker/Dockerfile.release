@@ -3,7 +3,7 @@
 FROM ubuntu:24.04 AS base
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG VERSION=0.2.0
+ARG VERSION=0.2.1
 RUN apt-get update && apt-get install --yes --no-install-recommends \
         ca-certificates curl python3 python3-venv tini ncurses-term \
     && rm -rf /var/lib/apt/lists/* \
@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install --yes --no-install-recommends \
 
 # The build context is the extracted Linux SM70 release package.
 FROM base AS release
-ARG VERSION=0.2.0
+ARG VERSION=0.2.1
 WORKDIR /opt/ninfer
 COPY . .
 RUN ln -s /opt/ninfer/bin/ninfer /usr/local/bin/ninfer \
@@ -20,7 +20,7 @@ RUN ln -s /opt/ninfer/bin/ninfer /usr/local/bin/ninfer \
 
 LABEL org.opencontainers.image.title="NInfer V100" \
       org.opencontainers.image.version="${VERSION}" \
-      org.opencontainers.image.source="https://github.com/tuxKOH/ninfer-V100X2" \
+      org.opencontainers.image.source="https://github.com/tuxKOH/ninfer-v100xN" \
       org.opencontainers.image.licenses="Apache-2.0"
 
 ENV PATH="/opt/venv/bin:/opt/ninfer/bin:${PATH}" \

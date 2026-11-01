@@ -262,6 +262,12 @@ overlap stages; decode visits both stages serially. Optional sparse RAM-KV is ad
 Vision, DFlash, storage mode
 and concurrency above one are not admitted. No request-time TP/PP migration is provided.
 
+The v0.2.1 TP2 concurrency update adds packed NVFP4 batch projections at T9..64 and
+640 KiB direct-P2P TP2 packet channels. T>32 reduction association can differ from the old
+CUTLASS path and changes measured C8 output/acceptance. Independent FP64 operator and
+real QUASAR C2/C4/C8 Graph/eager state checks qualify the route; no new GPQA is claimed.
+See docs/performance.md for the local 2K/16K/85K workload and throughput.
+
 One Engine owns one resident model, with one device, TP2, experimental PP2, or the selected TP4 domain on the 27B
 package and a startup-fixed
 one to eight active requests. The V100X2 acceptance workload is one active request on two cards.

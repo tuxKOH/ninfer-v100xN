@@ -13,6 +13,13 @@
   The prepacked FP8 output head now uses its matching kernel for single-token calls and chunk
   tails too; reading that layout through row-major GEMV was a correctness bug. NVFP4 A4 is not
   supported on V100.
+- **TP2 NVFP4 concurrent decode:** real dense TP2 shapes at T9..64 share one K-major FP16
+  activation image and consume the existing packed QPN weights directly. Eight logical K
+  partitions execute in shape-selected physical phases; paired gate/up emits SwiGLU from one
+  CTA. Original normal/fast scale profiles and BF16 Op boundaries remain. This replaces some
+  former T>32 CUTLASS calls and can change their output/acceptance. Independent FP64 oracles
+  and real C2/C4/C8 Graph/eager MTP4 checks qualify the route; see the
+  [concurrency measurements](performance.md#tp2-concurrent-packed-batch-decode-2026-11-02).
 - **Long-context decode:** the split-KV attention reducer shares softmax weights and reads eight
   split vectors cooperatively, then accumulates in the original FP32 order. It retains every
   history token, the same KV format and the same partial-output precision. The INT8 attention
@@ -63,9 +70,10 @@
   domains, startup instead selects verified CUDA-managed staging for PCIe peers. An active
   NVLink mesh is identified from NVML's actual remote PCI endpoints and qualified separately;
   it bypasses the host-IOMMU restriction without changing system settings. Neither path maintains a
-  second explicit pinned-host copy route; PCIe P2P is not NVLink. Qualified SM70 all-reduces
-  of at most 80 KiB now sum direct peer reads into rank-local staging; both reads retire before
-  either input is overwritten. Wide prefill and peer-off collectives keep the DMA route.
+  second explicit pinned-host copy route; PCIe P2P is not NVLink. Qualified aligned BF16 SM70 sums use two-epoch packet mailboxes; direct-device TP2 reserves
+  640 KiB per channel for up to 64 hidden rows, while other packet domains retain 80 KiB.
+  Row-parallel NVFP4 publishes BF16 contributions before fused sum/RMSNorm. Other direct reads
+  retire before either source is overwritten. Wide prefill and peer-off collectives keep the DMA route.
 - **Experimental PP2:** SM70 Qwen3.8 NVFP4/QUASAR can use `--tp 1 --pp 2 --devices 0,1`.
   Complete layers are split 32/32; chronological prefill chunks run on two stages, while
   decode visits both stages serially. Text/None/MTP and prefix reuse are supported for one

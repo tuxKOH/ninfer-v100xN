@@ -487,8 +487,10 @@ int run_column_parallel_profile(std::string_view label, const Profile& shard_pro
             }
             failures += compare_output(name, actual, data.expected.data(), ActivationCompute::A16);
             failures += data.output->verify_guards(name);
-            if (data.workspace->used() != 0 || data.workspace->peak_used() != exact) {
-                std::cerr << name << ": exact workspace query/execution high-water mismatch\n";
+            // The public capacity query is an upper bound across weight layouts. A
+            // prepacked batch can need less than the portable materialization route.
+            if (data.workspace->used() != 0 || data.workspace->peak_used() > exact) {
+                std::cerr << name << ": workspace exceeds capacity or escapes its scope\n";
                 ++failures;
             }
         }

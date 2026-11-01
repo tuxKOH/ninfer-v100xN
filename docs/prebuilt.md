@@ -1,6 +1,6 @@
 # Linux V100 prebuilt package
 
-The v0.2.0 release includes a Linux x86_64 / `sm_70` / CUDA 12.8 binary package.
+The v0.2.1 release includes a Linux x86_64 / `sm_70` / CUDA 12.8 binary package.
 It supports the qualified V100 TP2 routes and QUASAR TP4 Text/MTP, including both optional
 experimental profiles. Model weights, the NVIDIA driver, Python and Qt are not included.
 See [TP4 measurements and limits](tp4.md); TP4 Vision/DFlash remain unsupported.
@@ -43,11 +43,11 @@ GPU; only BF16 visual embeddings are uploaded. CPU and GPU visual arithmetic are
 bit-identical. Long attention also changes floating-point association, so both can change
 logits or generated output. No new GPQA score or losslessness claim is made.
 
-To reproduce the v0.2.0 package after building with the private dependency prefix:
+To reproduce the v0.2.1 package after building with the private dependency prefix:
 
 ```bash
 .venv/bin/python3 tools/release/package_linux.py --build build-v100-tp4 \
-  --output dist --version 0.2.0 --dependency-prefix build/_deps/install
+  --output dist --version 0.2.1 --dependency-prefix build/_deps/install
 ```
 
 The packager checks transitive library resolution, glibc symbols, dependency license files and

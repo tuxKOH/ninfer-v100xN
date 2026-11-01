@@ -3,9 +3,12 @@
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
+#include <cuda_profiler_api.h>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <thread>
 
@@ -33,6 +36,7 @@ int main(int argc, char** argv) {
         options.prefill_decode_rounds = decode_rounds;
         options.kv_cache = ninfer::KvCacheStorage::Int8Group64;
         options.max_concurrency = concurrency;
+        options.use_cuda_graph = std::getenv("NINFER_BENCH_EAGER") == nullptr;
         options.pending_timeout_ms = 1800000; // Eight cold 85K prefills can queue for minutes.
         options.speculative.backend = ninfer::SpeculativeBackend::Mtp;
         options.speculative.draft_tokens = 4;
@@ -66,8 +70,16 @@ int main(int argc, char** argv) {
         Json rows = Json::array(), samples = Json::array();
         const auto before = settled_stats(31);
         const auto started = Clock::now();
+        const bool profile = std::getenv("NINFER_BENCH_PROFILE") != nullptr;
+        if (profile && cudaProfilerStart() != cudaSuccess) {
+            throw std::runtime_error("cannot start CUDA profiler");
+        }
         std::vector<ninfer::GenerationHandle> handles;
-        for (auto& prompt : prompts) { handles.push_back(engine.submit(std::move(prompt), request)); }
+        std::vector<double> submitted;
+        for (auto& prompt : prompts) {
+            submitted.push_back(std::chrono::duration<double>(Clock::now() - started).count());
+            handles.push_back(engine.submit(std::move(prompt), request));
+        }
         std::jthread sampler([&](std::stop_token stop) {
             while (!stop.stop_requested()) {
                 const auto stats = engine.runtime_stats();
@@ -79,9 +91,14 @@ int main(int argc, char** argv) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
         });
+        double all_live_start = 0, all_live_end = std::numeric_limits<double>::infinity();
+        unsigned request_index = 0;
         for (auto& handle : handles) {
             const auto result = handle.wait();
             if (result.generated_token_ids.size() != output) { throw std::runtime_error("incomplete output"); }
+            const double origin = submitted[request_index++] - result.timings.prepare_seconds;
+            all_live_start = std::max(all_live_start, origin + result.timings.first_token_seconds);
+            all_live_end = std::min(all_live_end, origin + result.timings.total_seconds);
             rows.push_back({{"prompt_tokens", result.prompt.prompt_tokens},
                 {"completion_tokens", result.generated_token_ids.size()}, {"cached_tokens", result.reused_prompt_tokens},
                 {"prefill_seconds", result.timings.prefill_seconds}, {"decode_seconds", result.timings.decode_seconds},
@@ -91,6 +108,9 @@ int main(int argc, char** argv) {
                 {"drafted", result.speculative.drafted_tokens}, {"accepted", result.speculative.accepted_tokens}});
         }
         const double makespan = std::chrono::duration<double>(Clock::now() - started).count();
+        if (profile && cudaProfilerStop() != cudaSuccess) {
+            throw std::runtime_error("cannot stop CUDA profiler");
+        }
         sampler.request_stop(); sampler.join();
         const auto after = settled_stats(before.committed_decode_tokens + std::uint64_t(concurrency) * (output - 1));
         const auto committed = after.committed_decode_tokens - before.committed_decode_tokens;
@@ -120,15 +140,33 @@ int main(int argc, char** argv) {
                     previous.at("committed_decode_tokens").get<std::uint64_t>();
             }
         }
+        // Complete 10ms sample intervals inside the common decode lifetime. Wall time includes
+        // intervening prefill; no window is reported if requests never all reach decode together.
+        const Json* live_first = nullptr;
+        const Json* live_last = nullptr;
+        for (const auto& sample : samples) {
+            const double seconds = sample.at("seconds").get<double>();
+            if (seconds >= all_live_start && seconds < all_live_end) {
+                if (!live_first) { live_first = &sample; }
+                live_last = &sample;
+            }
+        }
+        const double live_wall = live_first && live_last
+            ? live_last->at("seconds").get<double>() - live_first->at("seconds").get<double>() : 0;
+        const std::uint64_t live_tokens = live_wall > 0
+            ? live_last->at("committed_decode_tokens").get<std::uint64_t>() -
+              live_first->at("committed_decode_tokens").get<std::uint64_t>() : 0;
         Json report{{"artifact_type", "ninfer_v100_long_concurrency"}, {"input_tokens", length},
             {"concurrency", concurrency}, {"output_tokens_per_request", output},
-            {"tp", 2}, {"mtp_drafts", 4}, {"graphs", true}, {"kv_capacity", 180000},
+            {"tp", 2}, {"mtp_drafts", 4}, {"graphs", options.use_cuda_graph}, {"kv_capacity", 180000},
             {"prefill_chunk", 1024}, {"prefill_decode_rounds", decode_rounds},
             {"long_attention", true}, {"fast_decode", true},
             {"prefix_reuse", false}, {"committed_decode_tokens", committed},
             {"decode_wall_seconds", decode_wall}, {"total_decode_tok_s", committed / decode_wall},
             {"group_makespan_seconds", makespan}, {"group_output_tok_s", double(concurrency * output) / makespan},
             {"decode_rounds", rounds}, {"mean_decode_batch", double(row_rounds) / rounds},
+            {"all_live_sampled_wall_seconds", live_wall}, {"all_live_sampled_tokens", live_tokens},
+            {"all_live_sampled_tok_s", live_wall > 0 ? Json(live_tokens / live_wall) : Json(nullptr)},
             {"mixed_wall_seconds", mixed_wall}, {"mixed_committed_decode_tokens", mixed_committed},
             {"mixed_wall_decode_tok_s", mixed_wall > 0 ? Json(mixed_committed / mixed_wall) : Json(nullptr)},
             {"peak_running", peak_running}, {"peak_decode_ready", peak_ready},

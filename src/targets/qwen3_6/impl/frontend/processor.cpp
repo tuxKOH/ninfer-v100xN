@@ -587,15 +587,17 @@ std::span<const std::int32_t> ProcessedInput::position_axis(int axis) const {
         static_cast<std::size_t>(axis) * input_ids.size(), input_ids.size());
 }
 
-EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered) {
+EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered,
+                                 const PreparationControl& control) {
     EncodedChat encoded;
-    encoded.input_ids = tokenizer.encode(rendered.text);
+    encoded.input_ids = tokenizer.encode(rendered.text, {.control = control});
     if (!rendered.rewrite_checkpoint) { return encoded; }
     if (rendered.rewrite_checkpoint->offset > rendered.text.size()) {
         throw std::logic_error("rewrite checkpoint byte offset exceeds rendered chat");
     }
     const std::vector<int> prefix = tokenizer.encode(
-        std::string_view(rendered.text).substr(0, rendered.rewrite_checkpoint->offset));
+        std::string_view(rendered.text).substr(0, rendered.rewrite_checkpoint->offset),
+        {.control = control});
     if (prefix.empty() || prefix.size() > encoded.input_ids.size() ||
         !std::equal(prefix.begin(), prefix.end(), encoded.input_ids.begin())) {
         throw std::logic_error("rewrite checkpoint is not an exact token prefix");
@@ -767,7 +769,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     check_preparation_control(control);
     rendered                    = expand_placeholders(std::move(rendered), items);
     const auto tokenize_started = Clock::now();
-    EncodedChat encoded         = encode_rendered_chat(tokenizer_, rendered);
+    EncodedChat encoded         = encode_rendered_chat(tokenizer_, rendered, control);
     stats.tokenize_seconds = std::chrono::duration<double>(Clock::now() - tokenize_started).count();
     check_preparation_control(control, "tokenization");
     output.input_ids          = std::move(encoded.input_ids);

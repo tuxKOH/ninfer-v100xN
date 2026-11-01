@@ -1,4 +1,4 @@
-# NInfer V100X2
+# ninfer-v100xN
 
 [中文](README.zh-CN.md) · [GUI](docs/gui.md) · [TUI](docs/tui.md) · [Docker](docs/docker.md) · [Detailed measurements](docs/performance.md) · [HTTP API](docs/serving.md)
 
@@ -32,6 +32,28 @@ Maintainer's personal experience: “It feels in the same tier as FP8.”
 The authors report GPQA-D 90.91% versus BF16 91.41%, and AIME'26 100% for both.
 These are external source-checkpoint results, not our V100 conversion scores or proof of
 losslessness. [Sources, independent comparison and limitations](docs/model-quality.md).
+
+## v0.2.1: TP2 concurrency and serving fixes
+
+QUASAR NVFP4 / MTP4 now uses packed batch projections and fused TP2 packet/norm handoff.
+On the local two 16 GB V100s, committed decode throughput is:
+
+| Input per request | C1 | C2 | C4 | C8 |
+|---|---:|---:|---:|---:|
+| 2K | 183.2 | 246.0 | 357.1 | **493.1** |
+| 16K | 181.4 | 237.4 | 323.0 | **408.0** |
+| 85K | 199.5 | 213.3 | — | — |
+
+Rates are total committed decode tok/s, excluding prefill. Compared with the preceding source,
+C8 improves about **203.6% / 109.5%** at 2K / 16K; single-stream rates are effectively unchanged.
+The 180K shared KV pool fits only two 85K requests. Cold prefill still dominates long-input
+whole-group latency. The replacement T>32 reduction can change output/acceptance, observed at
+C8; no new GPQA.
+These changes ship in v0.2.1 source, Linux SM70 binaries and Docker assets.
+This release also fixes tokenization deadline/cancellation (#6) and DSH Responses requests
+with `prompt_cache_key` and optional reasoning hints (#4).
+[Full conditions and before/after chart](docs/performance.md#tp2-concurrent-packed-batch-decode-2026-11-02).
+
 
 ## v0.2.0: TP4, hot model residency and packaged Docker
 

@@ -127,6 +127,13 @@ ninfer_add_test(ninfer_qwen3_6_frontend_test
 target_include_directories(ninfer_qwen3_6_frontend_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl)
+ninfer_add_test(ninfer_tokenizer_control_test
+  SOURCES targets/qwen3_6/test_tokenizer_control.cpp
+  NEEDS_SOURCE_DIR
+  LIBRARIES ninfer_engine ninfer_core)
+target_include_directories(ninfer_tokenizer_control_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+set_tests_properties(ninfer_tokenizer_control_test PROPERTIES TIMEOUT 15)
 ninfer_add_test(ninfer_qwen3_6_runtime_mechanisms_test
   SOURCES targets/qwen3_6/test_runtime_mechanisms.cpp
   LIBRARIES ninfer_engine ninfer_core)
@@ -499,6 +506,11 @@ ninfer_add_op_test(ninfer_linear_q4_volta_proposal_test
   SOURCES ops/linear/test_q4_volta_proposal.cu
   LIBRARIES ninfer_ops)
 ninfer_add_linear_test(ninfer_linear_nvfp4_a16_test ops/linear/test_nvfp4_a16.cpp)
+ninfer_add_op_test(ninfer_nvfp4_volta_batch_test
+  SOURCES ops/linear/test_nvfp4_volta_batch.cpp
+          ops/linear/linear_test_common.cpp
+          ops/linear_swiglu/linear_swiglu_test_common.cpp
+  LIBRARIES ninfer_ops)
 ninfer_add_linear_test(ninfer_linear_volta_tp4_a16_test ops/linear/test_volta_tp4_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_nvfp4_a4_test ops/linear/test_nvfp4_a4.cpp)
 ninfer_add_linear_test(ninfer_linear_fp8_a16_test ops/linear/test_fp8_a16.cpp)

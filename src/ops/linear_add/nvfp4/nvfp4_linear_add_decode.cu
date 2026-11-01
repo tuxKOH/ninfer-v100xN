@@ -5,6 +5,7 @@
 #include "ops/linear/nvfp4/nvfp4_gemv.cuh"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_epilogue.cuh"
 #ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/nvfp4/nvfp4_volta_batch.cuh"
 #include "ops/linear/nvfp4/nvfp4_volta_qpn_gemm.cuh"
 #endif
 
@@ -117,7 +118,9 @@ void nvfp4_linear_add_qpn_to(const Tensor& x, const Weight& weight, const Tensor
                              const Tensor& output, WorkspaceArena& workspace, cudaStream_t stream) {
     const Nvfp4RoundedAddOutput epilogue{static_cast<const __nv_bfloat16*>(residual.data),
                                        static_cast<__nv_bfloat16*>(output.data), weight.n};
-    if (nvfp4_volta_qpn_precast_supported(weight.n, weight.k, x.ne[1])) {
+    if (nvfp4_volta_batch_supported(weight.n, weight.k, x.ne[1])) {
+        launch_nvfp4_volta_batch_output(x, weight, epilogue, weight.n, workspace, stream);
+    } else if (nvfp4_volta_qpn_precast_supported(weight.n, weight.k, x.ne[1])) {
         launch_nvfp4_volta_qpn_with_precast_output(x, weight, epilogue, weight.n, workspace, stream);
     } else {
         launch_nvfp4_volta_qpn_with_output(x, weight, epilogue, weight.n,
@@ -164,7 +167,9 @@ void nvfp4_linear_add_qpn_publish(const Tensor& x, const Weight& weight,
             reinterpret_cast<const unsigned*>(static_cast<const std::uint8_t*>(local_storage) +
                                                 2 * epoch_bytes),
             static_cast<int>(epoch_bytes / sizeof(__nv_bfloat162))};
-        if (nvfp4_volta_qpn_precast_supported(weight.n, weight.k, x.ne[1])) {
+        if (nvfp4_volta_batch_supported(weight.n, weight.k, x.ne[1])) {
+            launch_nvfp4_volta_batch_output(x, weight, epilogue, weight.n, workspace, stream);
+        } else if (nvfp4_volta_qpn_precast_supported(weight.n, weight.k, x.ne[1])) {
             launch_nvfp4_volta_qpn_with_precast_output(x, weight, epilogue, weight.n,
                                                        workspace, stream);
         } else {

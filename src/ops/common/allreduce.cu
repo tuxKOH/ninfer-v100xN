@@ -444,14 +444,16 @@ PeerEvents::PeerEvents(const ExecutionContext& ec, bool direct_peer_access, Host
                 "mapped host packets require SM70 TP2 with direct P2P disabled");
     }
     if (packet_transport) {
-        const std::size_t payload_bytes = 2 * kPacketMaxBytes * (ec.device_count == 4 ? 4 : 1);
+        const std::size_t channel_bytes = packet_capacity_bytes();
+        const std::size_t blocks = channel_bytes / (16 * 64);
+        const std::size_t payload_bytes = 2 * channel_bytes * (ec.device_count == 4 ? 4 : 1);
         for (int rank = 0; rank < ec.device_count; ++rank) {
             CurrentDeviceGuard::set(ec.dev[rank]->device);
-            packets_[rank] = DeviceBuffer(payload_bytes + kPacketBlocks * sizeof(unsigned));
+            packets_[rank] = DeviceBuffer(payload_bytes + blocks * sizeof(unsigned));
             CUDA_CHECK(cudaMemsetAsync(packets_[rank].p, 0xff, payload_bytes,
                                        ec.dev[rank]->stream));
             CUDA_CHECK(cudaMemsetAsync(byte_offset(packets_[rank].p, payload_bytes),
-                                       0, kPacketBlocks * sizeof(unsigned), ec.dev[rank]->stream));
+                                       0, blocks * sizeof(unsigned), ec.dev[rank]->stream));
         }
     }
     // Create through a local table so a mid-way failure destroys what was already created instead
@@ -595,7 +597,7 @@ void allreduce_sum(std::span<const Tensor> buffer, std::span<const Tensor> stagi
         }
         return;
     }
-    if (events.packet_storage(0) != nullptr && bytes <= PeerEvents::kPacketMaxBytes &&
+    if (events.packet_storage(0) != nullptr && bytes <= events.packet_capacity_bytes() &&
         bytes % 16 == 0 && (addresses & 15U) == 0) {
         const std::array<void*, 4> storage{events.packet_storage(0), events.packet_storage(1),
                                          events.packet_storage(2), events.packet_storage(3)};
@@ -607,7 +609,7 @@ void allreduce_sum(std::span<const Tensor> buffer, std::span<const Tensor> stagi
                     PeerEvents::kPacketMaxBytes, local.stream);
             } else {
                 detail::allreduce_packet_sum_launch(buffer[rank], buffer[rank],
-                    storage[rank], storage[1 - rank], PeerEvents::kPacketMaxBytes, local.stream);
+                    storage[rank], storage[1 - rank], events.packet_capacity_bytes(), local.stream);
             }
         }
         return;
@@ -854,14 +856,14 @@ void allreduce_sum_to(std::span<const Tensor> input, std::span<const Tensor> out
         }
         return;
     }
-    if (events.packet_storage(0) != nullptr && bytes <= PeerEvents::kPacketMaxBytes &&
+    if (events.packet_storage(0) != nullptr && bytes <= events.packet_capacity_bytes() &&
         bytes % 16 == 0 && (addresses & 15U) == 0) {
         for (int rank = 0; rank < 2; ++rank) {
             const auto& local = *ec.dev[rank];
             CurrentDeviceGuard::set(local.device);
             detail::allreduce_packet_sum_launch(input[rank], output[rank],
                 events.packet_storage(rank), events.packet_storage(1 - rank),
-                PeerEvents::kPacketMaxBytes, local.stream);
+                events.packet_capacity_bytes(), local.stream);
         }
         return;
     }
@@ -920,14 +922,15 @@ static void sum_rmsnorm_to(std::span<const Tensor> input, std::span<const Tensor
         require_disjoint(n.data, n.bytes(), output[rank].data, output[rank].bytes(), "collective norm sum overlap");
 #endif
     }
-    if (events.packet_storage(0) && input[0].ne[0] == 5120 && input[0].ne[1] <= 8 &&
+    if (events.packet_storage(0) && input[0].ne[0] == 5120 && input[0].ne[1] >= 1 &&
+        input[0].bytes() <= events.packet_capacity_bytes() &&
         input[0].ne[2] == 1 && input[0].ne[3] == 1 && (addresses & 15U) == 0) {
         const CurrentDeviceGuard guard;
         for (int rank = 0; rank < 2; ++rank) {
             CurrentDeviceGuard::set(ec.dev[rank]->device);
             detail::allreduce_packet_rmsnorm_launch(input[rank], output[rank], norm.weight[rank],
                 norm.output[rank], norm.eps, norm.unit_offset, events.packet_storage(rank),
-                events.packet_storage(1-rank), PeerEvents::kPacketMaxBytes, ec.dev[rank]->stream, published);
+                events.packet_storage(1-rank), events.packet_capacity_bytes(), ec.dev[rank]->stream, published);
         }
         return;
     }

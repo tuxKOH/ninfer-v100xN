@@ -1,6 +1,7 @@
 #pragma once
 
 #include "targets/qwen3_6/impl/frontend/processor.h"
+#include "targets/qwen3_6/impl/frontend/preparation_control.h"
 
 #include <array>
 #include <cstddef>
@@ -116,8 +117,5 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
-
-void check_preparation_control(const PreparationControl& control,
-                               std::string_view stage = "preparation");
 
 } // namespace ninfer::targets::qwen3_6::frontend_internal

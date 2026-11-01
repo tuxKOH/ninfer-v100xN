@@ -18,7 +18,8 @@
 // UVA D2D implementation then selects its driver-managed staging path. Startup validates the
 // exact UVA D2D route in either case. Callers need no peer-access branch;
 // enable_peer_access() only reports whether direct peer access was qualified.
-// Qualified aligned SM70 TP2/TP4 reductions through 80 KiB use a two-epoch packet push.
+// Qualified aligned SM70 reductions use a two-epoch packet push: direct TP2
+// admits 640 KiB (64 hidden rows), while TP4 and mapped-host TP2 retain 80 KiB.
 // Each rank keeps its own contribution in registers and publishes a remote copy into a
 // startup-owned mailbox; it never reads the peer's input allocation. After every lane arrives,
 // it adds in FP32 and rounds once to BF16. Empty slots use a reserved NaN payload, preserving
@@ -193,6 +194,12 @@ public:
     }
     static constexpr std::size_t kPacketMaxBytes = 81920;
     static constexpr std::size_t kPacketBlocks = kPacketMaxBytes / (16 * 64);
+    static constexpr std::size_t kTp2PacketMaxBytes = 64 * 5120 * sizeof(std::uint16_t);
+    // Capacity of one direct-device channel, fixed by the startup rank domain.
+    // Mapped-host channels have their independent kPacketMaxBytes capacity.
+    [[nodiscard]] std::size_t packet_capacity_bytes() const noexcept {
+        return ranks_ == 2 ? kTp2PacketMaxBytes : kPacketMaxBytes;
+    }
 
     // False for a moved-from instance.
     [[nodiscard]] bool live() const noexcept {
@@ -267,7 +274,7 @@ void allreduce_sum_to(std::span<const Tensor> input, std::span<const Tensor> out
 // FP64 sum rounded once to BF16; the norm oracle evaluates the complete RMSNorm
 // formula in FP64 from that represented sum and the BF16 weights. Input planes
 // remain unchanged and retire on both streams before source reuse is allowed.
-// No per-call allocation. Qualified SM70 D5120/T1..8 uses one fused kernel;
+// No per-call allocation. Qualified direct SM70 TP2 D5120/T1..64 uses one fused kernel;
 // other profiles compose the same two Ops.
 void allreduce_sum_rmsnorm_to(std::span<const Tensor> input,
                               std::span<const Tensor> output,

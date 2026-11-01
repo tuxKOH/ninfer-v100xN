@@ -1,5 +1,7 @@
 #pragma once
 
+#include <ninfer/types.h>
+
 #include <array>
 #include <cstddef>
 #include <span>
@@ -12,6 +14,7 @@ namespace ninfer::targets::qwen3_6::frontend_internal {
 
 struct EncodeOptions {
     bool parse_added_tokens = true;
+    PreparationControl control;
 };
 
 struct DecodeOptions {

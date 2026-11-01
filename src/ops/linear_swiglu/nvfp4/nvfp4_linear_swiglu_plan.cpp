@@ -164,8 +164,8 @@ std::size_t capacity_bytes_impl(LinearPolicy policy, std::int32_t min_tokens,
             maximum = qpn_split_workspace_bytes<Geometry>(1);
         }
 #endif
-        // On Volta all A16 widths use dequantize+CUTLASS. Other builds use the fused kernel at
-        // small widths and the materialized baseline for wider calls.
+        // Capacity covers both the portable materialization path and the prepacked QPN
+        // paths. The latter reuse this arena for their packed activation supply.
         const Nvfp4LinearSwiGluRoute route = resolve_route(policy, max_tokens);
         if (route == Nvfp4LinearSwiGluRoute::LinearW4A4Post) {
             return baseline_workspace_bytes<Geometry>(policy, max_tokens);
@@ -243,13 +243,18 @@ void launch_tma(const std::uint8_t* activation_codes, const std::uint8_t* activa
     }
 }
 
-// The one route body, parameterized on Geometry. `workspace` is nullable (see
-// nvfp4_linear_swiglu_plan.h): the A16 routes never touch it; a W4A4-family route with a null
-// workspace throws, matching ops::linear's own nvfp4_dispatch guard.
+// The one route body, parameterized on Geometry. Packed batch and split-QPN A16
+// paths use caller-owned scratch; their arena scopes also remain valid during Graph capture.
 template <class Geometry>
 void dispatch_impl(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
                    WorkspaceArena* workspace, cudaStream_t stream) {
 #ifdef NINFER_VOLTA_BUILD
+    if (workspace && policy == LinearPolicy::A16Only &&
+        weight.layout == QuantLayout::VoltaQpnPrepacked &&
+        nvfp4_volta_batch_supported(weight.n, weight.k, x.ne[1])) {
+        nvfp4_linear_swiglu_batch_launch(x, weight, out, *workspace, stream);
+        return;
+    }
     if (workspace && policy == LinearPolicy::A16Only && x.ne[1] == 1 &&
         nvfp4_linear_swiglu_qpn_split_supported(weight.n, weight.k, x.ne[1])) {
         auto scope = workspace->scope();

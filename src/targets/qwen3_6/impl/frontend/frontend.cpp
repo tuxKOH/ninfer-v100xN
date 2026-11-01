@@ -936,7 +936,9 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
             if (it->role != ChatRole::User) { continue; }
             const std::string query = it->rendered_content();
             // Retrieval does not require a second unbounded encoding of a long archive message.
-            if (query.size() <= 16384) { retrieval_tokens = impl_->tokenizer->encode(query); }
+            if (query.size() <= 16384) {
+                retrieval_tokens = impl_->tokenizer->encode(query, {.control = control});
+            }
             break;
         }
     }
@@ -976,7 +978,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         const fi::RenderedChat rendered =
             impl_->chat_template.render(messages, render_options(options));
         const auto tokenize_started = Clock::now();
-        fi::EncodedChat encoded     = fi::encode_rendered_chat(*impl_->tokenizer, rendered);
+        fi::EncodedChat encoded     = fi::encode_rendered_chat(*impl_->tokenizer, rendered, control);
         result.prepare.tokenize_seconds =
             std::chrono::duration<double>(Clock::now() - tokenize_started).count();
         fi::check_preparation_control(control, "tokenization");
@@ -1015,7 +1017,7 @@ std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl
         const fi::RenderedChat rendered =
             impl_->chat_template.render(messages, render_options(options));
         const std::uint32_t count =
-            checked_token_count(impl_->tokenizer->encode(rendered.text).size());
+            checked_token_count(impl_->tokenizer->encode(rendered.text, {.control = control}).size());
         fi::check_preparation_control(control, "tokenization");
         return count;
     }

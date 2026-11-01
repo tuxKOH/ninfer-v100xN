@@ -240,10 +240,11 @@ int run_allreduce_case(const char* label, std::int32_t ne0, std::int32_t ne1, st
 // the same sources, without a gather or host wait between them. This exercises
 // the packet epochs across changing sizes and transitions to scalar/DMA routes.
 int run_varying_size_chain(const ExecutionContext& ec, const ops::PeerEvents& events) {
-    constexpr int maximum = 40961, rounds = 128;
+    constexpr int maximum = 5120 * 64 + 1, rounds = 128;
     const std::vector<std::uint16_t> initial(maximum, f32_to_bf16(std::ldexp(1.0f, -60)));
     std::vector<std::uint16_t> expected = initial;
-    const std::array<int, 5> sizes{5120, 25600, 40960, 4097, maximum};
+    const std::array<int, 9> sizes{5120, 25600, 40960, 51200, 102400, 204800,
+                                  327680, 4097, maximum};
     for (int round = 0; round < rounds; ++round) {
         for (int i = 0; i < sizes[round % sizes.size()]; ++i) {
             expected[i] = f32_to_bf16(2.0f * bf16_to_f32(expected[i]));
@@ -869,13 +870,14 @@ int main() {
     }
     // Real decode shape first: 5120 is the hidden dimension all-reduced 128 times per token.
     // Direct-read threshold, scalar tail, wide DMA fallback, graph replay and immutable inputs.
-    for (int count : {1, 4097, 5120, 25600, 40960, 40961}) {
+    for (int count : {1, 4097, 5120, 25600, 40960, 40961, 51200, 102400, 204800,
+                     327680, 327681}) {
         failures += run_allreduce_case("allreduce_sum_to", count, 1, 121u, ec, events, true);
         const ops::PeerEvents dma_events(ec, false, ops::PeerEvents::HostPackets::Disabled);
         failures += run_allreduce_case("allreduce_sum_to forced DMA", count, 1, 122u,
                                        ec, dma_events, true);
     }
-    for (int tokens : {1, 4, 5, 8, 9}) {
+    for (int tokens : {1, 4, 5, 8, 9, 10, 20, 40, 64, 65}) {
         for (unsigned seed : {141u, 142u}) {
             failures += run_allreduce_case("sum + RMSNorm", 5120, tokens, seed, ec, events, true, true);
             const ops::PeerEvents dma_events(ec, false, ops::PeerEvents::HostPackets::Disabled);

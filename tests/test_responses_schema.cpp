@@ -383,6 +383,71 @@ GenerationOutcome sample_outcome() {
     return outcome;
 }
 
+int test_dsh_request_options() {
+    // The pi-ai Responses provider used by DSH sends these options even for a
+    // local server. Optional summaries/ciphertext must not block raw reasoning.
+    Json body = {{"model", "qwen3.8-27b"},
+                 {"input", Json::array({Json{{"role", "user"},
+                    {"content", Json::array({Json{{"type", "input_text"}, {"text", "hello"}}})}}})},
+                 {"stream", true}, {"store", false}, {"prompt_cache_key", "dsh-session"},
+                 {"reasoning", {{"effort", "low"}, {"summary", "auto"}}},
+                 {"include", Json::array({"reasoning.encrypted_content"})}};
+    int failures = 0;
+    for (const std::string summary : {"auto", "concise", "detailed"}) {
+        body["reasoning"]["summary"] = summary;
+        auto request = parse_responses_request(body, limits());
+        auto built = make_response_object("resp_dsh", 1, request, {}, sample_outcome());
+        failures += check(request.prompt_cache_key == "dsh-session" && !request.store &&
+                              request.generation.reasoning_effort == RequestedReasoningEffort::Low &&
+                              built.body.at("prompt_cache_key") == "dsh-session" &&
+                              built.body.at("reasoning").at("summary") == summary &&
+                              built.output_items.front().at("summary").empty() &&
+                              built.output_items.front().at("encrypted_content").is_null(),
+                          "DSH cache/reasoning preferences did not preserve raw output");
+        Json replay = body;
+        replay["input"] = built.output_items;
+        failures += check(parse_responses_request(replay, limits()).input_turns[0].reasoning_content ==
+                              sample_outcome().reasoning, "DSH raw reasoning replay was lost");
+        ResponsesEventStream stream("resp_dsh_stream", 1, request, {});
+        auto events = stream.start();
+        auto deltas = stream.reasoning_delta("thought");
+        auto finish = stream.finish(sample_outcome());
+        events.insert(events.end(), deltas.begin(), deltas.end());
+        events.insert(events.end(), finish.events_before_terminal.begin(), finish.events_before_terminal.end());
+        events.push_back(stream.terminal(finish.response));
+        int reasoning_items = 0;
+        for (const auto& event : events) {
+            const auto wire = parse_event(event);
+            if (wire.contains("item") && wire.at("item").at("type") == "reasoning") {
+                ++reasoning_items;
+                failures += check(wire.at("item").at("encrypted_content").is_null(),
+                                  "SSE reasoning claimed encrypted content");
+            }
+        }
+        failures += check(reasoning_items == 2, "missing DSH reasoning item lifecycle");
+    }
+    for (const Json key : {Json(nullptr), Json(""), Json(std::string(128, 'a')), Json("会话🧪")}) {
+        body["prompt_cache_key"] = key;
+        const auto request = parse_responses_request(body, limits());
+        const auto built = make_response_object("resp_key", 1, request, {}, sample_outcome());
+        failures += check(built.body.at("prompt_cache_key") == key, "cache hint changed on echo");
+    }
+    for (const Json key : {Json(1), Json(true), Json::object(), Json::array()}) {
+        body["prompt_cache_key"] = key;
+        failures += check(throws_api([&] { (void)parse_responses_request(body, limits()); }),
+                          "non-string cache key accepted");
+    }
+    body["prompt_cache_key"] = "dsh-session";
+    body["reasoning"]["summary"] = "unknown";
+    failures += check(throws_api([&] { (void)parse_responses_request(body, limits()); }),
+                      "unknown reasoning summary preference accepted");
+    body["reasoning"]["summary"] = nullptr;
+    body["include"] = Json::array({"reasoning.encrypted_content", "made_up"});
+    failures += check(api_code([&] { (void)parse_responses_request(body, limits()); }) ==
+                          "include_not_supported", "unsupported include field was ignored");
+    return failures;
+}
+
 int test_response_object() {
     ResponsesRequest request = parse_responses_request(Json{{"model", "qwen3.6-27b"},
                                                             {"input", "hello"},
@@ -568,6 +633,7 @@ int main() {
     int failures = 0;
     failures += test_output_token_cap();
     failures += test_basic_request();
+    failures += test_dsh_request_options();
     failures += test_instruction_message_order();
     failures += test_preserve_thinking_options_and_inheritance();
     failures += test_reasoning_effort();

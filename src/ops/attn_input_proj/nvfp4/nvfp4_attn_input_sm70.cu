@@ -4,6 +4,7 @@
 #include "core/layout.h"
 #include "ops/linear/nvfp4/nvfp4_cutlass_sm70.h"
 #include "ops/linear/nvfp4/nvfp4_launch.h"
+#include "ops/linear/nvfp4/nvfp4_volta_batch.cuh"
 #include "ops/linear/nvfp4/nvfp4_volta_qpn_gemm.cuh"
 
 #include <algorithm>
@@ -54,6 +55,11 @@ void launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tens
                                       static_cast<__nv_bfloat16*>(k.data),
                                       static_cast<__nv_bfloat16*>(gate.data),
                                       static_cast<__nv_bfloat16*>(v.data)};
+    if (workspace != nullptr && weight.layout == QuantLayout::VoltaQpnPrepacked &&
+        nvfp4_volta_batch_supported(weight.n, weight.k, x.ne[1])) {
+        launch_nvfp4_volta_batch_output(x, weight, output, weight.n, *workspace, stream);
+        return;
+    }
     if (workspace != nullptr &&
         nvfp4_volta_qpn_precast_supported(weight.n, weight.k, x.ne[1])) {
         launch_nvfp4_volta_qpn_with_precast_output(x, weight, output, weight.n, *workspace, stream);
@@ -87,7 +93,10 @@ void launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tens
 } // namespace
 
 std::size_t nvfp4_attn_input_sm70_workspace_bytes(int rows, int tokens) {
-    if (tokens < 128) { return nvfp4_volta_qpn_precast_workspace_bytes(rows, 5120, tokens); }
+    if (tokens < 128) {
+        return std::max(nvfp4_volta_qpn_precast_workspace_bytes(rows, 5120, tokens),
+                        nvfp4_volta_batch_workspace_bytes(rows, 5120, tokens));
+    }
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::BF16, {rows, tokens});
     (void)layout.alloc_bytes(nvfp4_cutlass_sm70_workspace_bytes(rows, 5120, tokens));

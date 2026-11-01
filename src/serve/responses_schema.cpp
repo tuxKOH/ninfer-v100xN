@@ -532,10 +532,18 @@ void parse_reasoning(const Json& body, ResponsesRequest& out) {
     const Json& reasoning = body.at("reasoning");
     if (!reasoning.is_object()) { bad_request("reasoning must be an object", "reasoning"); }
     for (auto it = reasoning.begin(); it != reasoning.end(); ++it) {
-        if (it.key() != "effort" && !it.value().is_null()) {
+        if (it.key() != "effort" && it.key() != "summary" && !it.value().is_null()) {
             bad_request("reasoning." + it.key() + " is not supported", "reasoning",
                         "reasoning_option_not_supported");
         }
+    }
+    if (reasoning.contains("summary") && !reasoning.at("summary").is_null()) {
+        const auto& summary = reasoning.at("summary");
+        if (!summary.is_string() || (summary != "auto" && summary != "concise" &&
+                                      summary != "detailed")) {
+            bad_request("reasoning.summary must be auto, concise, or detailed", "reasoning.summary");
+        }
+        out.reasoning_summary = summary.get<std::string>();
     }
     if (!reasoning.contains("effort") || reasoning.at("effort").is_null()) { return; }
     if (!reasoning.at("effort").is_string()) {
@@ -615,7 +623,7 @@ void reject_unknown_top_level(const Json& body) {
 
 void reject_server_managed_features(const Json& body) {
     for (const char* key : {"context_management", "conversation", "max_tool_calls", "moderation",
-                            "prompt", "prompt_cache_key", "prompt_cache_options",
+                            "prompt", "prompt_cache_options",
                             "prompt_cache_retention", "safety_identifier", "user"}) {
         if (body.contains(key) && !body.at(key).is_null()) {
             bad_request(std::string(key) + " is not supported", key, "parameter_not_supported");
@@ -632,9 +640,11 @@ void reject_server_managed_features(const Json& body) {
     }
     if (body.contains("include") && !body.at("include").is_null()) {
         if (!body.at("include").is_array()) { bad_request("include must be an array", "include"); }
-        if (!body.at("include").empty()) {
-            bad_request("additional response fields are not supported", "include",
-                        "include_not_supported");
+        for (const auto& field : body.at("include")) {
+            if (!field.is_string() || field != "reasoning.encrypted_content") {
+                bad_request("include only supports reasoning.encrypted_content (null locally)",
+                            "include", "include_not_supported");
+            }
         }
     }
     if (body.contains("parallel_tool_calls") && !body.at("parallel_tool_calls").is_null()) {
@@ -718,6 +728,12 @@ ResponsesRequest parse_request_impl(const Json& body, const RequestLimits& limit
         bad_request("missing required field: model", "model");
     }
     out.generation.model = body.at("model").get<std::string>();
+    if (body.contains("prompt_cache_key") && !body.at("prompt_cache_key").is_null()) {
+        if (!body.at("prompt_cache_key").is_string()) {
+            bad_request("prompt_cache_key must be a string", "prompt_cache_key");
+        }
+        out.prompt_cache_key = body.at("prompt_cache_key").get<std::string>();
+    }
     if (!body.contains("input")) { bad_request("missing required field: input", "input"); }
     parse_input(body.at("input"), out);
 
@@ -814,7 +830,7 @@ Json response_common(const std::string& id, std::int64_t created_at,
         {"effort", request.generation.reasoning_effort
                        ? Json(requested_reasoning_effort_name(*request.generation.reasoning_effort))
                        : Json(nullptr)},
-        {"summary", nullptr}};
+        {"summary", request.reasoning_summary ? Json(*request.reasoning_summary) : Json(nullptr)}};
     return Json{
         {"id", id},
         {"object", "response"},
@@ -828,6 +844,7 @@ Json response_common(const std::string& id, std::int64_t created_at,
         {"parallel_tool_calls", true},
         {"previous_response_id",
          request.previous_response_id ? Json(*request.previous_response_id) : Json(nullptr)},
+        {"prompt_cache_key", request.prompt_cache_key ? Json(*request.prompt_cache_key) : Json(nullptr)},
         {"reasoning", reasoning},
         {"service_tier", "default"},
         {"store", request.store},
@@ -857,6 +874,7 @@ BuiltResponse build_response(const std::string& id, std::int64_t created_at,
                  {"type", "reasoning"},
                  {"status", reasoning_status},
                  {"summary", Json::array()},
+                 {"encrypted_content", nullptr},
                  {"content",
                   Json::array({Json{{"type", "reasoning_text"}, {"text", outcome.reasoning}}})}});
     }
@@ -1021,6 +1039,7 @@ public:
                              {"type", "reasoning"},
                              {"status", "in_progress"},
                              {"summary", Json::array()},
+                             {"encrypted_content", nullptr},
                              {"content", Json::array()}};
         const Json part   = {{"type", "reasoning_text"}, {"text", ""}};
         return {sse(event("response.output_item.added",
@@ -1041,6 +1060,7 @@ public:
                            {"type", "reasoning"},
                            {"status", item_status},
                            {"summary", Json::array()},
+                           {"encrypted_content", nullptr},
                            {"content", Json::array({part})}};
         return {sse(event("response.reasoning_text.done", Json{{"item_id", ids.reasoning},
                                                                {"output_index", reasoning_index},
