@@ -33,27 +33,47 @@ The authors report GPQA-D 90.91% versus BF16 91.41%, and AIME'26 100% for both.
 These are external source-checkpoint results, not our V100 conversion scores or proof of
 losslessness. [Sources, independent comparison and limitations](docs/model-quality.md).
 
-## v0.2.1: TP2 concurrency and serving fixes
+## v0.2.1: TP2 / TP4 concurrency and serving fixes
 
-QUASAR NVFP4 / MTP4 now uses packed batch projections and fused TP2 packet/norm handoff.
-On the local two 16 GB V100s, committed decode throughput is:
+QUASAR NVFP4 / MTP4 now uses packed batch projections, direct packet publication and fused
+sum/norm handoff on TP2 and TP4. Complete **2K coding chats**, 512 output tokens per request:
 
-| Input per request | C1 | C2 | C4 | C8 |
+| Route | C1 | C2 | C4 | C8 |
 |---|---:|---:|---:|---:|
-| 2K | 183.2 | 246.0 | 357.1 | **493.1** |
-| 16K | 181.4 | 237.4 | 323.0 | **408.0** |
-| 85K | 199.5 | 213.3 | — | — |
+| 4 × V100 16 GB, NVLink TP4 | 312.1 | 436.6 | 702.0 | **1083.4** |
+| 2 × V100 16 GB, NVLink TP2 | 223.5 | 312.4 | 471.4 | **677.9** |
+| 2 × V100 16 GB, PCIe P2P without NVLink | 220.8 | 297.2 | 436.0 | **603.9** |
 
-Rates are total committed decode tok/s, excluding prefill. Compared with the preceding source,
-C8 improves about **203.6% / 109.5%** at 2K / 16K; single-stream rates are effectively unchanged.
-The 180K shared KV pool fits only two 85K requests. Cold prefill still dominates long-input
-whole-group latency. The replacement T>32 reduction can change output/acceptance, observed at
-C8; no new GPQA.
-These changes ship in v0.2.1 source, Linux SM70 binaries and Docker assets.
+These are total committed decode tok/s from executor rounds, excluding prefill, with Graphs,
+greedy optimized-head MTP4 and both experimental profiles. C8 draft acceptance is **74.4%**
+for TP4 and **76.4%** for both TP2 routes. The two TP2 hosts differ in more than NVLink.
+The new short prompt retains its complete task and assistant prefix. Earlier **493.1 / 554.0**
+short-input results used a truncated raw prefix and remain separate diagnostics; changing the
+prompt is not a software speedup.
+
+The **85K C1/C2/C4/C8 matrix** reports actual batch and whole-wave latency as well as pure
+decode. At 180K shared KV, only two 85K requests fit together, so offered C8 is not eight
+simultaneous decode streams. C8 reaches **317.8 / 200.3 / 198.2 tok/s** for TP4 NVLink,
+TP2 NVLink and local PCIe TP2, respectively, with mean actual batches of about **1.23**.
+The same-host **1Cat 1.5.1** control uses an existing AWQ INT4 /
+FP16 / E4M3-KV checkpoint; its HTTP token-ID windows are reported separately from NInfer's
+QUASAR NVFP4 / BF16 / INT8-G64 executor timing. These are speed references with different
+numerical profiles, not equal-quality comparisons.
+For 2K/C8, the common decode windows measure **1160.9 tok/s** for NInfer TP4's sampled
+executor window and **588.3 tok/s** for 1Cat's SSE window; whole-wave output rates are
+**444.6 / 338.8 tok/s**, respectively. The timing windows and formats differ as detailed below.
+[Full matrices, acceptance, source comparison and method](docs/performance.md#tp4-concurrent-packed-batch-decode-2026-11-05).
+
+![Complete-code concurrency measurements](docs/assets/tp4-concurrency/quasar-concurrency.svg)
+
+TP4 adds batch-aware short-context attention and per-request GDN record/norm. Independent
+FP64 operator checks, C2/C4/C8 normal/longfast Graph/eager output and acceptance checks, and
+actual-85K state/replay checks pass. Reduction association and draft acceptance can change;
+**no new GPQA**. Long attention and fast decode remain default-off.
+These changes ship as v0.2.1 source, Linux SM70 prebuilt binaries and a loadable Docker image.
+
 This release also fixes tokenization deadline/cancellation (#6) and DSH Responses requests
 with `prompt_cache_key` and optional reasoning hints (#4).
-[Full conditions and before/after chart](docs/performance.md#tp2-concurrent-packed-batch-decode-2026-11-02).
-
 
 ## v0.2.0: TP4, hot model residency and packaged Docker
 
@@ -114,7 +134,7 @@ Releases provide source archives, update logs and an explicit 85K performance co
 
 ## QUASAR measurements — 2026-10-19
 
-The latest speed-only matrix is complete: **80 measured requests**, four text tasks, native
+The earlier single-request speed-only matrix contains **80 measured requests**, four text tasks, native
 input lengths through **85,000 occupied tokens**, and the two saved GUI configurations below.
 Both use TP2, optimized-head **MTP4**, complete INT8 group-64 KV, CUDA Graphs and chunk 2560.
 Fast decode is **off in both**; the Text configuration enables experimental long attention.

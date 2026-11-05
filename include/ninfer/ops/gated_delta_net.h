@@ -106,11 +106,11 @@ void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tenso
 /**
  * Optional closed gated-normalization epilogue for replay recording. It consumes the public
  * BF16 readout and applies gated_rmsnorm with BF16 weight [128] and same-shaped BF16 z.
- * out is the BF16-rounded FP16 image. completion_counts is device I32 [12], initialized to
+ * out is BF16 or its BF16-rounded FP16 image. completion_counts is device I32 [12,B], initialized to
  * zero once before first use. Calls sharing these counters must be stream-ordered, including
  * Graph replays; every completed call restores all counters to zero. It is private synchronization
  * storage, never model state, and may not overlap any input, readout, record or normalized output.
- * The admitted fused geometry is Hq=4, Hv=12, B=1, T=2..8. Readout/record/state semantics are
+ * The admitted fused geometry is Hq=4, Hv=12, B=1..8, T=2..8. Readout/record/state semantics are
  * unchanged. Its norm oracle evaluates FP64 from the represented BF16 readout, weight and z.
  */
 struct GdnReplayGatedNorm {

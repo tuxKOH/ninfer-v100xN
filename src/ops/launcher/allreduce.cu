@@ -95,13 +95,17 @@ void allreduce_packet_sum4_rmsnorm_launch(const Tensor& buffer, const Tensor& we
     auto* epochs = reinterpret_cast<unsigned*>(static_cast<std::uint8_t*>(storage[rank]) +
                                               8 * channel_bytes);
     const auto launch = [&]<int Rank, RmsEpilogue Epilogue, bool Published, bool Fp16Image>() {
-        allreduce_packet_sum4_rmsnorm_kernel<Rank, Epilogue, Published, Fp16Image>
-            <<<buffer.ne[1], 640, 0, stream>>>(
+        const auto issue = [&]<int Threads>() {
+            allreduce_packet_sum4_rmsnorm_kernel<Rank, Epilogue, Published, Fp16Image, Threads>
+            <<<buffer.ne[1], Threads, 0, stream>>>(
             static_cast<Bf16x8Pack*>(buffer.data), static_cast<const Bf16x8Pack*>(weight.data),
             static_cast<Bf16x8Pack*>(normalized.data), static_cast<Bf16x8Pack*>(storage[0]),
             static_cast<Bf16x8Pack*>(storage[1]), static_cast<Bf16x8Pack*>(storage[2]),
             static_cast<Bf16x8Pack*>(storage[3]), epochs, buffer.ne[1],
             static_cast<int>(channel_bytes / sizeof(Bf16x8Pack)), eps);
+        };
+        if (buffer.ne[1] > 8) issue.template operator()<128>();
+        else issue.template operator()<640>();
     };
     const auto rank_launch = [&]<int Rank>() {
         const auto profile = [&]<bool Published, bool Fp16Image>() {

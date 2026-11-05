@@ -273,29 +273,40 @@ __global__ __launch_bounds__(kAllreduceTp4PacketThreads, 2) void allreduce_packe
 }
 
 // One complete D5120 row owns ten 64-pack epoch domains.
-template <int Rank, RmsEpilogue Epilogue, bool Published, bool Fp16Image>
-__global__ __launch_bounds__(640, 1) void allreduce_packet_sum4_rmsnorm_kernel(
+template <int Rank, RmsEpilogue Epilogue, bool Published, bool Fp16Image, int Threads = 640>
+__global__ __launch_bounds__(Threads, 1) void allreduce_packet_sum4_rmsnorm_kernel(
     Bf16x8Pack* buffer, const Bf16x8Pack* weight, Bf16x8Pack* normalized,
     Bf16x8Pack* storage0, Bf16x8Pack* storage1, Bf16x8Pack* storage2,
     Bf16x8Pack* storage3, unsigned* epochs, int rows, int channel_packs, float eps) {
     constexpr int PacksPerRow = 640;
-    const int tid = threadIdx.x, row = blockIdx.x, i = row * PacksPerRow + tid;
+    static_assert(Threads == 128 || Threads == PacksPerRow);
+    constexpr int Passes = PacksPerRow / Threads;
+    const int tid = threadIdx.x, row = blockIdx.x;
     Bf16x8Pack* const local_storage = Rank == 0 ? storage0 : Rank == 1 ? storage1 :
                                       Rank == 2 ? storage2 : storage3;
-    auto value = allreduce_packet_sum4_value<Rank, Published>(buffer, storage0, storage1,
-        storage2, storage3, local_storage, i, epochs[i / 64] & 1U, channel_packs);
-    store_vec(buffer + i, value);
-    float square_sum = 0.f;
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const auto v = __bfloat1622float2(value.pair[j]);
-        square_sum += v.x * v.x + v.y * v.y;
-    }
-#pragma unroll
-    for (int delta = 16; delta > 0; delta >>= 1)
-        square_sum += __shfl_xor_sync(0xffffffffU, square_sum, delta);
+    Bf16x8Pack values[Passes];
     __shared__ float warp_sums[20], inverse;
-    if ((tid & 31) == 0) warp_sums[tid / 32] = square_sum;
+    // Batch rows supply the grid. Reuse a smaller CTA over five pack panels,
+    // keeping all twenty logical warp sums and their final association intact.
+    // This follows 1Cat's small-CTA batch sum/norm scheduling, without changing
+    // NInfer's BF16 contribution/residual or fixed global-rank reduction order.
+#pragma unroll
+    for (int pass = 0; pass < Passes; ++pass) {
+        const int pack = tid + pass * Threads, i = row * PacksPerRow + pack;
+        values[pass] = allreduce_packet_sum4_value<Rank, Published>(buffer, storage0, storage1,
+            storage2, storage3, local_storage, i, epochs[i / 64] & 1U, channel_packs);
+        store_vec(buffer + i, values[pass]);
+        float square_sum = 0.f;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const auto v = __bfloat1622float2(values[pass].pair[j]);
+            square_sum += v.x * v.x + v.y * v.y;
+        }
+#pragma unroll
+        for (int delta = 16; delta > 0; delta >>= 1)
+            square_sum += __shfl_xor_sync(0xffffffffU, square_sum, delta);
+        if ((tid & 31) == 0) warp_sums[pack / 32] = square_sum;
+    }
     __syncthreads();
     if (tid < 32) {
         float sum = tid < 20 ? warp_sums[tid] : 0.f;
@@ -306,23 +317,28 @@ __global__ __launch_bounds__(640, 1) void allreduce_packet_sum4_rmsnorm_kernel(
     }
     if (tid < 10) epochs[row * 10 + tid] ^= 1U;
     __syncthreads();
-    const auto w = load_vec<Bf16x8Pack>(weight + tid);
 #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const auto v = __bfloat1622float2(value.pair[j]);
-        const auto ww = __bfloat1622float2(w.pair[j]);
-        const auto rounded = __floats2bfloat162_rn(
-            rmsnorm_epilogue<Epilogue>(v.x, inverse, ww.x, 0.f),
-            rmsnorm_epilogue<Epilogue>(v.y, inverse, ww.y, 0.f));
-        if constexpr (Fp16Image) {
-            const auto represented = __bfloat1622float2(rounded);
-            const auto image = __floats2half2_rn(represented.x, represented.y);
-            value.pair[j] = *reinterpret_cast<const __nv_bfloat162*>(&image);
-        } else {
-            value.pair[j] = rounded;
+    for (int pass = 0; pass < Passes; ++pass) {
+        const int pack = tid + pass * Threads;
+        const auto w = load_vec<Bf16x8Pack>(weight + pack);
+        auto value = values[pass];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const auto v = __bfloat1622float2(value.pair[j]);
+            const auto ww = __bfloat1622float2(w.pair[j]);
+            const auto rounded = __floats2bfloat162_rn(
+                rmsnorm_epilogue<Epilogue>(v.x, inverse, ww.x, 0.f),
+                rmsnorm_epilogue<Epilogue>(v.y, inverse, ww.y, 0.f));
+            if constexpr (Fp16Image) {
+                const auto represented = __bfloat1622float2(rounded);
+                const auto image = __floats2half2_rn(represented.x, represented.y);
+                value.pair[j] = *reinterpret_cast<const __nv_bfloat162*>(&image);
+            } else {
+                value.pair[j] = rounded;
+            }
         }
+        store_vec(normalized + row * PacksPerRow + pack, value);
     }
-    store_vec(normalized + i, value);
 }
 
 // Shares the packet route's fixed 256-pair epoch domains. Each complete D5120

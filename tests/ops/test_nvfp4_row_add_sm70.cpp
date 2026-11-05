@@ -229,7 +229,7 @@ int run(const ExecutionContext& ec, const ops::PeerEvents& events, int k, int to
     };
     auto expected = reference_bits();
     reset(); invoke(); sync(); verify(expected);
-    if (tokens == 5 || (Width == 2 && tokens >= 10) || (Width == 4 && tokens == 8)) {
+    if (tokens == 5 || (Width == 2 && tokens >= 10) || (Width == 4 && tokens >= 8)) {
         cuda_check(cudaSetDevice(ec.dev[0]->device), "select capture origin");
         std::array<std::unique_ptr<DecodeGraphPeerBridge>, Width - 1> bridges;
         std::array<DecodeGraphPeerCapture, Width - 1> peers;
@@ -284,6 +284,8 @@ int run(const ExecutionContext& ec, const ops::PeerEvents& events, int k, int to
 
 int main(int argc, char** argv) {
     const bool image_only = argc == 2 && std::string_view(argv[1]) == "--fp16-image-only";
+    const bool tp4_batch_only = argc == 2 && std::string_view(argv[1]) == "--tp4-batch-only";
+    if (argc != 1 && !image_only && !tp4_batch_only) return 2;
     if (cuda_unavailable()) { return 77; }
     int count = 0;
     cuda_check(cudaGetDeviceCount(&count), "device count");
@@ -292,7 +294,7 @@ int main(int argc, char** argv) {
     if (ec.dev[0]->sm() != 70) { return 77; }
     const ops::PeerEvents events(ec, ops::enable_peer_access(ec));
     int failures = 0;
-    if (!image_only) for (bool selected : {false, true}) {
+    if (!image_only && !tp4_batch_only) for (bool selected : {false, true}) {
         fp32_scale = selected;
         for (int k : {3072, 8704}) {
             for (int tokens : {1, 5, 8, 9, 10, 20, 40, 64}) {
@@ -300,13 +302,15 @@ int main(int argc, char** argv) {
             }
         }
     }
+    if (tp4_batch_only && count < 4) return 77;
     if (count >= 4) {
         const ExecutionContext four({0, 1, 2, 3});
         const ops::PeerEvents peer(four, ops::enable_peer_access(four));
         for (bool selected : {false, true}) {
             fp32_scale = selected;
             for (int k : {1536, 4352}) {
-                for (int tokens : {1, 5, 8, 9}) {
+                for (int tokens : {1, 5, 8, 9, 10, 16, 20, 32, 40, 64}) {
+                    if (tp4_batch_only && tokens <= 8) continue;
                     if (!image_only) failures += run<4>(four, peer, k, tokens);
                     if (tokens <= 8) failures += run<4>(four, peer, k, tokens, true);
                     if (tokens <= 8) {

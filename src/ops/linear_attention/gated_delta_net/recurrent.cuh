@@ -671,7 +671,9 @@ __device__ __forceinline__ void recurrent_bf16_body(const Access& access,
     }
 
     RawQkLane key = load_raw_qk_lane(access.key_ptr(coord, 0), coord.dqk_base);
-    if constexpr (Mode == RecurrentMode::Record) { access.store_key(coord, 0, key); }
+    if constexpr (Mode == RecurrentMode::Record) {
+        if (valid > 0) { access.store_key(coord, 0, key); }
+    }
     normalize_qk_lane<NormalizeInputs>(key.value, coord.lane);
 
     for (std::int32_t token = 0; token < valid; ++token) {
@@ -737,10 +739,10 @@ __global__ void __launch_bounds__(kWarpSize* Warps, 2)
 // thread publishes before the completion atomic; volatile loads bypass any earlier L1 lines.
 // The last atomic restores zero. The caller orders successive invocations on one stream, so no
 // next invocation can use the counter or readout before this kernel has completely finished.
-template <bool Masked>
+template <bool Masked, bool Fp16Image>
 __global__ __launch_bounds__(128, 2) void recurrent_record_norm_kernel(
     RecordAccess<Masked, 2, 4> access, const __nv_bfloat162* weight,
-    const __nv_bfloat162* z, __half2* output, float eps, unsigned* counters) {
+    const __nv_bfloat162* z, RmsOutputPair<Fp16Image>* output, float eps, unsigned* counters) {
     const auto coord = access.coordinates();
     recurrent_bf16_body<RecurrentMode::Record, true, RecordAccess<Masked, 2, 4>, 2>(
         access, coord, access.width, access.active_columns(coord));
@@ -748,13 +750,13 @@ __global__ __launch_bounds__(128, 2) void recurrent_record_norm_kernel(
     __syncthreads();
     __shared__ int last;
     if (threadIdx.x == 0 && threadIdx.y == 0) {
-        last = atomicInc(counters + coord.value_head, 15) == 15;
+        last = atomicInc(counters + coord.batch * access.heads.H_v + coord.value_head, 15) == 15;
     }
     __syncthreads();
     if (!last) { return; }
     const int lane = threadIdx.x;
     for (int token = threadIdx.y; token < access.width; token += 4) {
-        const int base = (token * access.heads.H_v + coord.value_head) * 64;
+        const int base = (access.column(coord, token) * access.heads.H_v + coord.value_head) * 64;
         const auto* x = reinterpret_cast<const volatile unsigned*>(access.out) + base;
         const unsigned p = x[lane], q = x[lane + 32];
         const auto f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&p));
@@ -769,10 +771,10 @@ __global__ __launch_bounds__(128, 2) void recurrent_record_norm_kernel(
         const auto w1 = __bfloat1622float2(weight[lane + 32]);
         const auto z0 = __bfloat1622float2(z[base + lane]);
         const auto z1 = __bfloat1622float2(z[base + lane + 32]);
-        output[base + lane] = rmsnorm_output_pair<true>(
+        output[base + lane] = rmsnorm_output_pair<Fp16Image>(
             rmsnorm_epilogue<RmsEpilogue::Gated>(f.x, inv, w0.x, z0.x),
             rmsnorm_epilogue<RmsEpilogue::Gated>(f.y, inv, w0.y, z0.y));
-        output[base + lane + 32] = rmsnorm_output_pair<true>(
+        output[base + lane + 32] = rmsnorm_output_pair<Fp16Image>(
             rmsnorm_epilogue<RmsEpilogue::Gated>(h.x, inv, w1.x, z1.x),
             rmsnorm_epilogue<RmsEpilogue::Gated>(h.y, inv, w1.y, z1.y));
     }

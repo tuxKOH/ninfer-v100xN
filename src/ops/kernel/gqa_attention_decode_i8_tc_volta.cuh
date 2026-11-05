@@ -104,7 +104,7 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void gqa_attention_small_t_tc_
     const std::int32_t* block_tables, const std::int32_t* valid_columns,
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
-    __nv_bfloat16* partial_acc, float* partial_m, float* partial_l) {
+    GqaPartial<Fp32Pv>* partial_acc, float* partial_m, float* partial_l, bool volta_long_attention) {
     static_assert(TokenTile >= 1 && TokenTile <= 6);
     static_assert(WarpsPerCta == 4 || WarpsPerCta == 8);
     static_assert(!Fp32Pv || (SharedSoftmax && WarpsPerCta == 8));
@@ -210,7 +210,7 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void gqa_attention_small_t_tc_
             gqa_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
             if (gqa_valid_q_head<Geometry>(kv_head, q_head)) {
                 partial_acc[gqa_partial_acc_index<Geometry>(q_head, d, token, split, tokens)] =
-                    __float2bfloat16(0.0f);
+                    GqaPartial<Fp32Pv>{};
             }
         }
     };
@@ -235,7 +235,8 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void gqa_attention_small_t_tc_
     // Producer and INT8 reducer must agree on the live partials, including the T=5/6
     // window specializations; the BF16 policy can leave unread or unwritten split rows.
     const int active_split_count =
-        gqa_small_t_active_splits<Geometry, true>(window, split_count, TokenTile, Fp32Pv);
+        gqa_small_t_active_splits<Geometry, true>(window, split_count, TokenTile,
+                                                volta_long_attention, MultiBatch ? gridDim.z : 1);
     if (split >= active_split_count) { return; }
 
     const int logical_tiles = div_up(window, Bc);
@@ -693,7 +694,7 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void gqa_attention_small_t_tc_
                                                           q_head, token);
                         const int d = dim_warp * DSlice + c * 8 + volta_d_get_j(j);
                         partial_acc[gqa_partial_acc_index<Geometry>(q_head, d, token, split, tokens)] =
-                            __float2bfloat16(acc_f[c][j]);
+                            acc_f[c][j];
                     }
                 }
             }

@@ -27,25 +27,43 @@ Graph/eager 状态检查已通过。Split-D 和实验数值路径可能改变输
 91.41%；AIME'26 两者均为 100%。这些是外部源模型成绩，不是本机转换后的质量分数，
 也不代表数学无损。[公开来源、独立对比和限制](docs/model-quality.md)。
 
-## v0.2.1：TP2 并发与接口修复
+## v0.2.1：双卡 / 四卡并发与服务修复
 
-QUASAR NVFP4 / MTP4 新增批量 packed 投影与 TP2 packet/norm 融合。本机双张 16 GB V100 实测：
+QUASAR NVFP4 / MTP4 在 TP2、TP4 使用 packed 批量投影、直接 packet 发布与 sum/norm 融合。
+**完整 2K 代码任务**，每请求输出 512 tokens：
 
-| 每请求输入 | 单并发 | 两并发 | 四并发 | 八并发 |
+| 路线 | 单并发 | 两并发 | 四并发 | 八并发 |
 |---|---:|---:|---:|---:|
-| 2K | 183.2 | 246.0 | 357.1 | **493.1** |
-| 16K | 181.4 | 237.4 | 323.0 | **408.0** |
-| 85K | 199.5 | 213.3 | — | — |
+| 四张 V100 16 GB，NVLink TP4 | 312.1 | 436.6 | 702.0 | **1083.4** |
+| 双张 V100 16 GB，NVLink TP2 | 223.5 | 312.4 | 471.4 | **677.9** |
+| 双张 V100 16 GB，PCIe P2P、无 NVLink | 220.8 | 297.2 | 436.0 | **603.9** |
 
-单位为排除 prefill 的总 committed decode tok/s。相比改动前源码，2K / 16K 八并发分别提升
-约 **203.6% / 109.5%**，单流基本不变。180K 共享 KV 只能同时容纳两个 85K 请求；
-长输入的冷请求整组耗时仍主要由 prefill 决定。替换 T>32 的归约可能改变输出/接受率，八并发实测已有差异，
-未跑新 GPQA。这些改动包含在 v0.2.1 源码、Linux SM70 预编译包与 Docker 附件中。
-[完整条件、前后对照与图表](docs/performance.md#tp2-concurrent-packed-batch-decode-2026-11-02)。
+单位为 executor round 统计的总 committed decode tok/s，排除 prefill；使用 Graph、greedy、
+优化 proposal 的 MTP4，两个数值实验均开启。八并发草稿接受率为四卡 **74.4%**、两种双卡均 **76.4%**。
+两台双卡主机还存在驱动等差别，不能把速度差全归于 NVLink。
+新 2K 输入保留完整代码任务与 assistant prefix；此前 **493.1 / 554.0** 使用截断 raw prefix，
+单独保留为诊断结果，不能把换任务带来的差别算作代码优化收益。
+
+**85K 的 1/2/4/8 并发矩阵**同时报告实际批大小、整组延迟与纯 decode。
+180K 共享 KV 只能同时容纳两个 85K 请求，提交八并发不代表八路一直同时 decode。
+85K 八并发的四卡 NVLink／双卡 NVLink／本机双卡 PCIe 分别为 **317.8／200.3／198.2 tok/s**，
+实际平均 decode batch 均约 **1.23**。
+同机 **1Cat 1.5.1** 对照使用现有 AWQ INT4 / FP16 / E4M3-KV 模型，按 HTTP 返回 token IDs 计数；
+与 NInfer 的 QUASAR NVFP4 / BF16 / INT8-G64 及 executor 计时面分列，不能作为同质量胜负。
+2K 八并发共同 decode 窗口中，NInfer TP4 的 executor 采样为 **1160.9 tok/s**，
+1Cat 的 SSE 窗口为 **588.3 tok/s**；包含 prefill 的整组吞吐分别为 **444.6／338.8 tok/s**。
+窗口计时与模型格式差异见详细方法。
+[完整矩阵、接受率、源码前后对照与方法](docs/performance.md#tp4-concurrent-packed-batch-decode-2026-11-05)。
+
+![完整代码任务并发测量](docs/assets/tp4-concurrency/quasar-concurrency.svg)
+
+四卡新增按 batch 选择的短上下文 attention 和请求隔离的 GDN record/norm 融合。
+独立 FP64 算子检查、C2/C4/C8 普通与长/快模式的 Graph/eager 输出和投机计数、实际 85K 状态与 replay
+检查均通过。归约顺序和草稿接受率可能改变，**未跑新 GPQA**；长注意力和快速解码仍默认关闭。
+这些改动包含在 v0.2.1 源码、Linux SM70 预编译包与可加载的 Docker 镜像附件中。
 
 同时修复分词期间的超时/取消（#6），以及 DSH Responses 的 `prompt_cache_key`
 和思考选项兼容（#4）。
-
 
 ## v0.2.0：四卡 TP4、模型热卸载与 Docker 成品
 
@@ -96,7 +114,7 @@ Responses 可用 `reasoning: {"effort": "high"}`，按当前 Qwen 模板映射�
 七档入参均通过实际端口的流式/非流式检查。[接口说明](docs/serving.md)。
 Release 记录更新日志及 85K 输入的性能变化；除源码外，按版本附带已验证的预编译包和镜像。
 
-## QUASAR NVFP4 最新测评 · 2026-10-19
+## QUASAR NVFP4 单请求测评 · 2026-10-19
 
 已完成 **80 次速度测量**，覆盖四种文本任务、原生短输入至 **85,000 实际输入 tokens**，
 使用下方两份 GUI 保存配置。两份均为 TP2、优化草稿头 **MTP4**、完整 INT8 group-64 KV、

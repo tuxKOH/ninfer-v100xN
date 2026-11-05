@@ -92,13 +92,15 @@ std::int32_t gqa_small_t_split_count(std::int32_t window, std::int32_t tokens, D
 
 template <typename Geometry>
 std::int32_t gqa_small_t_launch_capacity(GqaExecutionEnvelope envelope, std::int32_t tokens,
-                                         DType dtype) {
+                                         DType dtype, std::int32_t batch_size = 1) {
     std::int32_t capacity = 0;
     const auto include    = [&](std::uint32_t window) {
         if (window < envelope.min_visible_keys || window > envelope.max_visible_keys) { return; }
-        const auto splits =
-            gqa_small_t_split_count<Geometry>(static_cast<std::int32_t>(window), tokens, dtype,
-                                               envelope.volta_long_attention);
+        auto splits = gqa_small_t_split_count<Geometry>(
+            static_cast<std::int32_t>(window), tokens, dtype, envelope.volta_long_attention);
+        if (dtype == DType::I8) {
+            splits = gqa_volta_batch_i8_splits<Geometry>(splits, window, tokens, batch_size);
+        }
         capacity = capacity > splits ? capacity : splits;
     };
     include(envelope.min_visible_keys);
@@ -222,9 +224,20 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                         : static_cast<const std::int32_t*>(invocation.table_rows->data),
                     cache.block_tables.ne[0], invocation.width, invocation.full_width,
                     invocation.column_begin, logical_capacity, scale,
-                    static_cast<__nv_bfloat16*>(partial_acc.data),
-                    static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
+                    static_cast<GqaPartial<Fp32Pv>*>(partial_acc.data),
+                    static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
+                    volta_long_attention);
         };
+        if constexpr (Geometry::QHeads == 6 && MultiBatch) {
+            if (partial_acc.dtype == DType::FP32) {
+                // Independent requests provide the grid. FP32 PV avoids the
+                // FP16 MMA accumulation bias for nonzero-mean value histories;
+                // keep its private numerator in FP32 through the split merge.
+                launch_volta.template operator()<8, true>();
+                CUDA_CHECK(cudaGetLastError());
+                return;
+            }
+        }
         if constexpr ((Geometry::QHeads == 12 || Geometry::QHeads == 6) && TokenTile == 5) {
             if (implementation_window > 16390) {
                 launch_volta.template operator()<8>();
@@ -400,7 +413,8 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
     const auto logical_capacity      = static_cast<std::int32_t>(envelope.max_visible_keys);
     const auto implementation_window = static_cast<std::int32_t>(envelope.max_visible_keys);
     const auto splits =
-        gqa_small_t_launch_capacity<Geometry>(envelope, invocation.width, cache.dtype);
+        gqa_small_t_launch_capacity<Geometry>(envelope, invocation.width, cache.dtype,
+                                              invocation.batch_size);
 
     // BF16 keeps its row-tile warp count; INT8 selects its producer/consumer
     // geometry inside launch_tc_partial_i8.
@@ -463,11 +477,12 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
     const dim3 reduce_grid(Geometry::QHeads, div_up(kGqaHeadDim, kDChunk),
                            invocation.width * invocation.batch_size);
     const auto launch_reduce = [&]<bool Int8, bool MultiBatch, bool Masked, bool Offset>() {
-        const auto launch_staged = [&]<int SplitTile, bool DirectNumerator = false>() {
+        const auto launch_staged = [&]<int SplitTile, bool DirectNumerator = false,
+                                      bool Fp32Partial = false>() {
             gqa_attention_small_t_reduce_output_kernel<Geometry, kDChunk, Int8, MultiBatch, Masked,
-                                                       Offset, SplitTile, DirectNumerator>
+                                                       Offset, SplitTile, DirectNumerator, Fp32Partial>
                 <<<reduce_grid, kReduceBlock, 0, stream>>>(
-                    static_cast<const __nv_bfloat16*>(partial_acc.data),
+                    static_cast<const GqaPartial<Fp32Partial>*>(partial_acc.data),
                     static_cast<const float*>(partial_m.data),
                     static_cast<const float*>(partial_l.data),
                     static_cast<const std::int32_t*>(pos.data),
@@ -479,6 +494,12 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
                     envelope.volta_long_attention);
         };
 #ifdef NINFER_VOLTA_BUILD
+        if constexpr (Int8 && Geometry::QHeads == 6 && MultiBatch) {
+            if (partial_acc.dtype == DType::FP32) {
+                launch_staged.template operator()<8, true, true>();
+                return;
+            }
+        }
         if constexpr (Int8 && Geometry::QHeads == 6) {
             if (envelope.volta_long_attention && implementation_window > 65536) {
                 launch_staged.template operator()<8, true>();

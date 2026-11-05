@@ -4,6 +4,7 @@
 
 #include "ops/input_projection_test_common.h"
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
+#include "ops/attn_input_proj/volta_tp4.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
 #include "ops/gdn_input_proj/gdn_projected_conv.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
@@ -52,16 +53,16 @@ int exercise(bool attention, int tp) {
     int failures = 0;
     for (const int tokens : {1, 3, 4, 5, 6, 8, 9, 10, 16, 17, 20, 32, 33, 40, 41, 64,
                              127, 128, 129}) {
-        const auto x_host = make_bf16_activation(5120, tokens, 449U + tokens);
+        auto x_host = make_bf16_activation(5120, tokens, 449U + tokens);
         auto device_x = to_device_bf16(x_host);
         Tensor x(device_x.p, DType::BF16, {5120, tokens});
         const auto prefix = std::string(attention ? "NVFP4 attention" : "NVFP4 GDN") +
             " TP" + std::to_string(tp) + " T=" + std::to_string(tokens);
-        const auto capacity = tp == 2
+        const auto capacity = tp > 1
             ? (attention ? ops::attn_input_proj_column_parallel_workspace_capacity_bytes(
-                               QType::NVFP4, ops::LinearPolicy::A16Only, tokens, tokens, 2)
+                               QType::NVFP4, ops::LinearPolicy::A16Only, tokens, tokens, tp)
                          : ops::gdn_input_proj_column_parallel_workspace_capacity_bytes(
-                               QType::NVFP4, ops::LinearPolicy::A16Only, tokens, tokens, 2))
+                               QType::NVFP4, ops::LinearPolicy::A16Only, tokens, tokens, tp))
             : attention
             ? ops::attn_input_proj_workspace_capacity_bytes(
                     QType::NVFP4, n, 5120, ops::LinearPolicy::A16Only, tokens, tokens)
@@ -74,7 +75,10 @@ int exercise(bool attention, int tp) {
                 gate(q_rows, tokens), value(kv_rows, tokens);
             auto q = query.tensor(), k = key.tensor(), g = gate.tensor(), v = value.tensor();
             auto invoke = [&] {
-                if (tp == 2) {
+                if (tp == 4) {
+                    ops::detail::attn_input_volta_tp4_launch(
+                        x, weight, q, g, k, v, &workspace, stream);
+                } else if (tp == 2) {
                     // Qualify the real shard kernel directly against the same mathematical
                     // oracle; the split suite separately checks the public two-device wrapper.
                     ops::detail::nvfp4_attn_input_sm70_launch(
@@ -86,6 +90,13 @@ int exercise(bool attention, int tp) {
             };
             invoke();
             cuda_synchronize(stream);
+            const auto verify = [&] {
+                return check(prefix + " q", query, native, 0, q_rows, x_host, tokens) +
+                    check(prefix + " k", key, native, q_rows, kv_rows, x_host, tokens) +
+                    check(prefix + " gate", gate, native, q_rows + kv_rows, q_rows, x_host, tokens) +
+                    check(prefix + " v", value, native, 2 * q_rows + kv_rows, kv_rows, x_host, tokens);
+            };
+            failures += verify();
             // Capture the same public route using exactly its declared scratch capacity.
             cudaGraph_t graph;
             cudaGraphExec_t exec;
@@ -93,12 +104,12 @@ int exercise(bool attention, int tp) {
             invoke();
             cuda_check(cudaStreamEndCapture(stream, &graph), "finish input capture");
             cuda_check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0), "instantiate input");
+            x_host = make_bf16_activation(5120, tokens, 1741U + tokens);
+            const auto changed = bf16_bits(x_host);
+            device_x.copy_from_host(changed.data(), changed.size() * sizeof(std::uint16_t));
             cuda_check(cudaGraphLaunch(exec, stream), "replay input");
             cuda_synchronize(stream);
-            failures += check(prefix + " q", query, native, 0, q_rows, x_host, tokens);
-            failures += check(prefix + " k", key, native, q_rows, kv_rows, x_host, tokens);
-            failures += check(prefix + " gate", gate, native, q_rows + kv_rows, q_rows, x_host, tokens);
-            failures += check(prefix + " v", value, native, 2 * q_rows + kv_rows, kv_rows, x_host, tokens);
+            failures += verify();
             cuda_check(cudaGraphExecDestroy(exec), "destroy input exec");
             cuda_check(cudaGraphDestroy(graph), "destroy input graph");
         } else {
@@ -106,7 +117,7 @@ int exercise(bool attention, int tp) {
             GuardedBf16Tensor projected(qkv_rows, tokens), z_out(z_rows, tokens);
             auto qkv = projected.tensor(), z = z_out.tensor();
             auto invoke = [&] {
-                if (tp == 2) {
+                if (tp > 1) {
                     ops::detail::nvfp4_gdn_input_sm70_launch(
                         x, weight, qkv, z, &workspace, stream);
                 } else {
@@ -116,16 +127,23 @@ int exercise(bool attention, int tp) {
             };
             invoke();
             cuda_synchronize(stream);
+            const auto verify = [&] {
+                return check(prefix + " qkv", projected, native, 0, qkv_rows, x_host, tokens) +
+                    check(prefix + " z", z_out, native, qkv_rows, z_rows, x_host, tokens);
+            };
+            failures += verify();
             cudaGraph_t graph;
             cudaGraphExec_t exec;
             cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), "capture GDN input");
             invoke();
             cuda_check(cudaStreamEndCapture(stream, &graph), "finish GDN input capture");
             cuda_check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0), "instantiate GDN input");
+            x_host = make_bf16_activation(5120, tokens, 1747U + tokens);
+            const auto changed = bf16_bits(x_host);
+            device_x.copy_from_host(changed.data(), changed.size() * sizeof(std::uint16_t));
             cuda_check(cudaGraphLaunch(exec, stream), "replay GDN input");
             cuda_synchronize(stream);
-            failures += check(prefix + " qkv", projected, native, 0, qkv_rows, x_host, tokens);
-            failures += check(prefix + " z", z_out, native, qkv_rows, z_rows, x_host, tokens);
+            failures += verify();
             cuda_check(cudaGraphExecDestroy(exec), "destroy GDN input exec");
             cuda_check(cudaGraphDestroy(graph), "destroy GDN input graph");
         }
@@ -362,12 +380,18 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--record") {
         return exercise_conv_record() ? 1 : 0;
     }
+    const bool tp4 = argc == 2 && std::string_view(argv[1]) == "--tp4";
+    if (argc != 1 && !tp4) { return 2; }
     int failures = 0;
     for (bool selected : {false, true}) {
         fp32_scale = selected;
         std::cout << "NVFP4 FP32 epilogue=" << selected << '\n';
-        failures += exercise(true, 1) + exercise(false, 1) + exercise(true, 2) + exercise(false, 2)
-            + exercise_down_projection() + exercise_swiglu() + exercise_conv_record();
+        if (tp4) {
+            failures += exercise(true, 4) + exercise(false, 4);
+        } else {
+            failures += exercise(true, 1) + exercise(false, 1) + exercise(true, 2) + exercise(false, 2)
+                + exercise_down_projection() + exercise_swiglu() + exercise_conv_record();
+        }
     }
     std::cout << (failures ? "FAIL" : "OK") << " NVFP4 SM70 input projections\n";
     return failures ? 1 : 0;

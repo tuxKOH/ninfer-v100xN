@@ -606,7 +606,7 @@ void allreduce_sum(std::span<const Tensor> buffer, std::span<const Tensor> stagi
             CurrentDeviceGuard::set(local.device);
             if (ec.device_count == 4) {
                 detail::allreduce_packet_sum4_launch(buffer[rank], storage, rank,
-                    PeerEvents::kPacketMaxBytes, local.stream);
+                    events.packet_capacity_bytes(), local.stream);
             } else {
                 detail::allreduce_packet_sum_launch(buffer[rank], buffer[rank],
                     storage[rank], storage[1 - rank], events.packet_capacity_bytes(), local.stream);
@@ -796,9 +796,10 @@ static void sum_rmsnorm(std::span<const Tensor> buffer, std::span<const Tensor> 
                          "collective norm staging overlap");
 #endif
     }
-    if (published && ec.device_count == 4 && events.packet_storage(0) && buffer[0].ne[0] == 5120 &&
-        buffer[0].ne[1] >= 1 && buffer[0].ne[1] <= 8 && buffer[0].ne[2] == 1 &&
-        buffer[0].ne[3] == 1 && (addresses & 15U) == 0) {
+    if (ec.device_count == 4 && events.packet_storage(0) && buffer[0].ne[0] == 5120 &&
+        buffer[0].ne[1] >= 1 && buffer[0].ne[1] <= 64 && buffer[0].ne[2] == 1 &&
+        buffer[0].ne[3] == 1 && (addresses & 15U) == 0 &&
+        (norm.output[0].dtype == DType::BF16 || (published && buffer[0].ne[1] <= 8))) {
         const CurrentDeviceGuard guard;
         const std::array<void*, 4> storage{events.packet_storage(0), events.packet_storage(1),
                                          events.packet_storage(2), events.packet_storage(3)};
@@ -806,7 +807,7 @@ static void sum_rmsnorm(std::span<const Tensor> buffer, std::span<const Tensor> 
             CurrentDeviceGuard::set(ec.dev[rank]->device);
             detail::allreduce_packet_sum4_rmsnorm_launch(buffer[rank], norm.weight[rank],
                 norm.output[rank], norm.eps, norm.unit_offset, storage, rank,
-                PeerEvents::kPacketMaxBytes, ec.dev[rank]->stream, published);
+                events.packet_capacity_bytes(), ec.dev[rank]->stream, published);
         }
         return;
     }

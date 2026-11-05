@@ -1,6 +1,6 @@
 # V100 decoding 优化：公开项目调研与借鉴清单
 
-调研日期：2026-10-18；源码与试验更新至 2026-11-02。对象是本工作区的 **2 × V100-SXM2 16 GB、CUDA 12.8、SM70**，本轮新增 QUASAR/MTP4 的 TP2 并发优化；本机使用 **PCIe P2P，没有 NVLink**。远端 TP4/NVLink 单独看待。
+调研日期：2026-10-18；源码与试验更新至 2026-11-05。对象包括本工作区的 **2 × V100-SXM2 16 GB、CUDA 12.8、SM70** 和远端四卡 NVLink 的 QUASAR/MTP4 并发优化；本机使用 **PCIe P2P，没有 NVLink**。两种硬件的测量单独记录。
 
 本报告回答“读哪些项目、借鉴什么、落到哪里、如何判断值得保留”。它是研究结论，不修改现行产品契约，也不表示候选已经移植或在本机测得收益。检索覆盖 GitHub 仓库搜索、公开搜索引擎、上游引用及相关分支；下列为本轮能够核实的公开项目，不作全网穷尽声明。
 
@@ -102,6 +102,29 @@ T>32 的旧 CUTLASS 路径与新 batch 归约不同，八并发实测已出现�
 
 批量 attention 的 KV/head 复用、GDN 周边、W8 proposal/head 以及混合 prefill/decode 调度仍可
 继续优化；本轮采用 batch projection 和 packet 并不表示这些方向已经耗尽。
+
+### TP4 并发源码借鉴（2026-11-05）
+
+本轮主要参考 1Cat，读取其 2026-11-04 main 的实际四卡源码，而不只采用旧文档中的并发倍率：
+
+| 1Cat 源码机制 | NInfer 采用方式及边界 |
+|---|---|
+| `sm70_turbomind/ops/nvfp4_qpn2_sm70.cu` 的批量 activation supply、分阶段 K 归约 | 将已有 packed batch kernel 扩展到 TP4 的 attention/GDN、gate/up 和 contraction shapes，覆盖 T9..64；保留原 QPN codes/scales、normal/fast profile 和 BF16 输出，不展开第二份权重 |
+| `custom_all_reduce.cuh` 的批量 push、`sm70_push_allreduce_gemma_rms_norm_batch` | TP4 device channel 扩至 640 KiB；row projection 直接发布 BF16 contribution，T1..64 支持跨层 sum/norm handoff。T>8 使用较小 CTA 分 panel 处理完整 row，保留 NInfer 的 global-rank 求和顺序和二十个 logical warp norm sums |
+| `attention/sm70_grouped_long/kernel/grouped-attention.cu` 的 batch/context routing | C4/C8 已有请求级并行，短上下文减少 KV split。新私有路径以 FP32 累加并合并 PV numerator，输出仍为 BF16；保留完整 packed INT8-G64 KV，不丢历史 keys。分区/association 会改变数值，不能按逐位无损发布 |
+| `sm70_turbomind/ops/gdn_verify_sm70.cu` 的整块 verify 与周边融合 | 扩展 NInfer 自有 replay-record + gated norm 到 TP4 B1..8，保持原 FP32 recurrence、BF16 readout/record；completion 按 request/head 隔离。新 zero-valid fixture 暴露并修正了零有效行仍改写首个 key record 的问题 |
+
+**同机运行的对照是 1Cat 1.5.1 发布版**，不将 main 源码版本与实测运行版本混为一谈。
+两边均为四卡、MTP4、相同的完整 2048/85000-token 代码任务 IDs、每请求强制输出 512 tokens、greedy、关闭前缀复用。
+2K 单独保留完整任务与 assistant prefix，不再直接截短 85K；此前 raw-prefix 结果单独保留，不能跨任务计算软件提升。
+现有 1Cat checkpoint 为 AWQ INT4/FP16/E4M3-KV，NInfer 为 QUASAR NVFP4/BF16/INT8-G64；
+1Cat 使用 HTTP SSE token IDs 计数，NInfer 的 executor-round 与 all-live sampled 另列。
+它们可提供同机速度与扩展参考，不能称为同质量、同算术或相同计时面的胜负。
+条件、结果与图表见[TP4 并发测量](performance.md#tp4-concurrent-packed-batch-decode-2026-11-05)。
+
+采用项通过独立算子 oracle 后还须经过真实模型并发 Graph/eager、投机计数与提交状态检查；
+数值组合没有新 GPQA。W8 proposal/head、长上下文 batch attention 和进一步的通信/投影调度仍保留
+为待继续优化方向，不因本轮已采用同方向机制而删除。
 
 ### TP4 源码复核（2026-10-23）
 

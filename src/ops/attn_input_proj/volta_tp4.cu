@@ -6,6 +6,7 @@
 #include "ops/linear/fp8/fp8_block.h"
 #include "ops/linear/fp8/fp8_volta_qpn_gemm.cuh"
 #include "ops/linear/nvfp4/nvfp4_cutlass_sm70.h"
+#include "ops/linear/nvfp4/nvfp4_volta_batch.cuh"
 #include "ops/linear/nvfp4/nvfp4_volta_qpn_gemm.cuh"
 
 #include <algorithm>
@@ -42,7 +43,8 @@ std::size_t attn_input_volta_tp4_workspace_bytes(QType type, std::int32_t tokens
     }
     if (tokens < kWideTokens) {
         return type == QType::NVFP4
-            ? nvfp4_volta_qpn_precast_workspace_bytes(kRows, 5120, tokens) : 0;
+            ? std::max(nvfp4_volta_qpn_precast_workspace_bytes(kRows, 5120, tokens),
+                       nvfp4_volta_batch_workspace_bytes(kRows, 5120, tokens)) : 0;
     }
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::BF16, {kRows, tokens}, 256);
@@ -71,6 +73,15 @@ void attn_input_volta_tp4_launch(const Tensor& x, const Weight& weight, Tensor& 
         Tensor g = gate.view({256, 6, tokens});
         Tensor v = value.view({256, 1, tokens});
         mtp_split_attn_in(projected, q, k, g, v, stream);
+        return;
+    }
+    if (weight.qtype == QType::NVFP4 && weight.layout == QuantLayout::VoltaQpnPrepacked &&
+        nvfp4_volta_batch_supported(kRows, 5120, tokens)) {
+        if (!workspace) { throw std::invalid_argument("SM70 TP4 batch attention requires workspace"); }
+        const HeadLocalOutput output{static_cast<__nv_bfloat16*>(query.data),
+            static_cast<__nv_bfloat16*>(key.data), static_cast<__nv_bfloat16*>(gate.data),
+            static_cast<__nv_bfloat16*>(value.data)};
+        launch_nvfp4_volta_batch_output(x, weight, output, kRows, *workspace, stream);
         return;
     }
     // One pass over each small-T weight tile, with a fused head-local store. No BF16

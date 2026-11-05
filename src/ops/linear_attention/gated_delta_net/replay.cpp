@@ -333,14 +333,15 @@ void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tenso
     constexpr const char* kOp = "gated_delta_net_replay_record_norm";
     validate_replay_record(q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots,
                            key_record, value_record, gate_record, out);
-    if (q.ne[1] != 4 || v.ne[1] != 12 || q.ne[3] != 1 || q.ne[2] > 8 ||
+    if (q.ne[1] != 4 || v.ne[1] != 12 || q.ne[3] > 8 || q.ne[2] > 8 ||
+        (norm.out.dtype != DType::BF16 && norm.out.dtype != DType::FP16) ||
         !std::isfinite(norm.eps) || norm.eps <= 0.0F) {
         throw std::invalid_argument(std::string(kOp) + ": unsupported geometry or epsilon");
     }
     require_tensor(norm.weight, DType::BF16, {128}, 4, kOp, "weight");
-    require_tensor(norm.z, DType::BF16, {128, 12, q.ne[2], 1}, 4, kOp, "z");
-    require_tensor(norm.out, DType::FP16, {128, 12, q.ne[2], 1}, 4, kOp, "normalized output");
-    require_tensor(norm.completion_counts, DType::I32, {12}, 4, kOp, "completion counters");
+    require_tensor(norm.z, DType::BF16, {128, 12, q.ne[2], q.ne[3]}, 4, kOp, "z");
+    require_tensor(norm.out, norm.out.dtype, {128, 12, q.ne[2], q.ne[3]}, 4, kOp, "normalized output");
+    require_tensor(norm.completion_counts, DType::I32, {12, q.ne[3]}, 4, kOp, "completion counters");
     std::vector<MemoryRange> ranges;
     for (const Tensor* tensor : {&q, &k, &v, &g, &beta, &ssm_states, &valid_columns,
                                 &initial_state_slots, static_cast<const Tensor*>(&key_record),

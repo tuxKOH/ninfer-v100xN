@@ -17,6 +17,9 @@
 #include "ops/linear/ggml_k/ggml_k.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/nvfp4/nvfp4_launch.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -1224,7 +1227,7 @@ void project_fused_shard(const Tensor& x, const Weight& w, Tensor& qkv, Tensor& 
         if (workspace == nullptr) { throw std::invalid_argument("TP4 GDN needs workspace"); }
 #ifdef NINFER_VOLTA_BUILD
         if (w.qtype == QType::NVFP4 && w.layout == QuantLayout::VoltaQpnPrepacked &&
-            x.ne[1] <= 8) {
+            (x.ne[1] <= 8 || detail::nvfp4_volta_batch_supported(w.n, w.k, x.ne[1]))) {
             detail::nvfp4_gdn_input_sm70_launch(x, w, qkv, z, workspace, stream);
             return;
         }

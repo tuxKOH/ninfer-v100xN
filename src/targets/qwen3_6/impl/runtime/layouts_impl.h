@@ -329,9 +329,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                  std::int32_t batch_size, std::int32_t min_width,
                                  std::int32_t max_width, ops::GqaExecutionEnvelope envelope) {
         auto norm_scope = layout.scope();
-        if (plan.tp > 1 && first <= 8) {
-            (void)workspace_recipe::post_mixer_hidden<TextConfig>(layout, std::min(last, 8));
-            (void)workspace_recipe::post_mixer_hidden<TextConfig>(layout, std::min(last, 8));
+        const auto norm_limit = workspace_recipe::tp_norm_handoff_limit(plan.tp);
+        if (plan.tp > 1 && first <= norm_limit) {
+            (void)workspace_recipe::post_mixer_hidden<TextConfig>(layout, std::min(last, norm_limit));
+            (void)workspace_recipe::post_mixer_hidden<TextConfig>(layout, std::min(last, norm_limit));
         }
         attention_stage(layout, first, last, phase, batch_size, min_width, max_width, envelope);
         gdn_stage(layout, first, last, phase, path, batch_size, min_width, max_width);

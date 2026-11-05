@@ -104,9 +104,11 @@ intermediate artifacts are excluded unless requested or themselves the deliverab
 
 ## Current product contract
 
-NInfer is a from-scratch C++/CUDA inference engine for a small set of explicitly registered
-checkpoint artifacts. This checkout's active target is maximum single-request performance on
-two Tesla V100-SXM2 16 GB cards using CUDA 12.8 and `sm_70`. It combines the RTX 3060 TP2 path
+NInfer V100xN is a from-scratch C++/CUDA inference engine for a small set of explicitly registered
+checkpoint artifacts. Its measured scope includes the local two-card TP2 target and the
+separately qualified four-card TP4 extension, using CUDA 12.8 and `sm_70`. The original local
+target remains maximum single-request performance on two Tesla V100-SXM2 16 GB cards.
+It combines the RTX 3060 TP2 path
 with the Volta implementation from `geoffwatts/ninfer-v100`. Ampere `sm_86` and early Ada `sm_89`
 builds remain available; the RTX 5090 `sm_120a` results are inherited upstream evidence, not
 measurements of this target. The supported identities are
@@ -137,6 +139,15 @@ qualification and measurements are recorded separately from official NVFP4/nativ
 source E4M3 codes and BF16 block multipliers without requantization and requires TP4 on SM70.
 TP4 Vision/DFlash and other TP4 identities are not admitted. Operator checks on the local two
 cards do not substitute for four-card whole-model/state or end-to-end performance evidence.
+Release 0.2.1 additionally qualifies QUASAR TP4 Text/MTP4 with one to eight active requests.
+Packed batch projections and 640 KiB device packet channels cover up to 64 columns; fused
+sum/norm handoff, per-request GDN completion counters and short-context batch attention keep
+the family scheduler and private request state. Short TP4 batch attention uses FP32 PV and
+private split numerators before the public BF16 output. Arithmetic association and MTP
+acceptance can change; no new GPQA is claimed. At 180000 shared KV tokens, only two
+85000-input / 512-output requests fit together, so offered concurrency is not actual decode
+batch size. Complete-code prompt measurements and older truncated raw-prefix diagnostics
+are separate workloads; see docs/performance.md.
 The explicitly requested WSL2 extension targets QUASAR SM70 TP2 Text/MTP4 on two V100-SXM2
 16 GB cards without direct P2P. Small aligned BF16 reductions may use startup-owned mapped
 host packets with system fences and device-local epochs; wider reductions and gathers retain

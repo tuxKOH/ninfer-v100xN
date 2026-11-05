@@ -351,11 +351,16 @@ std::size_t nvfp4_linear_swiglu_shard_workspace_capacity_bytes(LinearPolicy poli
 #ifdef NINFER_VOLTA_BUILD
     if (tp == 4 && policy == LinearPolicy::A16Only && min_tokens > 0 && max_tokens >= min_tokens) {
         using Geometry = Nvfp4MlpGateUpTp4ColumnGeometry;
+        // The capacity interval can cross the batch domain even when its upper
+        // endpoint selects CUTLASS. Both routes reuse the same caller-owned arena.
+        const auto batch = min_tokens <= 64 && max_tokens >= 9
+            ? nvfp4_volta_batch_workspace_bytes(Geometry::kOutputRows, Geometry::kInputRows,
+                                                std::min(max_tokens, 64)) : 0;
         if (nvfp4_linear_swiglu_qpn_split_supported(
                 Geometry::kOutputRows, Geometry::kInputRows, max_tokens)) {
-            return qpn_split_workspace_bytes<Geometry>(max_tokens);
+            return std::max(batch, qpn_split_workspace_bytes<Geometry>(max_tokens));
         }
-        return cutlass_route_workspace_bytes<Geometry>(max_tokens);
+        return std::max(batch, cutlass_route_workspace_bytes<Geometry>(max_tokens));
     }
 #endif
     if (tp != 2) { throw std::invalid_argument("nvfp4 linear_swiglu: unsupported TP profile"); }
@@ -375,6 +380,11 @@ void nvfp4_linear_swiglu_dispatch_shard(const Tensor& x, const Weight& weight, T
     if (weight.n == 8704 && weight.k == 5120) {
         if (policy != LinearPolicy::A16Only || workspace == nullptr) {
             throw std::invalid_argument("nvfp4 TP4 linear_swiglu requires A16 and workspace");
+        }
+        if (weight.layout == QuantLayout::VoltaQpnPrepacked &&
+            nvfp4_volta_batch_supported(weight.n, weight.k, x.ne[1])) {
+            nvfp4_linear_swiglu_batch_launch(x, weight, out, *workspace, stream);
+            return;
         }
         auto scope = workspace->scope();
         if (nvfp4_linear_swiglu_qpn_split_supported(weight.n, weight.k, x.ne[1])) {

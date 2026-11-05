@@ -1,9 +1,11 @@
 # Linux V100 prebuilt package
 
 The v0.2.1 release includes a Linux x86_64 / `sm_70` / CUDA 12.8 binary package.
-It supports the qualified V100 TP2 routes and QUASAR TP4 Text/MTP, including both optional
+It supports the qualified V100 TP2 routes and QUASAR TP4 Text/MTP with 1–8 active requests, including both optional
 experimental profiles. Model weights, the NVIDIA driver, Python and Qt are not included.
 See [TP4 measurements and limits](tp4.md); TP4 Vision/DFlash remain unsupported.
+Concurrent requests share the configured KV capacity; 180000 tokens admit only two
+85000-input / 512-output requests at a time. Additional requests queue.
 
 Use Ubuntu 22.04 or newer, or a compatible Linux distribution whose glibc meets the exact
 `minimum_glibc` in `manifest.json`. A working NVIDIA driver is required; use driver 570 or newer

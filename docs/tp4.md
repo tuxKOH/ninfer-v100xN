@@ -4,6 +4,32 @@ The four-card results below belong to a separate NVLink host. Local V100X2 contr
 explicitly. QUASAR and the older official NVFP4/native FP8 measurements use different artifacts
 and draft windows; keep their results separate.
 
+## v0.2.1: QUASAR concurrent decode
+
+QUASAR TP4 Text/MTP4 now has qualified C2/C4/C8 batched projections, packet/norm handoff,
+short-context batch attention and per-request GDN record/norm. The complete 2K/85K coding
+task matrix includes TP4, NVLink TP2, local PCIe P2P TP2 and the same-host 1Cat 1.5.1 control.
+See [results, acceptance, actual batch and numerical limits](performance.md#tp4-concurrent-packed-batch-decode-2026-11-05).
+The binary and Docker assets use this same implementation.
+
+For the benchmark's bounded concurrency configuration:
+
+```bash
+./bin/ninfer-serve /path/to/quasar-v3/qwen3_8_27b_nvfp4.ninfer \
+  --tp 4 --devices 0,1,2,3 --max-context 180000 --kv-capacity 180000 \
+  --kv-dtype int8 --prefill-chunk 1024 --max-concurrency 8 \
+  --no-prefix-reuse --prefix-cache-tokens 0 \
+  --spec mtp --draft-tokens 4 --lm-head-draft \
+  --volta-long-attention --volta-fast-decode \
+  --default-max-tokens 512 --max-output-tokens 512 --no-thinking
+```
+
+180K is the shared KV pool, not 180K per lane. Eight short requests fit, but eight 85K
+requests require queueing at this capacity. Increase `--kv-capacity` only within available
+VRAM; `--kv-capacity auto` resolves capacity at startup. Cold long prefills also stagger
+decode readiness even when there is enough KV. Both numerical flags remain default-off;
+this command opts in and can change generated outputs. TP4 Vision/DFlash remain unsupported.
+
 ## v0.2.0 serving: 256K context and 128K output
 
 Use the Linux SM70 release package, or the equivalent [Docker image](docker.md).

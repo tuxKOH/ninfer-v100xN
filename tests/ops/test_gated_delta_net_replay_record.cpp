@@ -45,7 +45,7 @@ int verify_equal(const std::string& label, const std::vector<std::uint16_t>& lhs
 
 int run_case(std::int32_t qk_heads, std::int32_t value_heads, std::int32_t width,
              std::int32_t batch, std::vector<std::int32_t> valid_columns, std::uint32_t seed,
-             bool fused_norm = false) {
+             bool fused_norm = false, DType norm_dtype = DType::FP16) {
     const std::int32_t kQkHeads = qk_heads;
     const bool dense            = valid_columns.empty();
     if (dense) { valid_columns.assign(static_cast<std::size_t>(batch), width); }
@@ -127,13 +127,14 @@ int run_case(std::int32_t qk_heads, std::int32_t value_heads, std::int32_t width
     DeviceBuffer norm_weight = to_device(norm_weight_bits);
     DeviceBuffer norm_z = to_device(norm_z_bits);
     DeviceBuffer norm_out(value_elements * 2), norm_reference(value_elements * 2);
-    DeviceBuffer counters(12 * sizeof(std::int32_t));
+    const int counter_count = 12 * batch;
+    DeviceBuffer counters(counter_count * sizeof(std::int32_t));
     counters.fill();
     const ops::GdnReplayGatedNorm epilogue{
         Tensor(norm_weight.p, DType::BF16, {128}),
         Tensor(norm_z.p, DType::BF16, {128, value_heads, width, batch}), 1.0e-6F,
-        Tensor(norm_out.p, DType::FP16, {128, value_heads, width, batch}),
-        Tensor(counters.p, DType::I32, {12})};
+        Tensor(norm_out.p, norm_dtype, {128, value_heads, width, batch}),
+        Tensor(counters.p, DType::I32, {12, batch})};
     const auto record = [&](cudaStream_t stream) {
         if (fused_norm) {
             ops::gated_delta_net_replay_record(
@@ -162,7 +163,8 @@ int run_case(std::int32_t qk_heads, std::int32_t value_heads, std::int32_t width
             device_q.copy_from_host(q_bits.data(), device_q.bytes);
             CUDA_CHECK(cudaGraphLaunch(executable, stream));
             CUDA_CHECK(cudaStreamSynchronize(stream));
-            if (from_device<std::int32_t>(counters, 12) != std::vector<std::int32_t>(12, 0)) {
+            if (from_device<std::int32_t>(counters, counter_count) !=
+                std::vector<std::int32_t>(counter_count, 0)) {
                 std::cerr << "record-norm counters did not reset\n";
                 return 1;
             }
@@ -199,12 +201,14 @@ int run_case(std::int32_t qk_heads, std::int32_t value_heads, std::int32_t width
                 const double z = bf16_to_f32(norm_z_bits[base + dim]);
                 expected[base + dim] = bf16_to_f32(record_output_bits[base + dim]) * inv *
                     bf16_to_f32(norm_weight_bits[dim]) * z / (1.0 + std::exp(-z));
-                actual[base + dim] = quantized_weight::detail::f16_to_f32(image[base + dim]);
+                actual[base + dim] = norm_dtype == DType::FP16
+                    ? quantized_weight::detail::f16_to_f32(image[base + dim])
+                    : bf16_to_f32(image[base + dim]);
             }
         }
         failures += verify_reduction("record-norm FP64 oracle" + suffix, actual, expected,
                                        {1.85e-3, 4.5e-5, 2.8e-3});
-        Tensor normalized(norm_reference.p, DType::FP16, {128, value_heads, width, batch});
+        Tensor normalized(norm_reference.p, norm_dtype, {128, value_heads, width, batch});
         ops::gated_rmsnorm(record_output, epilogue.weight, epilogue.z, epilogue.eps,
                            normalized, nullptr);
         cuda_synchronize();
@@ -566,6 +570,11 @@ int main() {
     for (int width = 2; width <= 8; ++width) {
         failures += run_case(4, 12, width, 1, {}, 1900U + width, true);
         failures += run_case(4, 12, width, 1, {width - 1}, 1920U + width, true);
+    }
+    for (auto dtype : {DType::BF16, DType::FP16}) {
+        failures += run_case(4, 12, 5, 4, {}, 1951U, true, dtype);
+        failures += run_case(4, 12, 5, 8, {5, 4, 3, 2, 1, 0, 5, 2}, 1961U, true, dtype);
+        failures += run_case(4, 12, 8, 8, {8, 6, 4, 2, 0, 1, 7, 8}, 1971U, true, dtype);
     }
     failures += oracle_shard_case(6, 1801U);
     failures += oracle_shard_case(4, 1811U);

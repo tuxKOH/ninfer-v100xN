@@ -143,6 +143,13 @@ Tensor gdn_normalized_output(Allocator& allocator, std::int32_t tokens, std::int
     return matrix(allocator, dtype, Config::value_dim / tp, tokens);
 }
 
+// TP4's bounded verifier batch can publish row contractions directly into
+// packet storage and hand the resulting BF16 norm to the following projection.
+// TP2 keeps its independently qualified eight-column handoff schedule.
+inline constexpr std::int32_t tp_norm_handoff_limit(std::int32_t tp) {
+    return tp == 4 ? 64 : 8;
+}
+
 template <class Config, class Allocator>
 Tensor post_mixer_hidden(Allocator& allocator, std::int32_t tokens) {
     return matrix(allocator, DType::BF16, Config::hidden, tokens);

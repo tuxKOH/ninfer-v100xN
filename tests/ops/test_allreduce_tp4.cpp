@@ -133,8 +133,8 @@ int reduce_case(const ExecutionContext& ec, const ops::PeerEvents& events, int c
     // Decode alternates one-token, MTP verification and partially filled blocks.
     // Reuse one transport across a long captured chain with changing message sizes.
     // The oracle applies each public BF16 output boundary independently.
-    if (count == 5120 * 8) {
-        const std::array<int, 5> sizes{5120, 5120 * 5, count, 5128, count};
+    if (count == 5120 * 64) {
+        const std::array<int, 6> sizes{5120, 5120 * 5, 5128, 5120 * 20, 5120 * 40, count};
         std::array<std::vector<std::uint16_t>, 4> logical = inputs;
         for (int round = 0; round < 8; ++round) {
             for (int size : sizes) {
@@ -173,11 +173,11 @@ int reduce_case(const ExecutionContext& ec, const ops::PeerEvents& events, int c
 }
 
 int norm_case(const ExecutionContext& ec, const ops::PeerEvents& events, bool unit_offset) {
-    constexpr int width = 5120, rows = 8, count = width * rows;
+    constexpr int width = 5120, rows = 64, count = width * rows;
     std::array<std::unique_ptr<Allocation>, 4> data, scratch, weights, norms;
     std::array<Tensor, 4> buffers, staging, weight, output;
     std::array<std::vector<std::uint16_t>, 4> input;
-    std::vector<std::uint16_t> host_weight(width), oracle(count);
+    std::vector<std::uint16_t> host_weight(width);
     for (int i = 0; i < width; ++i) host_weight[i] = bf16((i % 23 - 11) / 16.);
     for (int r = 0; r < 4; ++r) {
         data[r] = std::make_unique<Allocation>(ec.dev[r]->device, count * 2);
@@ -201,7 +201,7 @@ int norm_case(const ExecutionContext& ec, const ops::PeerEvents& events, bool un
         }
         synchronize(ec);
     };
-    const std::array<int, 6> widths{1, 5, 8, 3, 7, 8};
+    const std::array<int, 10> widths{1, 5, 8, 9, 20, 40, 64, 3, 7, 64};
     const auto run = [&] {
         for (std::size_t call = 0; call < widths.size(); ++call) {
             auto b = buffers, n = output;
@@ -222,7 +222,7 @@ int norm_case(const ExecutionContext& ec, const ops::PeerEvents& events, bool un
             for (int r = 0; r < 4; ++r) logical[r][i] = bf16(sum);
         }
     }
-    oracle = logical[0];
+    const auto& oracle = logical[0];
     std::vector<double> norm_oracle(count);
     for (int row = 0; row < rows; ++row) {
         double sum = 0.;
@@ -570,7 +570,9 @@ int main() {
     for (bool route : {false, true}) {
         if (route && !direct) { continue; }
         ops::PeerEvents events(ec, route);
-        for (int size : {511, 5120, 5120 * 5, 5120 * 8, 5120 * 48, 5120 * 2560}) {
+        for (int size : {511, 5120, 5120 * 5, 5120 * 8, 5120 * 9, 5120 * 10,
+                         5120 * 16, 5120 * 20, 5120 * 32, 5120 * 40, 5120 * 48,
+                         5120 * 64, 5120 * 65, 5120 * 2560}) {
             failures += reduce_case(ec, events, size);
         }
         failures += norm_case(ec, events, false);

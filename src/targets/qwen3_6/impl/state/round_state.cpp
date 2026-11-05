@@ -81,7 +81,9 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
     layout.backend_kv_table_row = add_tensor(builder, DType::I32, {1}, "step backend KV table row");
     if (spec.gdn_record_norm_heads != 0) {
         layout.gdn_record_norm_counts = add_tensor(
-            builder, DType::I32, {spec.gdn_record_norm_heads}, "GDN record-norm completion counts");
+            builder, DType::I32,
+            {spec.gdn_record_norm_heads, static_cast<std::int32_t>(spec.batch_capacity)},
+            "GDN record-norm completion counts");
     }
     return layout;
 }

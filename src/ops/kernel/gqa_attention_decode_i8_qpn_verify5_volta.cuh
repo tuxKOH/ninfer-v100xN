@@ -75,7 +75,8 @@ __global__ __launch_bounds__(256, 2) void gqa_attention_verify5_qpn_volta_partia
         return;
     }
     const int window = positions[T - 1] + 1;
-    const int active = gqa_small_t_active_splits<G, true>(window, split_count, T, true);
+    const int active = gqa_small_t_active_splits<G, true>(window, split_count, T, true,
+                                                          MultiBatch ? gridDim.z : 1);
     if (split >= active) return;
     const int tiles_per_split = div_up(div_up(window, Bc), active);
     const int begin = split * tiles_per_split * Bc;

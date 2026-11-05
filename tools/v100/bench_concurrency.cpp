@@ -16,22 +16,35 @@ using Json = nlohmann::json;
 using Clock = std::chrono::steady_clock;
 int main(int argc, char** argv) {
     try {
-        if (argc != 7 && argc != 8) { throw std::invalid_argument("usage: bench ARTIFACT CORPUS INPUT_TOKENS CONCURRENCY OUTPUT_TOKENS REPORT.json [PREFILL_DECODE_ROUNDS]"); }
+        if (argc < 7) { throw std::invalid_argument("usage: bench ARTIFACT CORPUS INPUT_TOKENS CONCURRENCY OUTPUT_TOKENS REPORT.json [--tp 2|4] [--kv-capacity TOKENS] [--prefill-decode-rounds N]"); }
         const unsigned length = std::stoul(argv[3]), concurrency = std::stoul(argv[4]), output = std::stoul(argv[5]);
-        const unsigned decode_rounds = argc == 8 ? std::stoul(argv[7]) : 1;
+        unsigned tp = 2, kv_capacity = 180000, decode_rounds = 1;
+        for (int i = 7; i < argc; i += 2) {
+            if (i + 1 >= argc) { throw std::invalid_argument("benchmark option requires a value"); }
+            const std::string option = argv[i];
+            const unsigned value = std::stoul(argv[i + 1]);
+            if (option == "--tp") { tp = value; }
+            else if (option == "--kv-capacity") { kv_capacity = value; }
+            else if (option == "--prefill-decode-rounds") { decode_rounds = value; }
+            else { throw std::invalid_argument("unknown benchmark option: " + option); }
+        }
         if (length < 1 || length > 85000 || concurrency < 1 || concurrency > 8 || output < 2) {
             throw std::invalid_argument("invalid workload");
         }
         if (decode_rounds < 1 || decode_rounds > 64) { throw std::invalid_argument("invalid decode burst"); }
+        if ((tp != 2 && tp != 4) || kv_capacity < 180000 || length + output + 7 > 180000) {
+            throw std::invalid_argument("invalid tensor-parallel width or KV capacity");
+        }
         std::vector<ninfer::TokenId> ids;
         std::ifstream corpus(argv[2]);
         ninfer::TokenId token;
         while (corpus >> token && ids.size() < length) { ids.push_back(token); }
         if (ids.size() != length) { throw std::runtime_error("corpus too short"); }
         ninfer::EngineOptions options;
-        options.artifact_path = argv[1]; options.tp = 2; options.devices = {0, 1};
+        options.artifact_path = argv[1]; options.tp = tp;
+        for (unsigned rank = 0; rank < tp; ++rank) { options.devices.push_back(rank); }
         options.max_context = 180000;
-        options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(180000);
+        options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(kv_capacity);
         options.prefill_chunk = 1024;
         options.prefill_decode_rounds = decode_rounds;
         options.kv_cache = ninfer::KvCacheStorage::Int8Group64;
@@ -156,15 +169,25 @@ int main(int argc, char** argv) {
         const std::uint64_t live_tokens = live_wall > 0
             ? live_last->at("committed_decode_tokens").get<std::uint64_t>() -
               live_first->at("committed_decode_tokens").get<std::uint64_t>() : 0;
+        std::uint64_t accepted = 0, proposed = 0;
+        for (const auto& row : rows) {
+            accepted += row.at("accepted").get<std::uint64_t>();
+            proposed += row.at("drafted").get<std::uint64_t>();
+        }
         Json report{{"artifact_type", "ninfer_v100_long_concurrency"}, {"input_tokens", length},
+            {"prompt_fixture", std::filesystem::path(argv[2]).filename().string()},
             {"concurrency", concurrency}, {"output_tokens_per_request", output},
-            {"tp", 2}, {"mtp_drafts", 4}, {"graphs", options.use_cuda_graph}, {"kv_capacity", 180000},
+            {"tp", tp}, {"mtp_drafts", 4}, {"graphs", options.use_cuda_graph},
+            {"max_context", options.max_context}, {"kv_capacity", kv_capacity},
             {"prefill_chunk", 1024}, {"prefill_decode_rounds", decode_rounds},
             {"long_attention", true}, {"fast_decode", true},
             {"prefix_reuse", false}, {"committed_decode_tokens", committed},
             {"decode_wall_seconds", decode_wall}, {"total_decode_tok_s", committed / decode_wall},
             {"group_makespan_seconds", makespan}, {"group_output_tok_s", double(concurrency * output) / makespan},
             {"decode_rounds", rounds}, {"mean_decode_batch", double(row_rounds) / rounds},
+            {"accepted_drafts", accepted}, {"proposed_drafts", proposed},
+            {"draft_acceptance_rate", proposed ? double(accepted) / proposed : 0},
+            {"committed_tokens_per_round", double(committed) / rounds},
             {"all_live_sampled_wall_seconds", live_wall}, {"all_live_sampled_tokens", live_tokens},
             {"all_live_sampled_tok_s", live_wall > 0 ? Json(live_tokens / live_wall) : Json(nullptr)},
             {"mixed_wall_seconds", mixed_wall}, {"mixed_committed_decode_tokens", mixed_committed},

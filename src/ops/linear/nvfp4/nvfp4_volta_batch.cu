@@ -37,10 +37,11 @@ __global__ void pack_batch_activation(const Input* __restrict__ input,
 } // namespace
 
 bool nvfp4_volta_batch_supported(int n, int k, int tokens) noexcept {
-    // Exact TP2 dense shapes. Other TP dispatch and all T<=8 single-request
+    // Exact TP2/TP4 dense shapes. Other TP dispatch and all T<=8 single-request
     // schedules keep their existing implementation.
-    const bool shape = (k == 5120 && (n == 7168 || n == 8192 || n == 17408)) ||
-                       (n == 5120 && (k == 3072 || k == 8704));
+    const bool shape = (k == 5120 && (n == 3584 || n == 4096 || n == 7168 ||
+                                     n == 8192 || n == 8704 || n == 17408)) ||
+                       (n == 5120 && (k == 1536 || k == 3072 || k == 4352 || k == 8704));
     return shape && tokens >= 9 && tokens <= 64;
 }
 

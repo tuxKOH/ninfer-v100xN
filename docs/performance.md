@@ -4,6 +4,171 @@ Local hardware: 2 × Tesla V100-SXM2 16 GB, SXM2-to-PCIe adapters, PCIe 3.0 ×16
 
 [llama.cpp / LM Studio controls](llama-comparison.md) · [Other V100 profiles](performance-v100.md) · [TP4/NVLink](tp4.md) · [RAM-KV/PP2](experiments.md) · [Inherited upstream campaigns](performance-upstream.md)
 
+## TP4 concurrent packed-batch decode (2026-11-05)
+
+Release **v0.2.1** extends the packed-batch and packet/norm work to QUASAR TP4.
+The complete-code campaign compares four-card NVLink, two cards from that same NVLink host,
+the local two-card PCIe P2P route without NVLink, and the same remote host's **1Cat 1.5.1**.
+The remote host uses V100-SXM2 16 GB cards with complete pairwise NV2, driver 570.211.01,
+CUDA 12.8 / SM70 and its existing 300 W limits. No clocks or limits are changed.
+Different hosts/drivers prevent treating the two TP2 routes as a controlled NVLink-only A/B.
+
+Both input lengths are **complete coding chats**, not a slice of a longer prompt:
+2048 or 85000 saved token IDs, the same C++20 bounded blocking task queue implementation
+request, non-thinking assistant prefix and 512-token response budget. Each engine consumes
+the exact saved IDs directly. There is no repeated-code padding, decoded/re-tokenized prompt,
+prefix reuse or historical branch retention. Every case is one cold wave of C1/C2/C4/C8
+requests, with MTP4, greedy sampling and exactly 512 generated tokens per request.
+Loading and graph-path warmup are excluded.
+[Prompt construction and saved IDs](assets/tp4-concurrency/prompts/README.md).
+
+NInfer uses QUASAR NVFP4 v3, BF16 activations, complete INT8 group-64 KV, optimized proposal,
+CUDA Graphs, both experimental numerical profiles, 1024-token prefill chunks and one decode
+round between prefill chunks. Its main matrix has **180000 shared KV tokens**. Only two
+85000-input / 512-output requests fit at a time; C4/C8 are offered concurrency, not a promise
+that all requests decode together. Mean actual decode batch and whole-wave latency are
+reported. The 1Cat control uses its existing **AWQ INT4** checkpoint, FP16 activations,
+E4M3 KV, MTP4, chunk 1024, max-model-len 180000, max-num-seqs 8 and GPU memory utilization
+0.88. It reports **785196 physical KV tokens** at startup; max-model-len is not a
+shared-pool limit. This differs from both NInfer's 180000-token main matrix and its
+688000-token capacity control, so the long-input scheduling comparisons also differ in capacity.
+The 1Cat control uses isolated TileLang 0.1.10 / apache-tvm-ffi 0.1.10 dependencies; the
+original Conda environment is unchanged. The source review used 1Cat's 2026-11-04 main,
+whereas measurements run release 1.5.1. These versions are not interchangeable provenance.
+
+**Timing surfaces:** NInfer's headline rate is committed tokens after each request's first
+output divided by summed executor decode-round wall time, including commit/publication and
+excluding prefill and between-round waits. The common all-live rate uses complete nominal
+10 ms executor sample intervals for NInfer and returned HTTP SSE token IDs for 1Cat; no
+rate is reported if the streams never share a decode window. Whole-wave throughput includes
+prefill and queueing for every request. 1Cat's request-capacity estimate is C times total
+post-first-chunk tokens divided by summed per-request client decode lifetimes. It is not the
+same measurement as NInfer's executor rate. Do not divide these headline rates to claim an
+equal-quality win. MTP acceptance is accepted draft tokens divided by proposed draft tokens,
+not the fraction of output supplied by MTP.
+For NInfer, the compact report also derives a request-capacity estimate from C times all
+post-first-token outputs divided by summed request `(total - TTFT)` lifetimes. It includes
+intervening prefill stalls, unlike executor-round throughput; its timestamps are Engine-side,
+whereas 1Cat's are client-side. Whole-wave and common-window results remain separate.
+Multiplying by offered C does not make this an observed aggregate throughput when the
+requests do not overlap; queued long-input cases must be read with their actual batch.
+
+![Complete-code concurrency: decode, common window and whole-wave throughput](assets/tp4-concurrency/quasar-concurrency.svg)
+
+| Route | Input tokens | C1 decode tok/s | C2 | C4 | C8 |
+|---|---:|---:|---:|---:|---:|
+| TP4 NVLink | 2048 | 312.057 | 436.581 | 702.045 | **1083.389** |
+| TP2 NVLink | 2048 | 223.477 | 312.399 | 471.424 | **677.854** |
+| TP2 local PCIe P2P, no NVLink | 2048 | 220.799 | 297.185 | 436.011 | **603.917** |
+| TP4 NVLink | 85000 | 293.756 | 316.383 | 316.911 | **317.815** |
+| TP2 NVLink | 85000 | 183.386 | 201.466 | 200.587 | **200.267** |
+| TP2 local PCIe P2P, no NVLink | 85000 | 181.338 | 198.471 | 198.198 | **198.152** |
+
+These are executor decode-round rates, not HTTP or prefill throughput. At C8:
+
+| Route | Input | MTP accepted/proposed | Acceptance | Mean decode batch | Whole wave, s | Whole-wave output tok/s |
+|---|---:|---:|---:|---:|---:|---:|
+| TP4 NVLink | 2048 | 3058/4110 | 74.4% | 6.82 | 9.212 | 444.62 |
+| TP2 NVLink | 2048 | 3076/4024 | 76.4% | 7.23 | 14.199 | 288.46 |
+| TP2 local PCIe P2P | 2048 | 3076/4024 | 76.4% | 7.23 | 16.455 | 248.91 |
+| TP4 NVLink | 85000 | 3014/4252 | 70.9% | 1.23 | 327.996 | 12.49 |
+| TP2 NVLink | 85000 | 3024/4216 | 71.7% | 1.23 | 510.075 | 8.03 |
+| TP2 local PCIe P2P | 85000 | 3024/4216 | 71.7% | 1.23 | 569.311 | 7.19 |
+
+The two TP2 routes retain identical complete output IDs and speculative counters in all
+eight cases. They still run on different hosts, so their timing difference is not an isolated
+NVLink gain. The 85K C4/C8 cases have no common decode window across every submitted
+request. A missing all-live rate is not zero throughput. Their low mean batch reflects both
+the shared-pool admission limit and cold-prefill staggering.
+
+A separate **688000 shared-KV** TP4 85K/C8 control completes all eight requests at
+**337.864 executor decode tok/s**, mean decode batch **1.49**, peak decode-ready **2**,
+and whole-wave **326.973 s / 12.53 output tok/s**. It does not establish eight-way
+steady decode: cold prefill still staggers the requests. Acceptance is 3012/4260 (70.7%),
+so this is also not an equal-output isolated capacity speedup. A preceding 720000-token
+startup probe is rejected by the runtime reservation check, short by approximately
+211 MiB; it is retained as a failed capacity probe, not a throughput measurement.
+The main matrix keeps 180000 shared KV on every NInfer route.
+
+**Same-prompt software control:** the frozen implementation preceding this TP4 batch
+work is rerun on the same remote host with the exact complete 2K prompt and C8 options.
+It measures **295.319 → 1083.389 decode tok/s (+266.85%)**, with whole-wave time
+**19.308 → 9.212 s**. Mean batch is 7.28 → 6.82 and acceptance is
+3054/4122 (74.1%) → 3058/4110 (74.4%). Complete output IDs and speculative counters
+change; this is end-to-end decode improvement for the declared numerical profile, not
+an equal-output kernel speedup. The release-build repeat measures **1084.163 tok/s**,
+retaining every request's 512 output IDs and speculative counters from the 1083.389 run.
+
+**1Cat 1.5.1 HTTP control:** the following counts returned token IDs in the common
+decode lifetime, with all prefill/decode stalls inside that window retained. It is not
+executor-only decode time. A dash means no common decode window across every request.
+
+| Input tokens | C1 HTTP common tok/s | C2 | C4 | C8 |
+|---:|---:|---:|---:|---:|
+| 2048 | 153.850 | 223.620 | 396.104 | 588.349 |
+| 85000 | 126.005 | 103.516 | — | — |
+
+| Input tokens | C1 whole-wave output tok/s | C2 | C4 | C8 |
+|---:|---:|---:|---:|---:|
+| 2048 | 127.477 | 138.924 | 263.377 | 338.824 |
+| 85000 | 13.016 | 11.453 | 10.909 | 10.634 |
+
+1Cat C8 completes in **12.089 / 385.172 s** for 2K/85K, with draft acceptance
+3076/4072 (**75.5%**) and 3090/4012 (**77.0%**), respectively. NInfer TP4's 2K/C8
+common sampled window is **1160.949 tok/s**, and its whole-wave rate is **444.619 tok/s**.
+At 85K/C8 neither engine has an all-request common window in this cold-wave workload.
+The chart presents the named timing surfaces separately rather than treating a request-capacity
+estimate as observed total throughput. [Compact measurements](assets/tp4-concurrency/quasar-concurrency.json)
+retain all 32 cases, capacity control, software comparison and release-repeat equality flags.
+
+The implementation retains one original weight image. TP4 T9..64 projections reuse packed
+activation supply; direct BF16 row publication, 640 KiB device channels and cross-layer
+sum/RMSNorm handoff cover the verifier batch. T>8 sum/norm uses a 128-thread CTA with the
+same twenty logical warp sums and global-rank order. Short TP4 C4/C8 attention reduces
+excess KV splits and uses FP32 PV/private split numerators before the public BF16 output.
+GDN record/norm supports B1..8 with per-request/head resettable completion counters and the
+original FP32 recurrence/BF16 records. The zero-valid record case also preserves untouched
+key records. [Source review](v100-decode-survey.md#tp4-并发源码借鉴2026-11-05) and `NOTICE`
+identify 1Cat mechanisms and provenance.
+
+Independent FP64 attention/projection/row-add/SwiGLU/norm and GDN oracles, input/weight
+read-only checks, guards, changed-input Graphs and TP4 collectives pass without relaxed
+criteria. Real QUASAR C2/C4/C8 normal/longfast, greedy/mixed Graph/eager complete output
+IDs and acceptance checks pass. Actual-85K long/fast Graph/eager, prefix restoration,
+exact replay logits/counters and committed-frontier checks pass. These are numerical and
+state checks, not answer-quality qualification. Changed reductions can alter output and MTP
+acceptance; **no new GPQA or universal losslessness claim**. Long/fast remain default-off.
+
+Reproduce NInfer from a Release SM70 build with `NINFER_BUILD_BENCHMARKS=ON`:
+
+```bash
+python3 tools/v100/bench_concurrency.py \
+  --binary build/bench/ninfer_v100_concurrency_bench \
+  --artifact /path/to/quasar-v3/qwen3_8_27b_nvfp4.ninfer \
+  --corpus-dir docs/assets/tp4-concurrency/prompts \
+  --input-tokens 2048 85000 --concurrency 1 2 4 8 --tp 4 \
+  --output profiles/bench/complete-code-tp4
+```
+
+Use `--tp 2` for either two-card route. Health logging accompanies each case; resume keeps
+completed cases rather than discarding unfavourable samples. The 1Cat benchmark is
+`tools/v100/bench_vllm_concurrency.py`, using the same `--corpus-dir`, lengths and concurrency,
+plus the runtime/checkpoint/KV descriptions and a loopback API URL. Its SSE output must contain
+exactly 512 token IDs and matching usage counts. The compact report retains acceptance,
+actual batch, timing and workload metadata separately from the older raw-prefix diagnostics.
+
+With the 1Cat server configured as described above:
+
+```bash
+python3 tools/v100/bench_vllm_concurrency.py \
+  --base-url http://127.0.0.1:6199 --model onecat-control \
+  --checkpoint Qwen3.8-27B-AWQ-INT4 --runtime-version '1Cat 1.5.1' \
+  --kv-format 'FP16 activations / E4M3 KV' --tp 4 --capacity 180000 \
+  --corpus-dir docs/assets/tp4-concurrency/prompts \
+  --input-tokens 2048 85000 --concurrency 1 2 4 8 --repetitions 1 \
+  --output profiles/bench/complete-code-onecat
+```
+
 ## TP2 concurrent packed-batch decode (2026-11-02)
 
 Release **v0.2.1** targets QUASAR NVFP4 v3 / TP2 / optimized-head MTP4 on the
@@ -13,6 +178,10 @@ flags, greedy sampling, zero penalties and disabled model stops. Every request i
 consumes the same first 2048, 16384 or 85000 IDs from `v100-code-85000-iommu-pt.ids` and emits
 512 tokens. Prefix reuse and historical retention are off. There is no shared-prefix compute
 reuse between these cold requests. Loading and a short graph-path warmup are outside timing.
+The 2048/16384 prefixes stop inside reference source, before the full 85K task and assistant
+prefix. They are raw-prefix diagnostics, not complete short coding chats. The later
+[complete-code campaign](#tp4-concurrent-packed-batch-decode-2026-11-05) uses separately
+constructed prompts; differences between these workloads are not software speedups.
 
 The preceding implementation was frozen before the batch/packet changes and measured on the
 same host and workload. These are one cold group per case, not statistical estimates. **Total
@@ -110,6 +279,26 @@ Full local results and detailed GPU/host health logs are under
 `profiles/bench/tp2-concurrency-20261102/`. GPU clocks and limits are unchanged; completed
 retained-matrix runs reach at most 56 °C GPU and 63 °C memory, with zero volatile uncorrected
 ECC errors reported. This does not establish a hardware performance ceiling.
+
+### NVLink TP2 control (2026-11-05)
+
+Using two GPUs of the remote four-card V100-SXM2 16 GB host, the same 2K/C8 workload
+measures **554.018 total committed decode tok/s**. Direct NVLink P2P is verified at startup;
+the pair has an NV2 connection. Driver 570.211.01, CUDA 12.8 / SM70 and the existing 300 W
+per-card limits are used without changing clocks or limits. This is a separate NVLink hardware
+reference; the local PCIe-only **493.095** result above remains unchanged. The different host
+and driver prevent attributing the difference solely to NVLink.
+
+The run uses QUASAR NVFP4 v3, optimized-head MTP4, 2048 input IDs and 512 output tokens per
+request, eight cold independent requests, complete INT8 G64 KV, 180000 shared KV capacity,
+1024-token prefill chunks, CUDA Graphs and both experimental profiles. Prefix reuse/history
+are disabled. Loading and graph warmup are excluded, using the same decode-round counter
+method as the local campaign. It commits 4088 decode tokens in 7.378824 s, with a mean batch
+of 7.3059. The full group, including cold prefill and queue time, takes 15.451098 s
+(265.094 output tok/s). The separate common-lifetime sampled rate is 598.445 tok/s; it is not
+the headline decode metric. This is one group, with no new quality evaluation.
+
+[Compact NVLink TP2 measurement](assets/tp2-nvlink-concurrency/quasar-concurrency.json).
 
 ## v0.1.2: visual long attention and CPU Vision (2026-10-23)
 

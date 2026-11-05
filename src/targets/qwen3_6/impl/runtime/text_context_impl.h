@@ -1953,14 +1953,15 @@ void TextContext::gdn_mix_tp2(const std::array<const GdnLayerW*, kMaximumExecuti
             if (gdn_state_action_ == GdnStateAction::RecordForReplay) {
                 GdnReplayRecordLayer records =
                     replay_records_for(rank)->layer(gidx, active_sequence_batch_);
-                const Tensor counters = io_for(rank).gdn_record_norm_counts;
+                const Tensor counter_storage = io_for(rank).gdn_record_norm_counts;
                 fused_norm = q_batch.ne[1] == 4 && v_batch.ne[1] == 12 &&
-                             active_sequence_batch_ == 1 && width <= 8 &&
-                             on[r].dtype == DType::FP16 && counters.data != nullptr;
+                             active_sequence_batch_ <= 8 && width <= 8 &&
+                             counter_storage.data != nullptr;
                 if (fused_norm) {
+                    const auto counters = counter_storage.slice(1, 0, active_sequence_batch_);
                     const ops::GdnReplayGatedNorm epilogue{
-                        *w[r]->gdn_norm, z[r].view({128, 12, width, 1}), kCfg.rms_eps,
-                        on[r].view({128, 12, width, 1}), counters};
+                        *w[r]->gdn_norm, z[r].view({128, 12, width, active_sequence_batch_}), kCfg.rms_eps,
+                        on[r].view({128, 12, width, active_sequence_batch_}), counters};
                     ops::gated_delta_net_replay_record(
                         q_batch, k_batch, v_batch, g_batch, beta_batch, kGdnScale, recurrent_states,
                         valid, slots, records.key, records.value, records.gate, out_batch,
@@ -2021,13 +2022,14 @@ void TextContext::run_layers_tp2(std::array<Tensor, kMaximumExecutionDevices>& x
     if (sink != nullptr) { sink->begin(x[0]); }
     const bool prefill = phase == Phase::Prefill;
     auto input_norm_scopes = workspace_scopes();
-    const bool handoff_norm = x[0].ne[1] <= 8;
+    const auto norm_handoff_limit = workspace_recipe::tp_norm_handoff_limit(ec().device_count);
+    const bool handoff_norm = x[0].ne[1] <= norm_handoff_limit;
     const auto prepared_input = rank_map([&](int rank) {
         return handoff_norm ? workspace_recipe::post_mixer_hidden<TextConfig>(*workspaces()[rank], x[rank].ne[1]) : Tensor{};
     });
     for (int layer = 0; layer < kCfg.n_layers; ++layer) {
         auto layer_scopes = workspace_scopes();
-        const bool normalized_mixer_output = x[0].ne[1] <= 8;
+        const bool normalized_mixer_output = x[0].ne[1] <= norm_handoff_limit;
         const auto normalized = rank_map([&](int rank) {
             if (!normalized_mixer_output) return Tensor{};
             const MlpW* mlp;

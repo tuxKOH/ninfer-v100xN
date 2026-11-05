@@ -194,11 +194,11 @@ public:
     }
     static constexpr std::size_t kPacketMaxBytes = 81920;
     static constexpr std::size_t kPacketBlocks = kPacketMaxBytes / (16 * 64);
-    static constexpr std::size_t kTp2PacketMaxBytes = 64 * 5120 * sizeof(std::uint16_t);
-    // Capacity of one direct-device channel, fixed by the startup rank domain.
+    static constexpr std::size_t kDevicePacketMaxBytes = 64 * 5120 * sizeof(std::uint16_t);
+    // Capacity of one direct-device channel, including flattened MTP batches.
     // Mapped-host channels have their independent kPacketMaxBytes capacity.
     [[nodiscard]] std::size_t packet_capacity_bytes() const noexcept {
-        return ranks_ == 2 ? kTp2PacketMaxBytes : kPacketMaxBytes;
+        return kDevicePacketMaxBytes;
     }
 
     // False for a moved-from instance.

@@ -31,6 +31,19 @@ std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tok
 
 bool gqa_attention_uses_small_t(std::int32_t tokens);
 
+// Private short-context TP4 batch profile: keep the softmax numerator in FP32
+// through the split merge. The public BF16 output and original INT8 KV stay fixed.
+inline DType gqa_attention_small_t_accumulator_dtype(
+    std::int32_t q_heads, DType cache_dtype, GqaExecutionEnvelope envelope,
+    std::int32_t batch_size, std::int32_t tokens) {
+#ifdef NINFER_VOLTA_BUILD
+    if (q_heads == 6 && cache_dtype == DType::I8 && batch_size >= 4 &&
+        tokens >= 3 && tokens <= 6 && envelope.max_visible_keys > 128 &&
+        envelope.max_visible_keys <= 16390) return DType::FP32;
+#endif
+    return DType::BF16;
+}
+
 GqaAttentionRoute gqa_attention_resolve_route(std::int32_t q_heads, std::int32_t width,
                                               std::int32_t batch_size, DType cache_dtype,
                                               GqaExecutionEnvelope envelope);

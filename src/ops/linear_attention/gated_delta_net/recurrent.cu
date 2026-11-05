@@ -137,11 +137,15 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
         scale,
     };
     if (norm != nullptr) {
-        recurrent_record_norm_kernel<Masked><<<grid, block, 0, stream>>>(
-            access, static_cast<const __nv_bfloat162*>(norm->weight.data),
-            static_cast<const __nv_bfloat162*>(norm->z.data),
-            static_cast<__half2*>(norm->out.data), norm->eps,
-            static_cast<unsigned*>(norm->completion_counts.data));
+        const auto launch = [&]<bool Fp16Image>() {
+            recurrent_record_norm_kernel<Masked, Fp16Image><<<grid, block, 0, stream>>>(
+                access, static_cast<const __nv_bfloat162*>(norm->weight.data),
+                static_cast<const __nv_bfloat162*>(norm->z.data),
+                static_cast<RmsOutputPair<Fp16Image>*>(norm->out.data), norm->eps,
+                static_cast<unsigned*>(norm->completion_counts.data));
+        };
+        if (norm->out.dtype == DType::FP16) launch.template operator()<true>();
+        else launch.template operator()<false>();
     } else {
         recurrent_record_kernel<Masked, Dv, Warps><<<grid, block, 0, stream>>>(access);
     }

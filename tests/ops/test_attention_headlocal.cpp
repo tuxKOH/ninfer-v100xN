@@ -687,8 +687,8 @@ int run_long_split_graph_boundary(int device, int tokens, bool long_attention = 
 //
 // B>1 is the only way a 12-head geometry reaches GqaAttentionRoute::ChunkedSmallT, and it is the
 // only route that instantiates the decode kernels' MultiBatch=true / Masked=true specializations.
-// The reference is the tp1 run; the FP64 oracle is not evaluated here (the per-request extraction
-// it needs belongs to the conformance suite, and the tp1 leg already carries it there).
+// Each row is also extracted for an independent full-key FP64 oracle. Small-T
+// cases check changed-query Graph replay and guarded output/workspace writes.
 struct BatchHeadLocalCase {
     std::int32_t width;
     std::vector<std::int32_t> contexts;
@@ -761,10 +761,52 @@ BatchRunResult run_batch(int device, const Geometry& geometry, DType dtype,
     result.failures += verify_positions(label + " positions unchanged", dp, positions);
     result.failures += dout.verify_guards((label + " output").c_str());
     result.failures += workspace_buffer.verify_guards((label + " workspace").c_str());
+    if (test_case.width <= 6) {
+        cudaStream_t stream = nullptr;
+        cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "batch graph stream");
+        const auto invoke = [&](ops::GqaExecutionEnvelope current) {
+            workspace.reset();
+            ops::gqa_attention(tq, tk, tv, tp, masked ? tvalid : Tensor{}, trows, kAttentionScale,
+                               cache.view(), current, workspace, tout, stream);
+        };
+        auto replay_envelope = envelope;
+        replay_envelope.min_visible_keys = 1;
+        invoke(replay_envelope);
+        cuda_synchronize(stream);
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t executable = nullptr;
+        cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "batch capture");
+        invoke(replay_envelope);
+        cuda_check(cudaStreamEndCapture(stream, &graph), "batch capture end");
+        cuda_check(cudaGraphInstantiate(&executable, graph, 0), "batch graph instantiate");
+        auto changed_query = q_bits;
+        for (std::size_t i = 0; i < changed_query.size(); ++i) {
+            if (i % 3 != 0) changed_query[i] ^= 0x8000u;
+        }
+        for (const auto* query : std::array<const std::vector<std::uint16_t>*, 2>{&q_bits, &changed_query}) {
+            dq.copy_from_host(query->data(), query->size() * sizeof(std::uint16_t));
+            invoke(envelope);
+            cuda_synchronize(stream);
+            const auto eager = copy_from_guarded<std::uint16_t>(dout, q_bits.size());
+            dout.copy_from_host(canary.data(), canary.size() * sizeof(std::uint16_t));
+            cuda_check(cudaGraphLaunch(executable, stream), "batch graph replay");
+            cuda_synchronize(stream);
+            const auto replay = copy_from_guarded<std::uint16_t>(dout, q_bits.size());
+            result.failures += verify_exact((label + " changed-query Graph/eager").c_str(),
+                                             replay, eager);
+        }
+        cuda_check(cudaGraphExecDestroy(executable), "batch graph destroy");
+        cuda_check(cudaGraphDestroy(graph), "batch capture destroy");
+        cuda_check(cudaStreamDestroy(stream), "batch stream destroy");
+        result.failures += verify_input(label + " changed query unchanged", dq, changed_query);
+        result.failures += dout.verify_guards((label + " replay output").c_str());
+        result.failures += workspace_buffer.verify_guards((label + " replay workspace").c_str());
+    }
     return result;
 }
 
-int run_batch_case(DType dtype, const BatchHeadLocalCase& test_case) {
+int run_batch_case(DType dtype, const BatchHeadLocalCase& test_case,
+                   bool compare_global_execution = true) {
     const auto batch = static_cast<std::int32_t>(test_case.contexts.size());
     std::int32_t maximum_visible = 1;
     for (std::int32_t row = 0; row < batch; ++row) {
@@ -828,11 +870,14 @@ int run_batch_case(DType dtype, const BatchHeadLocalCase& test_case) {
                               " W=" + std::to_string(test_case.width);
 
     int failures = 0;
-    const BatchRunResult reference = run_batch(0, kGlobalGeometry, dtype, global_rows, test_case, q,
-                                               k, v, positions, envelope, label + " tp1");
-    failures += reference.failures;
-    const std::vector<double> reference_value = bf16_bits_to_double(reference.output);
-    std::vector<double> oracle(reference_value.size(), 0.0);
+    std::vector<double> reference_value;
+    if (compare_global_execution) {
+        const auto reference = run_batch(0, kGlobalGeometry, dtype, global_rows, test_case, q,
+                                          k, v, positions, envelope, label + " tp1");
+        failures += reference.failures;
+        reference_value = bf16_bits_to_double(reference.output);
+    }
+    std::vector<double> oracle(q.size(), 0.0);
     for (int row = 0; row < batch; ++row) {
         const int valid = test_case.valid_columns[row];
         if (valid == 0) { continue; }
@@ -851,7 +896,9 @@ int run_batch_case(DType dtype, const BatchHeadLocalCase& test_case) {
                                              expected_cache, row_positions);
         std::copy(values.begin(), values.end(), oracle.begin() + first_column * q_stride);
     }
-    failures += verify_attention(label + " batched vs FP64 oracle", reference_value, oracle, criterion);
+    if (compare_global_execution) {
+        failures += verify_attention(label + " batched vs FP64 oracle", reference_value, oracle, criterion);
+    }
 
     for (int rank = 0; rank < kRanks; ++rank) {
         std::vector<HostCache> local_rows;
@@ -874,8 +921,17 @@ int run_batch_case(DType dtype, const BatchHeadLocalCase& test_case) {
             run_batch(rank, kLocalGeometry, dtype, local_rows, test_case, local_q, local_k, local_v,
                       positions, envelope, label + " tp" + std::to_string(kRanks) + " rank=" + std::to_string(rank));
         failures += observed.failures;
-        failures += compare_device(label, rank, observed.output, reference_value, &oracle,
-                                   criterion, test_case.width, batch);
+        if (compare_global_execution) {
+            failures += compare_device(label, rank, observed.output, reference_value, &oracle,
+                                       criterion, test_case.width, batch);
+        } else {
+            // The focused TP4 route is judged directly against the mathematical
+            // oracle. The unrelated TP1 FP16-PV implementation does not pass
+            // these persistent-bias fixtures and is not a reference authority.
+            failures += verify_attention(label + " rank=" + std::to_string(rank) + " vs oracle",
+                bf16_bits_to_double(observed.output),
+                slice_output_heads(oracle, rank, test_case.width, batch), criterion);
+        }
     }
     return failures;
 }
@@ -971,6 +1027,7 @@ int verify_rejections() {
 } // namespace
 
 int main(int argc, char** argv) {
+    const bool batch_decode_only = argc == 2 && std::string(argv[1]) == "--batch-decode-only";
     const bool prefill_only = argc == 2 && std::string(argv[1]) == "--prefill-only";
     const bool long_context_from = argc == 3 && std::string(argv[1]) == "--long-context-from";
     int first_long_width = 1;
@@ -987,10 +1044,10 @@ int main(int argc, char** argv) {
     const bool default_single_only = argc == 2 && std::string(argv[1]) == "--default-single-only";
     const bool long_verify5_only = argc == 2 && std::string(argv[1]) == "--long-verify5-only";
     if (argc != 1 && !prefill_only && !long_context_only && !default_single_only &&
-        !long_verify5_only) {
+        !long_verify5_only && !batch_decode_only) {
         std::cerr << "usage: " << argv[0]
                   << " [--prefill-only|--long-context-only|--long-context-from 1|4|5|6"
-                     "|--default-single-only|--long-verify5-only]\n";
+                     "|--default-single-only|--long-verify5-only|--batch-decode-only]\n";
         return 2;
     }
     if (cuda_unavailable()) {
@@ -1003,6 +1060,25 @@ int main(int argc, char** argv) {
         std::cout << "SKIP: head-local attention parity requires " << kRanks
                   << " CUDA devices, found " << device_count << '\n';
         return 77;
+    }
+
+    if (batch_decode_only) {
+        int failures = 0;
+        for (bool long_attention : {false, true}) {
+            failures += run_batch_case(DType::I8,
+                {5, {2048, 2039, 2300, 2548, 2111, 127, 513, 2560},
+                 {5, 3, 5, 1, 4, 5, 0, 5}, {0, 1, 2, 3, 4, 5, 6, 7},
+                 MappingPattern::Fragmented, 1934u, true, long_attention}, false);
+            for (int width : {3, 4, 6}) {
+                failures += run_batch_case(DType::I8,
+                    {width, {2048, 4091, 5000, 128}, {width, width, width - 1, 0},
+                     {0, 1, 2, 3}, MappingPattern::Fragmented,
+                     static_cast<std::uint32_t>(1940 + width), true, long_attention}, false);
+            }
+        }
+        std::cout << (failures == 0 ? "PASS" : "FAIL")
+                  << " head-local INT8 concurrent decode (FP64 and changed-query Graph/eager)\n";
+        return failures == 0 ? 0 : 1;
     }
 
     if (long_verify5_only) {

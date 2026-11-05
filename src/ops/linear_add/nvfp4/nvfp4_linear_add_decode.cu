@@ -140,7 +140,9 @@ void nvfp4_linear_add_qpn_publish4(const Tensor& x, const Weight& weight,
             reinterpret_cast<const unsigned*>(static_cast<const std::uint8_t*>(storage[Rank]) +
                                                 8 * channel_bytes),
             static_cast<int>(channel_bytes / sizeof(__nv_bfloat162))};
-        if (nvfp4_volta_qpn_precast_supported(weight.n, weight.k, x.ne[1])) {
+        if (nvfp4_volta_batch_supported(weight.n, weight.k, x.ne[1])) {
+            launch_nvfp4_volta_batch_output(x, weight, epilogue, weight.n, workspace, stream);
+        } else if (nvfp4_volta_qpn_precast_supported(weight.n, weight.k, x.ne[1])) {
             launch_nvfp4_volta_qpn_with_precast_output(x, weight, epilogue, weight.n,
                                                        workspace, stream);
         } else {

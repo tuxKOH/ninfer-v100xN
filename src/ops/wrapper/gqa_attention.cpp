@@ -275,9 +275,10 @@ struct SmallTWorkspace {
 template <class Allocator>
 SmallTWorkspace allocate_small_t_workspace(Allocator& workspace, std::int32_t q_heads,
                                            std::int32_t tokens, std::int32_t splits,
-                                           std::int32_t batch_size = 1) {
+                                           std::int32_t batch_size = 1,
+                                           DType accumulator_dtype = DType::BF16) {
     return {
-        workspace.alloc(DType::BF16, {kHeadDim, q_heads, tokens, splits * batch_size}),
+        workspace.alloc(accumulator_dtype, {kHeadDim, q_heads, tokens, splits * batch_size}),
         workspace.alloc(DType::FP32, {q_heads, tokens, splits * batch_size}),
         workspace.alloc(DType::FP32, {q_heads, tokens, splits * batch_size}),
     };
@@ -377,7 +378,9 @@ void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
         const std::int32_t splits =
             detail::gqa_attention_split_capacity(q.ne[1], count, cache.dtype, envelope);
         SmallTWorkspace partial =
-            allocate_small_t_workspace(workspace, q.ne[1], count, splits, q.ne[3]);
+            allocate_small_t_workspace(workspace, q.ne[1], count, splits, q.ne[3],
+                detail::gqa_attention_small_t_accumulator_dtype(
+                    q.ne[1], cache.dtype, envelope, q.ne[3], count));
         detail::gqa_attention_small_t_launch(q, k, v, positions, valid_columns, table_rows, scale,
                                              cache, envelope, begin, count, partial.acc, partial.m,
                                              partial.l, out, stream);
@@ -485,8 +488,26 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
         const std::int32_t splits =
             detail::gqa_attention_split_capacity(q_heads, width, cache_dtype, envelope);
         WorkspaceLayoutBuilder layout;
-        (void)allocate_small_t_workspace(layout, q_heads, width, splits, batch_size);
-        return layout.peak_bytes(1);
+        (void)allocate_small_t_workspace(layout, q_heads, width, splits, batch_size,
+            detail::gqa_attention_small_t_accumulator_dtype(
+                q_heads, cache_dtype, envelope, batch_size, width));
+        auto maximum = layout.peak_bytes(1);
+        // A Program plans a wider interval than a captured short-context Graph.
+        // Include the FP32 batch route's clipped high-water independently of
+        // the BF16 long-window route, rather than doubling long KV workspaces.
+        auto short_envelope = envelope;
+        short_envelope.max_visible_keys = std::min(envelope.max_visible_keys, 16390U);
+        if (short_envelope.min_visible_keys <= short_envelope.max_visible_keys &&
+            detail::gqa_attention_small_t_accumulator_dtype(
+                q_heads, cache_dtype, short_envelope, batch_size, width) == DType::FP32) {
+            WorkspaceLayoutBuilder short_layout;
+            const auto short_splits = detail::gqa_attention_split_capacity(
+                q_heads, width, cache_dtype, short_envelope);
+            (void)allocate_small_t_workspace(short_layout, q_heads, width, short_splits,
+                                              batch_size, DType::FP32);
+            maximum = std::max(maximum, short_layout.peak_bytes(1));
+        }
+        return maximum;
     };
     const auto exact_capacity = [&](std::int32_t width) {
         const detail::GqaAttentionRoute route =
@@ -621,7 +642,9 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
         const std::int32_t splits =
             detail::gqa_attention_split_capacity(q.ne[1], width, cache.dtype, envelope);
         SmallTWorkspace partial =
-            allocate_small_t_workspace(workspace, q.ne[1], width, splits, batch);
+            allocate_small_t_workspace(workspace, q.ne[1], width, splits, batch,
+                detail::gqa_attention_small_t_accumulator_dtype(
+                    q.ne[1], cache.dtype, envelope, batch, width));
         detail::gqa_attention_small_t_launch(q, k, v, positions, valid_columns, kv_table_rows,
                                              scale, cache, envelope, 0, width, partial.acc,
                                              partial.m, partial.l, out, stream);

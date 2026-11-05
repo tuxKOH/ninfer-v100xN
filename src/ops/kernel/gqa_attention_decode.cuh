@@ -17,10 +17,19 @@
 #include <math_constants.h>
 
 #include <cstdint>
+#include <type_traits>
 
 namespace ninfer::ops {
 
 inline constexpr int kGqaHeadDim = 256;
+
+template <bool Fp32>
+using GqaPartial = std::conditional_t<Fp32, float, __nv_bfloat16>;
+
+__device__ __forceinline__ float gqa_partial_value(float value) { return value; }
+__device__ __forceinline__ float gqa_partial_value(__nv_bfloat16 value) {
+    return __bfloat162float(value);
+}
 
 // The SM shared-memory residency budget the split-KV decode kernels are tuned against.
 //
@@ -167,9 +176,31 @@ __host__ __device__ inline constexpr int gqa_volta_long_i8_splits(int window, in
     return 0;
 }
 
+// Concurrent short-context TP4 already supplies independent request CTAs. Reuse
+// longer key panels instead of multiplying the single-request occupancy grid.
+// Like 1Cat's SM70 batch/context routing, this is selected by live batch geometry;
+// all keys and the original packed KV remain visible. Allocation may retain the
+// single-request upper bound. Host launch and live device selection use this
+// same rule, including Graph replay intervals spanning split-policy boundaries.
+template <typename Geometry>
+__host__ __device__ inline constexpr int gqa_volta_batch_i8_splits(
+    int splits, int window, int tokens, int batch_size) {
+#ifdef NINFER_VOLTA_BUILD
+    if constexpr (Geometry::QHeads == 6) {
+        if (batch_size >= 4 && tokens >= 3 && tokens <= 6 &&
+            window > 128 && window <= 16390) {
+            const int divisor = batch_size >= 8 ? 4 : 2;
+            return div_up(splits, divisor);
+        }
+    }
+#endif
+    return splits;
+}
+
 template <typename Geometry, bool Int8>
 __device__ __forceinline__ int gqa_small_t_active_splits(int window, int launch_capacity,
-                                                         int tokens, bool volta_long_attention = false) {
+                                                         int tokens, bool volta_long_attention = false,
+                                                         int batch_size = 1) {
     if (window <= 0) { return launch_capacity; }
     int splits = 0;
     if constexpr (Int8) {
@@ -191,6 +222,10 @@ __device__ __forceinline__ int gqa_small_t_active_splits(int window, int launch_
         }
     } else {
         splits = gqa_small_t_default_splits<Geometry>(window);
+    }
+    if constexpr (Int8) {
+        splits = gqa_volta_batch_i8_splits<Geometry>(
+            splits, window, tokens, batch_size);
     }
     return splits < launch_capacity ? splits : launch_capacity;
 }
@@ -220,9 +255,9 @@ __device__ __forceinline__ void gqa_small_t_tc_row_to_qt(int row, int tokens, in
 }
 
 template <typename Geometry, int DChunk, bool Int8, bool MultiBatch, bool Masked, bool Offset,
-          int SplitTile = 256 / DChunk, bool DirectNumerator = false>
+          int SplitTile = 256 / DChunk, bool DirectNumerator = false, bool Fp32Partial = false>
 __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kernel(
-    const __nv_bfloat16* partial_acc, const float* partial_m, const float* partial_l,
+    const GqaPartial<Fp32Partial>* partial_acc, const float* partial_m, const float* partial_l,
     const std::int32_t* positions, const std::int32_t* valid_columns, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t batch_size,
     std::int32_t split_count, __nv_bfloat16* out, bool volta_long_attention = false) {
@@ -262,7 +297,8 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
 
     const int window = last_pos + 1;
     const int active_split_count =
-        gqa_small_t_active_splits<Geometry, Int8>(window, split_count, tokens, volta_long_attention);
+        gqa_small_t_active_splits<Geometry, Int8>(window, split_count, tokens,
+                                                 volta_long_attention, batch_size);
 
     __shared__ float reduce[256];
     __shared__ float weights[Geometry::DecodeSplits];
@@ -358,7 +394,7 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
                         const int split = first + item;
                         weight[item] = split < active_split_count ? weights[split] : -1.0f;
                         prefetched[item] = weight[item] >= 0.0f
-                            ? __bfloat162float(partial_acc[gqa_partial_acc_index<Geometry>(
+                            ? gqa_partial_value(partial_acc[gqa_partial_acc_index<Geometry>(
                                   q_head, d, token, split, tokens)])
                             : 0.0f;
                     }
@@ -377,7 +413,7 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
                     const int source_d = d_start + item % DChunk;
                     float value = 0.0f;
                     if (split < active_split_count && weights[split] >= 0.0f) {
-                        value = __bfloat162float(partial_acc[gqa_partial_acc_index<Geometry>(
+                        value = gqa_partial_value(partial_acc[gqa_partial_acc_index<Geometry>(
                             q_head, source_d, token, split, tokens)]);
                     }
                     values[item] = value;

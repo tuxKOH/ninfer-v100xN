@@ -441,7 +441,7 @@ void linear_add_row_parallel(std::span<const Tensor> x, std::span<const Weight> 
 
 #ifdef NINFER_VOLTA_BUILD
     bool published_tp4 = ec.device_count == 4 && policy == LinearPolicy::A16Only &&
-                         x[0].ne[1] <= 8 && norm && norm->weight.size() == 4 &&
+                         x[0].ne[1] <= 64 && norm && norm->weight.size() == 4 &&
                          norm->output.size() == 4 && events.packet_storage(0);
     for (int rank = 0; rank < ec.device_count && published_tp4; ++rank) {
         published_tp4 &= ec.dev[rank]->sm() == 70 && w[rank].qtype == QType::NVFP4 &&
@@ -472,7 +472,7 @@ void linear_add_row_parallel(std::span<const Tensor> x, std::span<const Weight> 
         detail::for_each_rank(ec, [&](int rank) {
             detail::nvfp4_linear_add_qpn_publish4(x[rank], w[rank],
                 rank == 0 ? residual[rank] : Tensor{}, residual[rank], *workspace[rank],
-                storage, rank, PeerEvents::kPacketMaxBytes, ec.dev[rank]->stream);
+                storage, rank, events.packet_capacity_bytes(), ec.dev[rank]->stream);
         });
         detail::allreduce_published_sum_rmsnorm(residual, staging, *norm, ec, events);
         return;

@@ -512,9 +512,9 @@ int main(int argc, char** argv) {
     try {
         const auto profile = v100x2_test::profile(ninfer::ProposalHead::Full);
         if (batches) {
-            require(v100x2_test::tp() == 2 && v100x2_test::pp() == 1 &&
+            require((v100x2_test::tp() == 2 || v100x2_test::tp() == 4) && v100x2_test::pp() == 1 &&
                         profile.backend == ninfer::SpeculativeBackend::Mtp,
-                    "batch gate requires TP2/PP1 MTP");
+                    "batch gate requires TP2/TP4 PP1 MTP");
             std::array<Tokens, kProbes> inputs;
             {
                 ninfer::Engine engine(engine_options(artifact, true, false, profile));
