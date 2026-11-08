@@ -152,7 +152,7 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
             if (end > base->summary.prompt_tokens) {
                 throw std::invalid_argument("vision item consumer span exceeds prompt");
             }
-            if (model.features.vision_device == VisionDevice::Gpu &&
+            if (!auxiliary_vision_enabled && model.features.vision_device == VisionDevice::Gpu &&
                 schedule::VisionContext::workspace_bytes(item) > work.capacity()) {
                 throw std::invalid_argument("vision item exceeds the Program workspace envelope");
             }

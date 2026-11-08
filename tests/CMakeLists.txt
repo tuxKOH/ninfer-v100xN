@@ -50,6 +50,15 @@ ninfer_add_op_test(ninfer_host_vision_test
   SOURCES ops/test_host_vision.cpp
   LIBRARIES ninfer_host_ops)
 
+if(NINFER_ENABLE_SM86_VISION)
+  ninfer_add_op_test(ninfer_vision_sm86_linear_test
+    SOURCES ops/test_vision_sm86_linear.cpp
+    LIBRARIES ninfer_vision_sm86 ninfer_ops ninfer_core CUDA::cudart)
+  ninfer_add_op_test(ninfer_vision_sm86_ops_test
+    SOURCES ops/test_vision_sm86_ops.cpp
+    LIBRARIES ninfer_vision_sm86 ninfer_core CUDA::cudart)
+endif()
+
 ninfer_add_op_test(ninfer_ggml_k_test
   SOURCES ops/test_ggml_k.cpp
   LIBRARIES ninfer_ops)

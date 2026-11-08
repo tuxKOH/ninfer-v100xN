@@ -16,6 +16,13 @@ struct ExecutionContext;
 }
 
 namespace ninfer::targets::qwen3_6 {
+struct VisionWeights;
+struct AuxiliaryVision {
+    int device;
+    const VisionWeights* weights;
+    std::shared_ptr<const void> owner;
+};
+
 
 enum class TextPhase {
     Prefill,
@@ -137,8 +144,9 @@ class Program {
 public:
     ~Program() noexcept;
 
-    // Host-only request staging. Called outside the executor/device lock after ingress
-    // capacity is reserved. Reads immutable model weights; never touches GPU/sequence state.
+    // Request staging runs outside the executor/text-device lock after ingress capacity
+    // is reserved. It may use immutable Vision weights and a separate auxiliary device,
+    // but must not touch text sequence state.
     [[nodiscard]] double prepare_media(PreparedPrompt& prompt,
                                        const PreparationControl& control) const;
 
@@ -211,7 +219,7 @@ private:
     friend std::unique_ptr<Program<V>> create_program(const typename V::ModelView&,
                                                       std::span<const typename V::ModelView* const>,
                                                       typename V::WeightsProfile, SequencePlan<V>&&,
-                                                      ExecutionContext&);
+                                                      ExecutionContext&, const AuxiliaryVision*);
 };
 
 template <class Variant>
@@ -227,6 +235,6 @@ template <class Variant>
 create_program(const typename Variant::ModelView& model,
                std::span<const typename Variant::ModelView* const> peer_models,
                typename Variant::WeightsProfile weights_profile, SequencePlan<Variant>&& plan,
-               ExecutionContext& execution);
+               ExecutionContext& execution, const AuxiliaryVision* auxiliary = nullptr);
 
 } // namespace ninfer::targets::qwen3_6

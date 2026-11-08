@@ -33,6 +33,18 @@ void destroy_event(cudaEvent_t& event) noexcept {
     }
 }
 
+class RestoreDevice {
+public:
+    RestoreDevice() noexcept : valid_(cudaGetDevice(&previous_) == cudaSuccess) {}
+    ~RestoreDevice() {
+        if (valid_) { log_cuda_error("cudaSetDevice(restore)", cudaSetDevice(previous_)); }
+    }
+
+private:
+    int previous_ = 0;
+    bool valid_ = false;
+};
+
 } // namespace
 
 void cuda_check(cudaError_t err, const char* expr, const char* file, int line) {
@@ -139,6 +151,7 @@ DeviceContext::DeviceContext(int device_id) : device(device_id) {
 }
 
 DeviceContext::~DeviceContext() {
+    const RestoreDevice restore;
     if (stream != nullptr || load_stream != nullptr) {
         log_cuda_error("cudaSetDevice", cudaSetDevice(device));
     }
@@ -155,6 +168,7 @@ DeviceContext::DeviceContext(DeviceContext&& other) noexcept
 
 DeviceContext& DeviceContext::operator=(DeviceContext&& other) noexcept {
     if (this == &other) { return *this; }
+    const RestoreDevice restore;
 
     if (stream != nullptr || load_stream != nullptr) {
         log_cuda_error("cudaSetDevice", cudaSetDevice(device));

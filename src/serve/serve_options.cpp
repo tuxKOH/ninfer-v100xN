@@ -45,6 +45,18 @@ std::uint64_t parse_u64(const char* text, const char* label) {
     return static_cast<std::uint64_t>(value);
 }
 
+int parse_vision_gpu(const char* text) {
+    const std::string_view input(text);
+    if (input.empty() || input.find_first_not_of("0123456789") != std::string_view::npos) {
+        throw std::invalid_argument(std::string("invalid vision-gpu: ") + text);
+    }
+    const std::uint64_t value = parse_u64(text, "vision-gpu");
+    if (value > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
+        throw std::invalid_argument(std::string("invalid vision-gpu: ") + text);
+    }
+    return static_cast<int>(value);
+}
+
 RopeMode parse_rope_mode(const char* text) {
     const std::string value(text);
     if (value == "native") { return RopeMode::Native; }
@@ -124,7 +136,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N] "
            "[--ram-kv-window N] [--ram-kv-budget-bytes N] "
            "[--default-max-tokens N] [--max-output-tokens N] "
-           "[--vision] [--vision-device gpu|cpu] [--vision-max-tokens N] [--no-cuda-graph] [--no-prefix-reuse] "
+           "[--vision] [--vision-device gpu|cpu] [--vision-gpu N] [--vision-max-tokens N] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -148,6 +160,7 @@ std::string serve_usage_text(const char* argv0) {
            "default\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
            "       --vision enables media; --vision-device gpu (default) or cpu selects the encoder\n"
+           "       --vision-gpu N selects a separate logical CUDA ordinal; requires GPU Vision and backend support\n"
            "       --vision-max-tokens N bounds merged visual tokens per prompt (1..32768, default 32768)\n"
            "       independently of text context; smaller budgets reduce reserved Vision memory\n"
            "       --kv-capacity auto leaves " +
@@ -359,6 +372,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (selected == "gpu") { options.vision_device = VisionDevice::Gpu; }
             else if (selected == "cpu") { options.vision_device = VisionDevice::Cpu; }
             else { throw std::invalid_argument("--vision-device must be gpu or cpu"); }
+        } else if (arg == "--vision-gpu") {
+            options.vision_gpu = parse_vision_gpu(require_value("--vision-gpu"));
         } else if (arg == "--vision-max-tokens") {
             options.vision_max_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--vision-max-tokens"), "vision-max-tokens"));
@@ -444,6 +459,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     product::validate_speculative_cli_options(options.speculative);
     if (!options.enable_vision && options.vision_device == VisionDevice::Cpu) {
         throw std::invalid_argument("--vision-device cpu requires --vision");
+    }
+    if (options.vision_gpu && (!options.enable_vision || options.vision_device != VisionDevice::Gpu)) {
+        throw std::invalid_argument("--vision-gpu requires --vision and --vision-device gpu");
     }
     if (options.vision_max_tokens == 0 || options.vision_max_tokens > kMaximumVisionTokenBudget) {
         throw std::invalid_argument("--vision-max-tokens must be in [1,32768]");

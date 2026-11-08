@@ -251,6 +251,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.volta_fast_decode     = options_.volta_fast_decode;
     engine_options.enable_vision            = options_.enable_vision;
     engine_options.vision_device = options_.vision_device;
+    engine_options.vision_gpu = options_.vision_gpu;
     engine_options.vision_max_tokens        = options_.vision_max_tokens;
     engine_options.use_cuda_graph           = options_.use_cuda_graph;
     engine_options.speculative              = options_.speculative;

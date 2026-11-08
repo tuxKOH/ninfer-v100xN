@@ -104,6 +104,8 @@ void check_documented() {
           "--ignore-eos is missing from the CLI usage text");
     check(usage.find("--vision-max-tokens") != std::string::npos,
           "--vision-max-tokens is missing from the CLI usage text");
+    check(usage.find("--vision-gpu") != std::string::npos,
+          "--vision-gpu is missing from the CLI usage text");
 }
 
 void check_vision_budget() {
@@ -123,6 +125,22 @@ void check_vision_budget() {
 } // namespace
 
 int main() {
+    check(!parse_cli(base()).vision_gpu, "CLI Vision GPU must be absent by default");
+    check(parse_cli(with({"--vision", "--vision-gpu", "0"})).vision_gpu == 0,
+          "CLI Vision GPU zero did not parse");
+    check(parse_cli(with({"--vision-gpu", "2", "--vision"})).vision_gpu == 2,
+          "CLI Vision GPU did not parse");
+    for (const auto& flags : {std::vector<std::string>{"--vision-gpu", "2"},
+                              std::vector<std::string>{"--vision", "--vision-device", "cpu", "--vision-gpu", "2"},
+                              std::vector<std::string>{"--vision", "--vision-gpu", "-1"},
+                              std::vector<std::string>{"--vision", "--vision-gpu", "1x"},
+                              std::vector<std::string>{"--vision", "--vision-gpu", "2147483648"},
+                              std::vector<std::string>{"--vision", "--vision-gpu"}}) {
+        bool rejected = false;
+        try { (void)parse_cli(with(flags)); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        check(rejected, "CLI accepted an invalid Vision GPU selection");
+    }
     check(parse_cli(with({"--vision", "--vision-device", "cpu"})).vision_device == ninfer::VisionDevice::Cpu,
           "CPU Vision device did not parse");
     for (const auto& flags : {std::vector<std::string>{"--vision-device", "cpu"},

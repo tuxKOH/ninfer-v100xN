@@ -139,6 +139,41 @@ int main() {
                         plan.device_capacity_bytes[1] == kTensor.size(),
                     "pipeline tensor placement changed its bytes or resident owner");
         }
+        {
+            using namespace ninfer::artifact;
+            Binder binder(reader, 2, false, 2);
+            const auto vision = bind_tensor(binder, "weights/test", NumericFormat::BF16, {2},
+                                            TensorPlacement::AuxiliaryDevice);
+            const auto text = bind_tensor(binder, "weights/second", NumericFormat::BF16, {4},
+                                          TensorPlacement::Device);
+            binder.validate_unconsumed_matching();
+            const auto plan = binder.finish();
+            std::array<int, 3> vision_count{};
+            std::array<int, 3> text_count{};
+            for (const auto& placement : plan.device_objects) {
+                if (placement.object.index == vision.index) { ++vision_count.at(placement.device); }
+                if (placement.object.index == text.index) { ++text_count.at(placement.device); }
+            }
+            require(vision_count == std::array{0, 0, 1} && text_count == std::array{1, 1, 0},
+                    "auxiliary placement mixed vision and replicated text slots");
+        }
+        {
+            using namespace ninfer::artifact;
+            Binder binder(reader, 2);
+            bool rejected = false;
+            try {
+                (void)bind_tensor(binder, "weights/test", NumericFormat::BF16, {2},
+                                  TensorPlacement::AuxiliaryDevice);
+            } catch (const ArtifactError&) { rejected = true; }
+            require(rejected, "auxiliary placement without an auxiliary slot was accepted");
+        }
+        for (const int slot : {0, 1, 3}) {
+            bool rejected = false;
+            try {
+                ninfer::artifact::Binder binder(reader, 2, false, slot);
+            } catch (const ninfer::artifact::ArtifactError&) { rejected = true; }
+            require(rejected, "overlapping or non-adjacent auxiliary slot was accepted");
+        }
         // A sharded placement that names no range for a device is a shard-map bug, not a request
         // to replicate: the binder must refuse it rather than quietly reserving a full copy.
         {

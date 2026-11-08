@@ -930,7 +930,8 @@ ShardPlan plan_for(std::string_view object, int tp, const TextConfig& config,
 }
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
-                               qwen3_6::StartupFeatures features, int tp, int pp) {
+                               qwen3_6::StartupFeatures features, int tp, int pp,
+                               std::optional<int> auxiliary_vision_device) {
     if (tp != 1 && tp != 2 && tp != 4) {
         throw std::invalid_argument("qwen3_6_27b: tp must be 1, 2 or 4");
     }
@@ -971,11 +972,13 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     // The binder's arena count and the shard map's device count are two halves of one decision.
     // If they disagree, nothing downstream notices: a tp2 map on a one-device binder would place
     // only device 0's half-shard and size the arena for half a model, and the load would "succeed".
-    if (binder.device_count() != tp * pp) {
-        throw std::invalid_argument("qwen3_6_27b: binder was built for " +
-                                    std::to_string(binder.device_count()) +
-                                    " device(s) but bind_artifact was asked for tp " +
-                                    std::to_string(tp));
+    if (binder.execution_storage_device_count() != tp * pp) {
+        throw std::invalid_argument("qwen3_6_27b: binder execution/storage count does not match tp * pp");
+    }
+    if (auxiliary_vision_device.has_value() != binder.auxiliary_device().has_value() ||
+        (auxiliary_vision_device && (!features.vision || features.vision_device != VisionDevice::Gpu ||
+                                     *auxiliary_vision_device < 0))) {
+        throw std::invalid_argument("qwen3_6_27b: auxiliary Vision selection does not match binder topology");
     }
     if (tp > 1) {
         const TextConfig config{};
@@ -1004,6 +1007,8 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     out.pp          = pp;
     out.frontend     = qwen3_6::bind_frontend_resources(binder);
     out.features     = features;
+    out.auxiliary_vision_slot = binder.auxiliary_device();
+    out.auxiliary_vision_device = auxiliary_vision_device;
     const bool ggml_k = weights_profile == WeightsProfile::Qwen38GgmlK;
     if (ggml_k && features.vision) {
         throw std::invalid_argument("qwen3.8-27b/gguf-q4-k-m supports Text and MTP; its preserved GGUF Vision weights are not execution-qualified");
@@ -1140,6 +1145,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
 
     const artifact::TensorPlacement vision_placement =
         features.vision ? (features.vision_device == VisionDevice::Cpu ? artifact::TensorPlacement::Host
+                                 : auxiliary_vision_device ? artifact::TensorPlacement::AuxiliaryDevice
                                  : tp == 2 ? artifact::TensorPlacement::PrimaryDevice
                                    : artifact::TensorPlacement::Device)
                         : artifact::TensorPlacement::ValidateOnly;
@@ -1171,6 +1177,28 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     }
     if (tp * pp > backing.device_count()) {
         throw std::invalid_argument("qwen3_6_27b: tp exceeds the materialized device count");
+    }
+    if (plan.auxiliary_vision_slot) {
+        const int slot = *plan.auxiliary_vision_slot;
+        if (slot != tp * pp || backing.device_count() != slot + 1 ||
+            !plan.auxiliary_vision_device ||
+            backing.physical_device(slot) != *plan.auxiliary_vision_device) {
+            throw std::invalid_argument("qwen3_6_27b: auxiliary Vision materialization does not match its plan");
+        }
+        for (int rank = 0; rank < tp * pp; ++rank) {
+            if (backing.physical_device(rank) == backing.physical_device(slot)) {
+                throw std::invalid_argument("qwen3_6_27b: auxiliary Vision device overlaps execution");
+            }
+        }
+        auto& vision = auxiliary_vision.emplace();
+        vision.slot = slot;
+        vision.physical_device = backing.physical_device(slot);
+        vision.weights.common = qwen3_6::materialize_vision_common(
+            backing, plan.vision_backbone, plan.vision_merger_input, plan.vision_merger_norm, slot);
+        vision.weights.merger_fc2 = artifact::materialized_weight(
+            backing, plan.vision_merger_fc2, NumericFormat::W8G32_F16S, 5120, 4608, slot);
+        vision.weights.merger_fc2_bias = artifact::materialized_tensor(
+            backing, plan.vision_merger_fc2_bias, NumericFormat::BF16, {5120}, slot);
     }
     frontend = qwen3_6::take_frontend_resources(backing, plan.frontend);
 
@@ -1399,7 +1427,7 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
             backing, plan.dflash.selector_successor_codebook, NumericFormat::BF16, {248320, 256}, device);
     }
 
-    if (plan.features.vision) {
+    if (plan.features.vision && !plan.auxiliary_vision_slot) {
         if (device != 0) { return; }
         auto& vision  = runtime.vision.emplace();
         if (plan.features.vision_device == VisionDevice::Cpu) {

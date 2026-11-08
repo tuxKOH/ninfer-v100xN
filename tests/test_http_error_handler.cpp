@@ -41,6 +41,13 @@ int main() {
             ninfer::RequestErrorKind::Cancelled, "request cancelled during preparation"));
     failures += check(cancelled.status == 499 && cancelled.code == "client_disconnected",
                       "preparation cancellation did not retain its HTTP classification");
+    const ninfer::serve::ApiError vision_overload =
+        ninfer::serve::request_error_to_api_error(ninfer::RequestError(
+            ninfer::RequestErrorKind::Overloaded, "Vision staged host memory limit exceeded"));
+    failures += check(vision_overload.status == 429 && vision_overload.code == "server_overloaded" &&
+                          vision_overload.type == "rate_limit_error" && vision_overload.param.empty() &&
+                          vision_overload.message == "Vision staged host memory limit exceeded",
+                      "vision host memory overload did not retain its HTTP classification and message");
 
     httplib::Request messages_request;
     messages_request.path = "/v1/messages";

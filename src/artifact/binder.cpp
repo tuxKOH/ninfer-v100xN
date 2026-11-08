@@ -20,14 +20,19 @@ std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) {
 
 } // namespace
 
-Binder::Binder(const Reader& reader, int device_count, bool storage_only)
+Binder::Binder(const Reader& reader, int device_count, bool storage_only,
+               std::optional<int> auxiliary_device)
     : reader_(reader), consumed_(reader.objects().size(), false),
       planned_(reader.objects().size(), false), storage_only_(storage_only) {
-    if (device_count < 1 || device_count > static_cast<int>(kMaximumDevices)) {
-        throw ArtifactError("materialization device count must be 1 or 2");
+    if (device_count < 1 || device_count > static_cast<int>(kMaximumDevices) ||
+        (auxiliary_device && (*auxiliary_device != device_count ||
+                              device_count == static_cast<int>(kMaximumDevices)))) {
+        throw ArtifactError("materialization requires 1 to 4 slots with auxiliary appended");
     }
     materialization_.object_count = reader.objects().size();
-    materialization_.device_count = device_count;
+    materialization_.execution_storage_device_count = device_count;
+    materialization_.auxiliary_device = auxiliary_device;
+    materialization_.device_count = device_count + (auxiliary_device ? 1 : 0);
 }
 
 bool Binder::has_tensor(std::string_view name) const noexcept { return reader_.find(name) != nullptr; }
@@ -124,10 +129,10 @@ void Binder::materialize_on_device(ObjectHandle handle) {
     const std::uint64_t alignment = tensor_alignment(tensor->layout);
     if (device_mask_resolver_) {
         const std::uint32_t mask = device_mask_resolver_(tensor->name);
-        if (mask == 0 || (mask >> materialization_.device_count) != 0) {
+        if (mask == 0 || (mask >> materialization_.execution_storage_device_count) != 0) {
             throw ArtifactError("invalid device placement mask: " + std::string(tensor->name));
         }
-        for (int device = 0; device < materialization_.device_count; ++device) {
+        for (int device = 0; device < materialization_.execution_storage_device_count; ++device) {
             if ((mask & (1U << device)) != 0) { place_on_device(handle, device); }
         }
         planned_[handle.index] = true;
@@ -142,7 +147,7 @@ void Binder::materialize_on_device(ObjectHandle handle) {
         return;
     }
 
-    for (int device = 0; device < materialization_.device_count; ++device) {
+    for (int device = 0; device < materialization_.execution_storage_device_count; ++device) {
         const std::vector<SliceRange>& ranges =
             placement.device_ranges[static_cast<std::size_t>(device)];
         if (placement.axis == ShardAxis::Replicated) {
@@ -228,7 +233,7 @@ void Binder::materialize_on_device(ObjectHandle handle, int device) {
 
 void Binder::materialize_virtual_rows(ObjectHandle handle,
                                        std::array<SliceRange, kVirtualStorageDevices> ranges) {
-    if (materialization_.device_count != static_cast<int>(kVirtualStorageDevices)) {
+    if (materialization_.execution_storage_device_count != static_cast<int>(kVirtualStorageDevices)) {
         throw ArtifactError("virtual row placement requires exactly two materialization devices");
     }
     if (planned_[handle.index]) {

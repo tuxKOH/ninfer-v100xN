@@ -4,12 +4,14 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -176,6 +178,66 @@ void verify(const char* path) {
                 !plan.bindings.features.volta_fast_decode,
                 "Vision weights must reside only on the selected encoder device");
     }
+    }
+    {
+        Binder primary_binder(reader, 2);
+        const auto primary = bind_artifact(primary_binder, WeightsProfile::Qwen38QuasarNvfp4,
+                                           {.vision = true}, 2);
+        Binder auxiliary_binder(reader, 2, false, 2);
+        const auto auxiliary = bind_artifact(auxiliary_binder, WeightsProfile::Qwen38QuasarNvfp4,
+                                             {.vision = true}, 2, 1, 7);
+        require(!primary.bindings.auxiliary_vision_slot &&
+                    auxiliary.bindings.auxiliary_vision_slot == 2 &&
+                    auxiliary.bindings.auxiliary_vision_device == 7,
+                "Vision slot or physical device was not recorded");
+        std::size_t vision_count = 0;
+        std::size_t text_count = 0;
+        std::size_t sharded_count = 0;
+        for (const auto& placement : auxiliary.materialization.device_objects) {
+            const auto name = object_name(auxiliary_binder.descriptor(placement.object));
+            if (name.starts_with("vision/")) {
+                require(placement.device == 2, "auxiliary Vision escaped its slot");
+                ++vision_count;
+                continue;
+            }
+            require(placement.device < 2, "text object was placed on the auxiliary slot");
+            const auto& original = primary.materialization.device_objects;
+            const auto match = std::find_if(original.begin(), original.end(), [&](const auto& item) {
+                return item.object.index == placement.object.index && item.device == placement.device;
+            });
+            require(match != original.end() && match->bytes == placement.bytes &&
+                        match->copies.size() == placement.copies.size(),
+                    "auxiliary Vision changed a text replica or shard");
+            for (std::size_t i = 0; i < placement.copies.size(); ++i) {
+                const auto& a = placement.copies[i];
+                const auto& b = match->copies[i];
+                require(a.source_offset == b.source_offset && a.dest_offset == b.dest_offset &&
+                            a.bytes == b.bytes, "auxiliary Vision changed a text shard range");
+            }
+            ++text_count;
+            sharded_count += !placement.copies.empty();
+        }
+        std::size_t primary_text_count = 0;
+        for (const auto& placement : primary.materialization.device_objects) {
+            const auto name = object_name(primary_binder.descriptor(placement.object));
+            if (name.starts_with("vision/")) {
+                require(placement.device == 0, "ordinary Vision left the primary slot");
+            } else {
+                ++primary_text_count;
+            }
+        }
+        require(vision_count > 0 && text_count == primary_text_count && sharded_count > 0,
+                "Vision or text shard placement is incomplete");
+    }
+    for (const bool missing_slot : {false, true}) {
+        Binder binder(reader, 2, false, missing_slot ? std::nullopt : std::optional<int>{2});
+        bool rejected = false;
+        try {
+            (void)bind_artifact(binder, WeightsProfile::Qwen38QuasarNvfp4,
+                                {.vision = true}, 2, 1,
+                                missing_slot ? std::optional<int>{7} : std::nullopt);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        require(rejected, "mismatched auxiliary Vision selection and slot was accepted");
     }
     {
         Binder binder(reader, 2);

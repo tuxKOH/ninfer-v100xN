@@ -134,7 +134,8 @@ void copy_host(const void* src, Tensor& dst, cudaStream_t stream) {
 
 } // namespace
 
-VisionContext::VisionContext(DeviceContext& ctx, const LoadedModelData& weights) : ctx_(ctx) {
+VisionContext::VisionContext(DeviceContext& ctx, const LoadedModelData& weights, bool auxiliary) : ctx_(ctx) {
+    if (auxiliary) { return; }
     if (!weights.vision) {
         throw std::invalid_argument("Vision execution was requested without materialized weights");
     }
@@ -322,9 +323,9 @@ VisionPrefillSession::VisionPrefillSession(DeviceContext& device, const LoadedMo
                                            WorkspaceArena& workspace,
                                            qwen3_6::PreparedPromptData& prompt,
                                            const VisionPrefillPlan& plan,
-                                           runtime::TransientRegion transient)
+                                           runtime::TransientRegion transient, bool auxiliary)
     : device_(device), workspace_(workspace), prompt_(prompt), plan_(plan), transient_(transient),
-      context_(device, model) {
+      auxiliary_(auxiliary), context_(device, model, auxiliary) {
     if (plan_.control == nullptr || plan_.control->items.empty() || plan_.uses.empty()) {
         throw std::invalid_argument("Vision prefill plan has no suffix item spans");
     }
@@ -396,14 +397,14 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
         if (!payload || payload->patch_elements != patch_elements) {
             throw std::invalid_argument("Vision item patch payload has an invalid shape");
         }
-        if (context_.is_cpu()) {
+        if (auxiliary_ || context_.is_cpu() || !prompt_.host_vision_embeddings.empty()) {
             const auto start = std::chrono::steady_clock::now();
             if (active->item_index >= prompt_.host_vision_embeddings.size()) {
-                throw std::logic_error("CPU Vision request was not staged before GPU admission");
+                throw std::logic_error("Vision request was not staged before GPU admission");
             }
             const auto& encoded = prompt_.host_vision_embeddings[active->item_index];
-            if (!encoded || encoded->size() * sizeof(std::uint16_t) != output.bytes()) {
-                throw std::logic_error("CPU Vision embedding extent mismatch");
+            if (!encoded || encoded->size() != output_bytes / sizeof(std::uint16_t)) {
+                throw std::logic_error("Vision embedding extent mismatch");
             }
             CUDA_CHECK(cudaMemcpyAsync(output.data, encoded->data(), output.bytes(),
                                        cudaMemcpyHostToDevice, device_.stream));
