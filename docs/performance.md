@@ -8,7 +8,9 @@ Local hardware: 2 × Tesla V100-SXM2 16 GB, SXM2-to-PCIe adapters, PCIe 3.0 ×16
 
 Release **v0.2.1** extends the packed-batch and packet/norm work to QUASAR TP4.
 The complete-code campaign compares four-card NVLink, two cards from that same NVLink host,
-the local two-card PCIe P2P route without NVLink, and the same remote host's **1Cat 1.5.1**.
+the local two-card PCIe P2P route without NVLink, and the same remote host's **1Cat 1.5.2**.
+The eight 1Cat cases were measured on **2026-11-08**; the NInfer results are retained from
+2026-11-05 with the same complete prompt IDs and output budgets.
 The remote host uses V100-SXM2 16 GB cards with complete pairwise NV2, driver 570.211.01,
 CUDA 12.8 / SM70 and its existing 300 W limits. No clocks or limits are changed.
 Different hosts/drivers prevent treating the two TP2 routes as a controlled NVLink-only A/B.
@@ -27,14 +29,18 @@ CUDA Graphs, both experimental numerical profiles, 1024-token prefill chunks and
 round between prefill chunks. Its main matrix has **180000 shared KV tokens**. Only two
 85000-input / 512-output requests fit at a time; C4/C8 are offered concurrency, not a promise
 that all requests decode together. Mean actual decode batch and whole-wave latency are
-reported. The 1Cat control uses its existing **AWQ INT4** checkpoint, FP16 activations,
+reported. The 1Cat control uses the existing **QUASAR NVFP4 Hugging Face** checkpoint, FP16 activations,
 E4M3 KV, MTP4, chunk 1024, max-model-len 180000, max-num-seqs 8 and GPU memory utilization
-0.88. It reports **785196 physical KV tokens** at startup; max-model-len is not a
-shared-pool limit. This differs from both NInfer's 180000-token main matrix and its
+0.88. Explicit KV allocation is **2.5 GiB/rank for 2K**, **7 GiB/rank for 85K**;
+startup reports **262135 / 735728 physical KV tokens**, respectively. Max-model-len is not a
+shared-pool limit. These differ from both NInfer's 180000-token main matrix and its
 688000-token capacity control, so the long-input scheduling comparisons also differ in capacity.
-The 1Cat control uses isolated TileLang 0.1.10 / apache-tvm-ffi 0.1.10 dependencies; the
-original Conda environment is unchanged. The source review used 1Cat's 2026-11-04 main,
-whereas measurements run release 1.5.1. These versions are not interchangeable provenance.
+The downloaded **1.5.2+cu128** wheel uses an isolated environment with torch 2.10.0+cu128,
+TileLang 0.1.10 / apache-tvm-ffi 0.1.10 and transformers 5.22.1; the original environment is
+unchanged. All main-matrix cases use default long-prefill scheduling. The source review used
+1Cat's 2026-11-04 main; it is separate provenance from this release-wheel measurement.
+The superseded 1.5.1 concurrency matrix used AWQ INT4, so changes from it are not a
+version-only speed comparison.
 
 **Timing surfaces:** NInfer's headline rate is committed tokens after each request's first
 output divided by summed executor decode-round wall time, including commit/publication and
@@ -52,6 +58,10 @@ intervening prefill stalls, unlike executor-round throughput; its timestamps are
 whereas 1Cat's are client-side. Whole-wave and common-window results remain separate.
 Multiplying by offered C does not make this an observed aggregate throughput when the
 requests do not overlap; queued long-input cases must be read with their actual batch.
+The supplemental **active decode union** rate divides all post-first-token outputs by the
+union of individual first-to-last-token lifetimes. It excludes gaps with no decoding request
+but retains stalls inside a lifetime, including intervening prefill. It does not establish
+that all submitted requests decode simultaneously and is not the common-window metric.
 
 ![Complete-code concurrency: decode, common window and whole-wave throughput](assets/tp4-concurrency/quasar-concurrency.svg)
 
@@ -99,27 +109,44 @@ change; this is end-to-end decode improvement for the declared numerical profile
 an equal-output kernel speedup. The release-build repeat measures **1084.163 tok/s**,
 retaining every request's 512 output IDs and speculative counters from the 1083.389 run.
 
-**1Cat 1.5.1 HTTP control:** the following counts returned token IDs in the common
+**1Cat 1.5.2 HTTP control:** the following counts returned token IDs in the common
 decode lifetime, with all prefill/decode stalls inside that window retained. It is not
 executor-only decode time. A dash means no common decode window across every request.
 
-| Input tokens | C1 HTTP common tok/s | C2 | C4 | C8 |
-|---:|---:|---:|---:|---:|
-| 2048 | 153.850 | 223.620 | 396.104 | 588.349 |
-| 85000 | 126.005 | 103.516 | — | — |
+| Input tokens | Requests | HTTP common tok/s | Whole-wave output tok/s | Whole wave, s | MTP accepted/proposed | Acceptance |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2048 | 1 | 129.822 | 113.661 | 4.505 | 386/504 | 76.59% |
+| 2048 | 2 | 193.328 | 142.345 | 7.194 | 772/1008 | 76.59% |
+| 2048 | 4 | 316.715 | 195.690 | 10.466 | 1535/2076 | 73.94% |
+| 2048 | 8 | 549.956 | 169.021 | 24.234 | 3081/4056 | 75.96% |
+| 85000 | 1 | 106.806 | 14.432 | 35.476 | 387/500 | 77.40% |
+| 85000 | 2 | — | 13.333 | 76.803 | 765/1040 | 73.56% |
+| 85000 | 4 | — | 12.580 | 162.795 | 1538/2064 | 74.52% |
+| 85000 | 8 | — | 10.504 | 389.940 | 3072/4140 | 74.20% |
 
-| Input tokens | C1 whole-wave output tok/s | C2 | C4 | C8 |
-|---:|---:|---:|---:|---:|
-| 2048 | 127.477 | 138.924 | 263.377 | 338.824 |
-| 85000 | 13.016 | 11.453 | 10.909 | 10.634 |
+The main matrix uses one completed wave per case. The 2K/C8 repeat measures
+**552.957 tok/s**, versus the first wave's **549.956**; mean **551.457 ± 2.122**
+(sample standard deviation), pooled draft acceptance **6161/8124 = 75.84%**.
+The two whole waves take **24.234 / 24.025 s**, averaging **169.754 output tok/s**.
+NInfer TP4's retained 2K/C8 common sampled window is **1160.949 tok/s**, with whole-wave
+**444.619 tok/s**. These common-window measurements are short samples with different
+sampling/timing surfaces, not sustained-load or equal-quality results.
 
-1Cat C8 completes in **12.089 / 385.172 s** for 2K/85K, with draft acceptance
-3076/4072 (**75.5%**) and 3090/4012 (**77.0%**), respectively. NInfer TP4's 2K/C8
-common sampled window is **1160.949 tok/s**, and its whole-wave rate is **444.619 tok/s**.
-At 85K/C8 neither engine has an all-request common window in this cold-wave workload.
+At 85K/C8 the default 1Cat wave takes **389.940 s** with no all-request common decode
+window. A separate supported `--long-prefill-token-threshold 128` control, keeping the
+1024-token total budget and 7 GiB KV/rank, takes **322.039 s / 12.719 whole-wave output tok/s**.
+Its aggregate rate over the **union of active decode lifetimes** is **92.170 tok/s**:
+4088 post-first outputs / 44.3528 seconds, including prefill stalls within those lifetimes.
+It is not eight simultaneously decoding. Increasing KV to 7.5 GiB/rank gives
+788155 reported physical tokens, **327.242 s / 12.517 whole-wave output tok/s**, and
+**86.806 active-union tok/s**; one KV preemption is observed. All three configurations
+lack a common window across all eight requests. [Scheduling, capacity and telemetry](tp4.md#1cat-152-85kc8-scheduling-controls).
+
 The chart presents the named timing surfaces separately rather than treating a request-capacity
 estimate as observed total throughput. [Compact measurements](assets/tp4-concurrency/quasar-concurrency.json)
-retain all 32 cases, capacity control, software comparison and release-repeat equality flags.
+retain all 32 main cases, per-input 1Cat KV settings, the 2K/C8 repeat, long-prefill controls,
+NInfer capacity/software controls and release-repeat equality flags. Every completed response
+passes the requested prompt/output token-ID and usage counts, with zero cached prompt tokens.
 
 The implementation retains one original weight image. TP4 T9..64 projections reuse packed
 activation supply; direct BF16 row publication, 640 KiB device channels and cross-layer
@@ -157,17 +184,42 @@ plus the runtime/checkpoint/KV descriptions and a loopback API URL. Its SSE outp
 exactly 512 token IDs and matching usage counts. The compact report retains acceptance,
 actual batch, timing and workload metadata separately from the older raw-prefix diagnostics.
 
-With the 1Cat server configured as described above:
+Run the 1Cat **1.5.2+cu128** environment with the existing QUASAR HF checkpoint.
+For the 2K matrix, start this server in a separate terminal:
 
 ```bash
-python3 tools/v100/bench_vllm_concurrency.py \
-  --base-url http://127.0.0.1:6199 --model onecat-control \
-  --checkpoint Qwen3.8-27B-AWQ-INT4 --runtime-version '1Cat 1.5.1' \
-  --kv-format 'FP16 activations / E4M3 KV' --tp 4 --capacity 180000 \
-  --corpus-dir docs/assets/tp4-concurrency/prompts \
-  --input-tokens 2048 85000 --concurrency 1 2 4 8 --repetitions 1 \
-  --output profiles/bench/complete-code-onecat
+CUDA_VISIBLE_DEVICES=0,1,2,3 VLLM_WORKER_MULTIPROC_METHOD=spawn \
+OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false \
+python -m vllm.entrypoints.openai.api_server \
+  --model /path/to/Qwen3.8-27B-QUASAR-NVFP4 --served-model-name onecat-v152-mtp4 \
+  --tensor-parallel-size 4 --dtype half --attention-backend FLASH_ATTN_V100 \
+  --kv-cache-dtype fp8_e4m3 --block-size 2048 \
+  --max-model-len 180000 --max-num-seqs 8 --max-num-batched-tokens 1024 \
+  --gpu-memory-utilization 0.88 --kv-cache-memory-bytes 2684354560 \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":4,"draft_sample_method":"greedy"}' \
+  --no-enable-prefix-caching --language-model-only --generation-config vllm \
+  --host 127.0.0.1 --port 6199
 ```
+
+Then measure the saved complete prompts through the loopback API:
+
+```bash
+python tools/v100/bench_vllm_concurrency.py \
+  --base-url http://127.0.0.1:6199 --model onecat-v152-mtp4 \
+  --checkpoint 'Qwen3.8-27B-QUASAR-NVFP4 (existing HF checkpoint)' \
+  --runtime-version '1Cat 1.5.2+cu128' --kv-format 'FP16 activations / FP8 E4M3 KV' \
+  --tp 4 --capacity 180000 --corpus-dir docs/assets/tp4-concurrency/prompts \
+  --input-tokens 2048 --concurrency 1 2 4 8 --repetitions 1 \
+  --output profiles/bench/complete-code-onecat-152
+```
+
+For 85K, restart with `--kv-cache-memory-bytes 7516192768` and measure with
+`--input-tokens 85000`. The main matrix leaves long-prefill scheduling at its defaults;
+add `--long-prefill-token-threshold 128` only for the separately labeled scheduling control.
+The 7.5 GiB control uses `--kv-cache-memory-bytes 8053063680`. A repeat is a separate wave;
+it must not overwrite the original result. Do not substitute DFlash2 or Flash-Next for this
+QUASAR/MTP4 comparison. The report records startup physical KV tokens separately for each
+input length; equal per-request context ceilings do not imply equal shared KV capacities.
 
 ## TP2 concurrent packed-batch decode (2026-11-02)
 
@@ -411,7 +463,8 @@ committed-frontier checks. The earlier uninitialized-scratch residual trial rema
 its real-shape regression passes initcheck. No current-combination GPQA was run.
 **300 tok/s was not reached; this result is not a measured hardware limit.**
 
-The same host's existing **1cat-vllm 1.5.1**, using the same 85K token IDs, MTP4, output
+In this historical **220 W / 1200 MHz** campaign, the same host's **1cat-vllm 1.5.1**,
+using the same 85K token IDs, MTP4, output
 budget and single-request settings, measures **98.249 / 102.509**, mean **100.379 ± 3.012**
 committed wall tok/s. Its first token averages **35.9378 s**, versus NInfer's **36.4077 s**;
 its whole request averages **41.0408 s**. It uses FP16/E4M3 KV, versus BF16/INT8 group-64

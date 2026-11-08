@@ -17,7 +17,7 @@ ROUTES = {
     'tp4_nvlink': ('NInfer TP4 NVLink', '#2563eb', 4),
     'tp2_nvlink': ('NInfer TP2 NVLink', '#0f766e', 2),
     'tp2_pcie': ('NInfer TP2 PCIe (local)', '#b45309', 2),
-    'onecat_tp4': ('1Cat 1.5.1 TP4', '#9333ea', 4),
+    'onecat_tp4': ('1Cat 1.5.2 TP4', '#9333ea', 4),
 }
 
 
@@ -48,20 +48,67 @@ def ninfer_case(path, length, concurrency, tp, kv_capacity=180000):
     return compact
 
 
-def onecat_case(path, length, concurrency):
+def onecat_case(path, length, concurrency, repetition=1):
     source = json.loads(path.read_text())
     required = {'tp': 4, 'mtp_drafts': 4, 'input_tokens': length,
                 'output_tokens_per_request': 512, 'concurrency': concurrency,
-                'repetition': 1, 'prefix_reuse': False, 'temperature': 0,
-                'capacity': 180000, 'prompt_fixture': f'code-chat-{length}.ids'}
+                'repetition': repetition, 'prefix_reuse': False, 'temperature': 0,
+                'capacity': 180000, 'prompt_fixture': f'code-chat-{length}.ids',
+                'runtime_version': '1Cat 1.5.2+cu128',
+                'checkpoint': 'Qwen3.8-27B-QUASAR-NVFP4 (existing HF checkpoint)',
+                'kv_format': 'FP16 activations / FP8 E4M3 KV'}
     if any(source.get(key) != value for key, value in required.items()):
         raise ValueError(f'1Cat workload mismatch: {path}')
     if (len(source['requests']) != concurrency or any(
             len(row['token_ids']) != 512 or row['usage']['prompt_tokens'] != length
             or row['usage']['completion_tokens'] != 512
+            or (row['usage'].get('prompt_tokens_details') or {}).get('cached_tokens', 0) != 0
+            or row['first_chunk_tokens'] != 1
+            or sum(chunk['tokens'] for chunk in row['chunks']) != 512
             for row in source['requests'])):
         raise ValueError(f'incomplete 1Cat wave: {path}')
-    return {key: value for key, value in source.items() if key != 'requests'}
+    compact = {key: value for key, value in source.items() if key != 'requests'}
+    # The union excludes periods when no request is decoding, but retains any
+    # prefill/queueing stalls within a request's first-to-last token lifetime.
+    intervals = sorted((row['chunks'][0]['time'], row['chunks'][-1]['time'])
+                       for row in source['requests'])
+    start, end = intervals[0]
+    seconds = 0.
+    for next_start, next_end in intervals[1:]:
+        if next_start > end:
+            seconds += end - start
+            start, end = next_start, next_end
+        else:
+            end = max(end, next_end)
+    seconds += end - start
+    tokens = sum(len(row['token_ids']) - row['first_chunk_tokens']
+                 for row in source['requests'])
+    compact['active_decode_union_seconds'] = seconds
+    compact['active_decode_union_tokens'] = tokens
+    compact['active_decode_union_tok_s'] = tokens / seconds
+    return compact
+
+
+def onecat_settings(manifest):
+    if manifest['versions']['1cat-vllm'] != '1.5.2+cu128':
+        raise ValueError('1Cat server manifest is not release 1.5.2')
+    command = manifest['server_command']
+    expected = {'--tensor-parallel-size': '4', '--dtype': 'half',
+                '--kv-cache-dtype': 'fp8_e4m3', '--max-model-len': '180000',
+                '--max-num-seqs': '8', '--max-num-batched-tokens': '1024',
+                '--block-size': '2048', '--attention-backend': 'FLASH_ATTN_V100'}
+    for flag, value in expected.items():
+        if command[command.index(flag) + 1] != value:
+            raise ValueError(f'1Cat server setting mismatch: {flag}')
+    spec = json.loads(command[command.index('--speculative-config') + 1])
+    if spec != {'method': 'mtp', 'num_speculative_tokens': 4, 'draft_sample_method': 'greedy'}:
+        raise ValueError('1Cat server is not greedy MTP4')
+    if '--no-enable-prefix-caching' not in command or manifest['physical_kv_tokens'] < 1:
+        raise ValueError('invalid 1Cat cache configuration')
+    return {'versions': manifest['versions'], 'checkpoint': manifest['checkpoint'],
+            'server_command': command,
+            'kv_cache_memory_bytes_per_rank': int(command[command.index('--kv-cache-memory-bytes') + 1]),
+            'physical_kv_tokens': manifest['physical_kv_tokens']}
 
 
 def main():
@@ -69,20 +116,23 @@ def main():
     parser.add_argument('--tp4-nvlink', type=Path, required=True)
     parser.add_argument('--tp2-nvlink', type=Path, required=True)
     parser.add_argument('--tp2-pcie', type=Path, required=True)
-    parser.add_argument('--onecat', type=Path, required=True)
+    parser.add_argument('--onecat', type=Path, required=True,
+                        help='1.5.2 campaign directory with manifest.json and results/')
     parser.add_argument('--tp4-expanded', type=Path,
                         help='Separate 85K/C8 capacity control with 688000 shared KV tokens')
     parser.add_argument('--tp4-repeat', type=Path,
                         help='Release-build repeat of the complete 2K/C8 prompt')
     parser.add_argument('--tp4-before', type=Path,
                         help='Pre-TP4-batch implementation, same saved complete 2K/C8 prompt')
-    parser.add_argument('--onecat-kv-tokens', type=int, required=True,
-                        help='Physical KV token pool reported by the measured 1Cat server')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--preview', type=Path, help='Optional local PNG for visual inspection')
     args = parser.parse_args()
-    if args.onecat_kv_tokens < 1:
-        raise ValueError('physical 1Cat KV pool must be positive')
+    onecat_manifest = json.loads((args.onecat / 'manifest.json').read_text())
+    onecat_by_input = {str(length): onecat_settings(onecat_manifest['by_input'][str(length)])
+                      for length in LENGTHS}
+    if any('--long-prefill-token-threshold' in row['server_command']
+           for row in onecat_by_input.values()):
+        raise ValueError('main matrix must use default long-prefill scheduling')
     cases = []
     for route, directory in [('tp4_nvlink', args.tp4_nvlink),
                              ('tp2_nvlink', args.tp2_nvlink), ('tp2_pcie', args.tp2_pcie)]:
@@ -93,16 +143,17 @@ def main():
                 cases.append({'route': route, **row})
     for length in LENGTHS:
         for concurrency in CONCURRENCIES:
-            row = onecat_case(args.onecat / f'{length}-c{concurrency}-rep1.json',
+            row = onecat_case(args.onecat / 'results' / f'{length}-c{concurrency}-rep1.json',
                               length, concurrency)
             cases.append({'route': 'onecat_tp4', **row})
     summary = {
-        'date': '2026-11-05',
+        'date': '2026-11-08',
+        'ninfer_measurement_date': '2026-11-05',
         'remote_hardware': '4 x V100-SXM2 16 GB, complete pairwise NV2, existing 300 W limits',
         'local_hardware': '2 x V100-SXM2 16 GB, PCIe P2P, no NVLink',
         'toolchain': 'CUDA 12.8, SM70; remote driver 570.211.01, local driver 580.178.04',
         'ninfer': 'QUASAR NVFP4 v3 / BF16 / INT8 group-64 KV; long/fast enabled',
-        'onecat': '1Cat 1.5.1 / existing AWQ INT4 checkpoint / FP16 / E4M3 KV; '
+        'onecat': '1Cat 1.5.2+cu128 / QUASAR NVFP4 HF checkpoint / FP16 / E4M3 KV; '
                   'isolated TileLang 0.1.10 / apache-tvm-ffi 0.1.10',
         'workload': 'Complete code-chat-2048.ids or code-chat-85000.ids, MTP4, greedy, '
                     '512 forced output tokens per request, cold independent request waves, '
@@ -113,11 +164,31 @@ def main():
                   'prefill and queueing. 1Cat request_capacity_tok_s is an HTTP per-request '
                   'estimate, not NInfer executor-round time. Non-overlapping streams have no '
                   'common all-live rate. 180K is NInfer shared KV capacity and 1Cat per-request '
-                  'max-model-len, not a claim of equal physical KV pools.',
+                  'max-model-len, not a claim of equal physical KV pools. '
+                  'active_decode_union_tok_s divides all post-first outputs by the union of '
+                  'individual first-to-last-token lifetimes, including stalls within those '
+                  'lifetimes; this is not a common all-request window or steady C8 rate.',
         'quality': 'Different artifacts, KV and arithmetic profiles; no equal-quality claim or new GPQA.',
-        'onecat_physical_kv_tokens': args.onecat_kv_tokens,
+        'onecat_settings_by_input': onecat_by_input,
         'cases': cases,
     }
+    repeated = onecat_case(args.onecat / 'results' / '2048-c8-rep2.json', 2048, 8, 2)
+    first = next(row for row in cases if row['route'] == 'onecat_tp4'
+                 and row['input_tokens'] == 2048 and row['concurrency'] == 8)
+    values = [first['all_live_client_tok_s'], repeated['all_live_client_tok_s']]
+    mean = sum(values) / 2
+    summary['onecat_2k_c8_repeat'] = {
+        'case': repeated, 'common_window_mean_tok_s': mean,
+        'common_window_sample_sd_tok_s': math.sqrt(sum((value - mean) ** 2 for value in values)),
+        'pooled_draft_acceptance_rate': (first['accepted_drafts'] + repeated['accepted_drafts'])
+                                      / (first['proposed_drafts'] + repeated['proposed_drafts'])}
+    summary['onecat_long_prefill_controls'] = []
+    for control in onecat_manifest['long_prefill_controls']:
+        settings = onecat_settings(control)
+        case = onecat_case(args.onecat / control['result'], 85000, 8)
+        summary['onecat_long_prefill_controls'].append({
+            'settings': settings, 'case': case,
+            'observed_preemptions': control.get('observed_preemptions')})
     if args.tp4_expanded:
         summary['expanded_capacity_control'] = ninfer_case(args.tp4_expanded, 85000, 8, 4, 688000)
     if args.tp4_repeat:

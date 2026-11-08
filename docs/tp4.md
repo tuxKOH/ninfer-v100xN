@@ -8,7 +8,8 @@ and draft windows; keep their results separate.
 
 QUASAR TP4 Text/MTP4 now has qualified C2/C4/C8 batched projections, packet/norm handoff,
 short-context batch attention and per-request GDN record/norm. The complete 2K/85K coding
-task matrix includes TP4, NVLink TP2, local PCIe P2P TP2 and the same-host 1Cat 1.5.1 control.
+task matrix includes TP4, NVLink TP2, local PCIe P2P TP2 and the same-host
+**1Cat 1.5.2 / QUASAR NVFP4 / MTP4** control, refreshed on 2026-11-08.
 See [results, acceptance, actual batch and numerical limits](performance.md#tp4-concurrent-packed-batch-decode-2026-11-05).
 The binary and Docker assets use this same implementation.
 
@@ -29,6 +30,74 @@ requests require queueing at this capacity. Increase `--kv-capacity` only within
 VRAM; `--kv-capacity auto` resolves capacity at startup. Cold long prefills also stagger
 decode readiness even when there is enough KV. Both numerical flags remain default-off;
 this command opts in and can change generated outputs. TP4 Vision/DFlash remain unsupported.
+
+### 1Cat 1.5.2: complete-code MTP4 comparison (2026-11-08)
+
+The official `1.5.2+cu128` wheel runs the existing QUASAR NVFP4 Hugging Face checkpoint on
+the same four-card 16 GB NVLink host, driver 570.211.01 and unchanged 300 W limits.
+All eight **2048/85000 input × C1/C2/C4/C8** cases use the published complete coding
+prompt IDs, greedy MTP4, exactly 512 output tokens per request and disabled prefix caching.
+This replaces the active 1.5.1/AWQ concurrency comparison; it is not a version-only A/B.
+The [full matrix and chart](performance.md#tp4-concurrent-packed-batch-decode-2026-11-05)
+separate executor-round, common HTTP window and whole-wave timings.
+
+Two 2K/C8 waves measure **549.956 / 552.957 HTTP common-window tok/s**, mean
+**551.457 ± 2.122** (sample standard deviation), with **75.84% pooled MTP acceptance**.
+Whole-wave times are **24.234 / 24.025 s**, or **169.021 / 170.488 output tok/s**.
+The common windows last 2.775 / 2.369 seconds. NInfer TP4's retained 2K/C8 sampled window
+measures 1160.949 tok/s and its whole wave 444.619 tok/s. The sampled executor and HTTP
+windows differ; FP16/E4M3 KV versus BF16/INT8-G64 and auxiliary weight representations
+also prevent an equal-quality claim. The main matrix uses the first wave and retains the
+second separately, without selecting the faster repetition.
+
+1Cat uses 1024 total prefill tokens, max-model-len 180000, max-num-seqs 8 and 2048-token
+KV blocks. Explicit KV allocation is 2.5 GiB/rank for 2K and 7 GiB/rank for 85K; startup
+reports **262135 / 735728 physical KV tokens**. These are not NInfer's 180000 shared KV.
+All responses pass fixed prompt/output token-ID and usage counts with zero cached tokens.
+
+### 1Cat 1.5.2: 85K/C8 scheduling controls
+
+Three separate configurations complete one cold eight-request wave each:
+
+| Prefill schedule | KV GiB/rank | Physical KV tokens | Whole wave, s | Whole-wave output tok/s | Active decode union tok/s | MTP acceptance |
+|---|---:|---:|---:|---:|---:|---:|
+| Default, main matrix | 7 | 735728 | 389.940 | 10.504 | 22.190 | 3072/4140 (74.20%) |
+| Per-request 128-token prefill cap | 7 | 735728 | **322.039** | **12.719** | **92.170** | 3070/4156 (73.87%) |
+| Per-request 128-token prefill cap | 7.5 | 788155 | 327.242 | 12.517 | 86.806 | 3061/4164 (73.51%) |
+
+The cap uses the supported V1 option `--long-prefill-token-threshold 128`; total prefill
+remains 1024. No completed wave has a common decode window across all eight requests.
+Default scheduling staggers first tokens from 31.3 to 385.0 seconds. In the 7 GiB capped
+run, seven requests start decoding at 248.2–261.3 s; the final request starts at 317.0 s,
+after those seven have finished. With 7.5 GiB, `vllm:num_preemptions_total` increases by
+one and the final request is delayed by recomputation. A startup physical-token count
+therefore does not establish usable eight-stream decode capacity for this hybrid model.
+
+**92.170 tok/s** counts 4088 post-first outputs over **44.3528 s**, the union of individual
+first-to-last-token lifetimes. This excludes intervals with no decoding request and retains
+prefill stalls within an active lifetime. It is measured aggregate throughput over those
+intervals, **not eight simultaneously decoding**, not the all-request common window and
+not full-request throughput. The complete wave still takes 322.039 s. The compact report
+keeps all three timing surfaces, capacities, settings and speculative counters.
+
+The default run's second wave was interrupted and provides no result. V1 rejects the old
+`--max-num-partial-prefills` / `--max-long-partial-prefills` options; neither is used in a
+completed wave. All 24 completed responses pass 85000-input / 512-output usage and token-ID
+counts, with zero cached tokens. Maximum sampled temperature is 59°C; power limits and
+clocks are unchanged. Raw reports and telemetry are retained under local/remote
+`profiles/bench/1cat-v152-20261108-*`; no new GPQA is run.
+
+### 1Cat 1.5.2: separate legacy 85K single-request fixture
+
+The 2026-11-06 in-process control uses the older `v100-code-85000-iommu-pt.ids`, 2560-token
+prefill chunks, 180000 context, 2.5 GiB KV/rank and 513 outputs, excluding the first from
+the 512-token decode interval. It is separate from the complete-code 512-output HTTP matrix.
+The 1.5.2 QUASAR TP4/MTP4 wheel measures **89.489 / 104.794 committed wall tok/s**,
+mean **97.142 ± 10.822**, TTFT **29.2417 / 29.2046 s**, and **389/496 accepted/proposed**
+per request (78.4%). Its two requests reproduce all output IDs. This host retains 300 W;
+NInfer's earlier same-fixture 322.178 result is a speed reference with different arithmetic,
+not a new paired software or equal-quality A/B. The saved report is
+`profiles/bench/1cat-v152-20261106/1cat-mtp4-85k.json`.
 
 ## v0.2.0 serving: 256K context and 128K output
 
@@ -150,8 +219,9 @@ two cold requests with no prefix reuse or extra warmup. Each request emits one p
 and **512 committed timed decode tokens**. Loading and graph priming are outside request
 timing. Decode below is committed wall throughput, `512 / (total_seconds - first_token_seconds)`.
 
-### Existing 1Cat installation: same-host MTP4 control
+### Historical 220 W / 1Cat 1.5.1 same-host MTP4 control
 
+This is the retained 2026-10-23–24 control, not the current 1.5.2 comparison above.
 The control uses the host's existing **1cat-vllm 1.5.1** environment at `~/1cat/.venv`
 and existing `~/1cat/models/Qwen3.8-27B-QUASAR-NVFP4` checkpoint. Nothing was downloaded,
 installed or upgraded. Its original launcher selects DFlash2; this control explicitly selects

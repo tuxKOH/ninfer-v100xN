@@ -9,9 +9,7 @@
 
 此前 220 W 主机的四卡 NVLink 在 **85K 输入、QUASAR/MTP4** 下实测 **283.118 / 283.367 committed wall tok/s**，
 均值 **283.242 ± 0.176**，保留 **220 W / 1200 MHz** 限制。借鉴 1Cat 的通信与 Split-D
-机制后，prefill 从约 1743 提高到 **2334.73 tok/s**。同机现有 1Cat 1.5.1 在相同
-85K/MTP4 任务下为 **98.25 / 102.51 tok/s**，
-首字更快；计算/KV 精度与输出不同，不能当作同质量比较。TP4 普通模式、前缀及实际 85K
+机制后，prefill 从约 1743 提高到 **2334.73 tok/s**。TP4 普通模式、前缀及实际 85K
 Graph/eager 状态检查已通过。Split-D 和实验数值路径可能改变输出，当前组合未跑 GPQA，
 另一台 **300 W** 主机现以同一 85K/MTP4 fixture 实测 **322.138 / 322.218 tok/s**，
 均值 **322.178**，prefill **2731.60 tok/s**；这是不同主机与功耗条件下的实测，不能视为纯代码提速。
@@ -48,11 +46,15 @@ QUASAR NVFP4 / MTP4 在 TP2、TP4 使用 packed 批量投影、直接 packet 发
 180K 共享 KV 只能同时容纳两个 85K 请求，提交八并发不代表八路一直同时 decode。
 85K 八并发的四卡 NVLink／双卡 NVLink／本机双卡 PCIe 分别为 **317.8／200.3／198.2 tok/s**，
 实际平均 decode batch 均约 **1.23**。
-同机 **1Cat 1.5.1** 对照使用现有 AWQ INT4 / FP16 / E4M3-KV 模型，按 HTTP 返回 token IDs 计数；
-与 NInfer 的 QUASAR NVFP4 / BF16 / INT8-G64 及 executor 计时面分列，不能作为同质量胜负。
+同机对照已更新为 **1Cat 1.5.2 / QUASAR NVFP4 / MTP4**，
+**2K/85K × 1/2/4/8 并发八项均已实测**。1Cat 使用 FP16 / E4M3-KV，按 HTTP 返回 token IDs 计数；
+与 NInfer 的 BF16 / INT8-G64 及 executor 计时面分列，不能作为同质量胜负。
 2K 八并发共同 decode 窗口中，NInfer TP4 的 executor 采样为 **1160.9 tok/s**，
-1Cat 的 SSE 窗口为 **588.3 tok/s**；包含 prefill 的整组吞吐分别为 **444.6／338.8 tok/s**。
-窗口计时与模型格式差异见详细方法。
+1Cat 两轮 SSE 窗口为 **549.96 / 552.96 tok/s**，均值 **551.46**；
+包含 prefill 的整组吞吐分别为 NInfer **444.6**、1Cat **169.02 / 170.49 tok/s**。
+85K 八并发两边都没有覆盖全部请求的共同 decode 窗口。1Cat 加入每请求 128-token prefill cap 后，
+按**活跃 decode 时间段并集**统计为 **92.17 tok/s**，不代表八路同时 decode；整组耗时 **322.04 s**。
+计时窗口、调度与 KV 容量差异见详细方法。
 [完整矩阵、接受率、源码前后对照与方法](docs/performance.md#tp4-concurrent-packed-batch-decode-2026-11-05)。
 
 ![完整代码任务并发测量](docs/assets/tp4-concurrency/quasar-concurrency.svg)

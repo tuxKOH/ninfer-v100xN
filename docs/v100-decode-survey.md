@@ -114,10 +114,12 @@ T>32 的旧 CUTLASS 路径与新 batch 归约不同，八并发实测已出现�
 | `attention/sm70_grouped_long/kernel/grouped-attention.cu` 的 batch/context routing | C4/C8 已有请求级并行，短上下文减少 KV split。新私有路径以 FP32 累加并合并 PV numerator，输出仍为 BF16；保留完整 packed INT8-G64 KV，不丢历史 keys。分区/association 会改变数值，不能按逐位无损发布 |
 | `sm70_turbomind/ops/gdn_verify_sm70.cu` 的整块 verify 与周边融合 | 扩展 NInfer 自有 replay-record + gated norm 到 TP4 B1..8，保持原 FP32 recurrence、BF16 readout/record；completion 按 request/head 隔离。新 zero-valid fixture 暴露并修正了零有效行仍改写首个 key record 的问题 |
 
-**同机运行的对照是 1Cat 1.5.1 发布版**，不将 main 源码版本与实测运行版本混为一谈。
+**同机对照于 2026-11-08 更新为 1Cat 1.5.2 发布版**，八项 2K/85K × C1/C2/C4/C8 均实际运行；
+不将 2026-11-04 main 的源码调研版本与运行版本混为一谈。
 两边均为四卡、MTP4、相同的完整 2048/85000-token 代码任务 IDs、每请求强制输出 512 tokens、greedy、关闭前缀复用。
 2K 单独保留完整任务与 assistant prefix，不再直接截短 85K；此前 raw-prefix 结果单独保留，不能跨任务计算软件提升。
-现有 1Cat checkpoint 为 AWQ INT4/FP16/E4M3-KV，NInfer 为 QUASAR NVFP4/BF16/INT8-G64；
+新版对照使用现有 QUASAR NVFP4 HF checkpoint、FP16/E4M3-KV，NInfer 为 QUASAR NVFP4/BF16/INT8-G64；
+此前 1.5.1 并发对照使用 AWQ INT4，不能将跨模型的差别归为纯版本提速。
 1Cat 使用 HTTP SSE token IDs 计数，NInfer 的 executor-round 与 all-live sampled 另列。
 它们可提供同机速度与扩展参考，不能称为同质量、同算术或相同计时面的胜负。
 条件、结果与图表见[TP4 并发测量](performance.md#tp4-concurrent-packed-batch-decode-2026-11-05)。
