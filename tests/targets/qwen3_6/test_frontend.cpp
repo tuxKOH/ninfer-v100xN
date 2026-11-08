@@ -1225,8 +1225,8 @@ int test_visual_budget_independent_of_text_context() {
     bool rejected = false;
     try {
         (void)prepare_image(blocked);
-    } catch (const fi::ProcessorError& error) {
-        rejected = error.kind() == fi::ProcessorErrorKind::BudgetExceeded;
+    } catch (const ninfer::RequestError& error) {
+        rejected = error.kind() == ninfer::RequestErrorKind::MediaBudgetExceeded;
     }
     failures += check(rejected, "visual token limit did not reject excess media");
     return failures;

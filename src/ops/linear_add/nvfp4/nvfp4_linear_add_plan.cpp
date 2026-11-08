@@ -110,13 +110,16 @@ std::size_t linear_then_add_workspace_bytes(std::int32_t output_rows, std::int32
                                             std::int32_t tokens) {
     WorkspaceLayoutBuilder layout;
     (void)allocate_projected(layout, output_rows, tokens);
-    const std::size_t linear_bytes = tokens >= 33 &&
-        !nvfp4_volta_batch_supported(output_rows, input_rows, tokens)
-        ? nvfp4_cutlass_sm70_workspace_bytes(output_rows, input_rows, tokens)
-        : std::max<std::size_t>(
-              linear_workspace_capacity_bytes(QType::NVFP4, output_rows, input_rows,
-                                              kNvfp4InternalPolicy, tokens, tokens),
-              256);
+    // The query has no weight layout. Canonical weights use CUTLASS from T=33,
+    // while QPN-prepacked weights can use the batch route through T=64.
+    std::size_t linear_bytes = std::max<std::size_t>(
+        linear_workspace_capacity_bytes(QType::NVFP4, output_rows, input_rows,
+                                        kNvfp4InternalPolicy, 1, std::min(tokens, 64)),
+        256);
+    if (tokens >= 33) {
+        linear_bytes = std::max(linear_bytes,
+                                nvfp4_cutlass_sm70_workspace_bytes(output_rows, input_rows, tokens));
+    }
     (void)layout.alloc_bytes(linear_bytes, 256);
     return layout.peak_bytes(1);
 }

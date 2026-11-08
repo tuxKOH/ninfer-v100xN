@@ -17,7 +17,8 @@ namespace ninfer::ops {
 
 /**
  * Returns the A16-only transient capacity required by LinearAdd for every T in the inclusive
- * [min_tokens,max_tokens] interval. The QType and dimensions are the fixed implementation profile.
+ * [min_tokens,max_tokens] interval, for every supported weight layout. The QType and dimensions
+ * are the fixed implementation profile. The result can exceed the storage used by a call.
  * Invalid profiles or intervals throw; a legal static-zero route returns zero.
  */
 [[nodiscard]] std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output_rows,

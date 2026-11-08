@@ -1,5 +1,7 @@
 #include "ops/linear/linear_test_common.h"
 
+#include <cuda_runtime.h>
+
 #include <array>
 #include <exception>
 #include <iostream>
@@ -51,6 +53,22 @@ int main() {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
+#if defined(NINFER_VOLTA_BUILD) || defined(NINFER_SM8X_COMPAT)
+    std::cout << "SKIP: NVFP4 A4 kernels are not included in this build\n";
+    return 77;
+#else
+    int device = 0;
+    cudaDeviceProp properties{};
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaGetDeviceProperties(&properties, device) != cudaSuccess) {
+        std::cerr << "NVFP4_A4 Linear: failed to query CUDA device\n";
+        return 1;
+    }
+    if (properties.major < 12) {
+        std::cout << "SKIP: NVFP4 A4 requires SM120 or newer\n";
+        return 77;
+    }
+#endif
     try {
         const int failures = run_nvfp4_a4();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " NVFP4_A4 Linear\n";

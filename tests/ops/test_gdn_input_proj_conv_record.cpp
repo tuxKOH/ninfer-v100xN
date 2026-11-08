@@ -29,6 +29,16 @@ int device_sm() {
     cuda_check(cudaGetDeviceProperties(&props, device), "record capability");
     return props.major * 10 + props.minor;
 }
+
+bool supports_low_precision_activation(int minimum_sm) {
+#if defined(NINFER_VOLTA_BUILD) || defined(NINFER_SM8X_COMPAT)
+    (void)minimum_sm;
+    return false;
+#else
+    return device_sm() >= minimum_sm;
+#endif
+}
+
 constexpr ReductionCriterion kFp8GdnInputProjConvRecordA16Tolerance{1.0 / 256.0, 1.0 / 256.0,
                                                                     2.0 / 256.0};
 constexpr ReductionCriterion kFp8GdnInputProjConvRecordA8Tolerance{0.04, 1.0 / 256.0, 0.06};
@@ -361,7 +371,7 @@ int run_nvfp4() {
     };
     failures += run(2, 1, {}, ops::LinearPolicy::A16Only, 1611U);
     failures += run(16, 1, {11}, ops::LinearPolicy::A16Only, 1621U);
-    const auto policy = device_sm() >= 120 ? ops::LinearPolicy::AllowA4
+    const auto policy = supports_low_precision_activation(120) ? ops::LinearPolicy::AllowA4
                                          : ops::LinearPolicy::A16Only;
     failures += run(3, 1, {2}, policy, 1631U);
     failures += run(4, 1, {}, policy, 1641U);
@@ -540,13 +550,17 @@ int run_fp8() {
     failures += run_fp8_oracle_case(parent, 6, 1, {5}, ops::LinearPolicy::A16Only, 1741U);
     failures += run_fp8_oracle_case(parent, 7, 1, {}, ops::LinearPolicy::AllowA8, 1751U);
     failures += run_fp8_oracle_case(parent, 9, 1, {7}, ops::LinearPolicy::AllowA8, 1761U);
-    failures += run_fp8_oracle_case(parent, 10, 1, {}, ops::LinearPolicy::AllowA8, 1771U);
+    if (supports_low_precision_activation(89)) {
+        failures += run_fp8_oracle_case(parent, 10, 1, {}, ops::LinearPolicy::AllowA8, 1771U);
+    }
     failures += run_fp8_oracle_case(parent, 10, 1, {8}, ops::LinearPolicy::A16Only, 1781U);
     failures += run_fp8_oracle_case(parent, 11, 1, {9}, ops::LinearPolicy::A16Only, 1791U);
     failures += run_fp8_oracle_case(parent, 3, 2, {3, 1}, ops::LinearPolicy::AllowA8, 1801U);
-    failures += run_fp8_oracle_case(parent, 4, 2, {4, 2}, ops::LinearPolicy::AllowA8, 1811U);
-    failures += run_fp8_oracle_case(parent, 16, 8, {16, 13, 11, 7, 5, 3, 2, 1},
-                                    ops::LinearPolicy::AllowA8, 1821U);
+    if (supports_low_precision_activation(89)) {
+        failures += run_fp8_oracle_case(parent, 4, 2, {4, 2}, ops::LinearPolicy::AllowA8, 1811U);
+        failures += run_fp8_oracle_case(parent, 16, 8, {16, 13, 11, 7, 5, 3, 2, 1},
+                                        ops::LinearPolicy::AllowA8, 1821U);
+    }
     return failures;
 }
 
