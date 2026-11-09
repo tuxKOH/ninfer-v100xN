@@ -5,7 +5,7 @@
 #include "artifact/reader.h"
 #include "core/device.h"
 #include "runtime/engine/kv_capacity.h"
-#ifdef NINFER_ENABLE_SM86_VISION
+#ifdef NINFER_AUX_VISION_ARCH
 #include "targets/qwen3_6/impl/vision/sm86/backend.h"
 #endif
 
@@ -158,7 +158,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, ExecutionCo
         if constexpr (!std::is_same_v<Target, Qwen3_6_27B>) {
             throw std::invalid_argument("auxiliary GPU Vision is supported only for Qwen3.6 27B");
         }
-#ifndef NINFER_ENABLE_SM86_VISION
+#ifndef NINFER_AUX_VISION_ARCH
         throw std::invalid_argument("auxiliary GPU Vision is not enabled in this build");
 #endif
         const int selected = *options.vision_gpu;
@@ -177,9 +177,13 @@ ConstructedTarget construct_registered(const EngineOptions& options, ExecutionCo
         }
         restore_device = std::make_unique<ScopedDevice>(device.device);
         auxiliary = std::make_shared<DeviceContext>(selected);
-        if (auxiliary->sm() != 86) {
-            throw std::invalid_argument("auxiliary GPU Vision requires an SM86 CUDA device");
+#ifdef NINFER_AUX_VISION_ARCH
+        if (auxiliary->sm() != NINFER_AUX_VISION_ARCH) {
+            throw std::invalid_argument("auxiliary GPU Vision requires an SM" +
+                std::to_string(NINFER_AUX_VISION_ARCH) + " CUDA device; selected device is SM" +
+                std::to_string(auxiliary->sm()));
         }
+#endif
         CUDA_CHECK(cudaSetDevice(device.device));
         auxiliary_slot = slot;
     }
@@ -208,7 +212,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, ExecutionCo
         const std::size_t available = runtime_bytes_after_planned_weights(
             load_plan.materialization().device_capacity_bytes[static_cast<std::size_t>(*auxiliary_slot)],
             auxiliary->device);
-#ifdef NINFER_ENABLE_SM86_VISION
+#ifdef NINFER_AUX_VISION_ARCH
         constexpr std::uint32_t kFrontendSegmentLimit = 768 / 2;
         const auto tokens = std::min(options.max_context, options.vision_max_tokens);
         const auto required = qwen3_6::vision_sm86::Backend::device_capacity_bytes(

@@ -17,7 +17,7 @@
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
 #include "targets/qwen3_6/impl/vision/host.h"
-#ifdef NINFER_ENABLE_SM86_VISION
+#ifdef NINFER_AUX_VISION_ARCH
 #include "targets/qwen3_6/impl/vision/sm86/backend.h"
 #endif
 
@@ -353,7 +353,7 @@ public:
     const LoadedModelData& model;
     mutable qwen3_6::HostVisionCache host_vision_cache;
     std::shared_ptr<VisionHostBudget> vision_host_budget;
-#ifdef NINFER_ENABLE_SM86_VISION
+#ifdef NINFER_AUX_VISION_ARCH
     std::unique_ptr<qwen3_6::vision_sm86::Backend> auxiliary_vision;
 #endif
     const bool auxiliary_vision_enabled;

@@ -42,7 +42,12 @@ __device__ __forceinline__ unsigned vision_attention_swz_addr(unsigned lane_base
     return lane_base + ((ck | as) ^ r);
 }
 
-__global__ void vision_attention_prepare_tiles_kernel(const std::int32_t* cu_seqlens,
+__device__ __forceinline__ unsigned vision_attention_pack_residual(float lo, float hi) {
+    return pack_bf16x2(lo - __bfloat162float(__float2bfloat16_rn(lo)),
+                       hi - __bfloat162float(__float2bfloat16_rn(hi)));
+}
+
+static __global__ void vision_attention_prepare_tiles_kernel(const std::int32_t* cu_seqlens,
                                                       std::int32_t segments,
                                                       VisionAttentionTile* tiles,
                                                       std::int32_t max_tiles,
@@ -78,7 +83,12 @@ vision_attention_stage_q(__nv_bfloat16* dst, const __nv_bfloat16* q, int q0, int
         __nv_bfloat16* smem = &dst[row * kVisionAttentionPaddedD + vision_attention_swz(row, d)];
         const __nv_bfloat16* global = vision_attention_ptr(
             q, stride_d, stride_h, stride_t, in_range ? d : 0, head, in_range ? q0 + row : q0);
-        cp_async_zfill<16, Cache::cg>(smem, global, in_range ? 16 : 0);
+        if (in_range && (reinterpret_cast<std::uintptr_t>(global) & 15u) != 0) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) { smem[i] = global[i]; }
+        } else {
+            cp_async_zfill<16, Cache::cg>(smem, global, in_range ? 16 : 0);
+        }
     }
 }
 
@@ -96,15 +106,21 @@ vision_attention_stage_kv(__nv_bfloat16* dst, const __nv_bfloat16* src, int key0
         const __nv_bfloat16* global =
             vision_attention_ptr(src, stride_d, stride_h, stride_t, in_range ? d : 0, head,
                                  in_range ? key0 + row : key0);
-        cp_async_zfill<16, Cache::cg>(smem, global, in_range ? 16 : 0);
+        if (in_range && (reinterpret_cast<std::uintptr_t>(global) & 15u) != 0) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) { smem[i] = global[i]; }
+        } else {
+            cp_async_zfill<16, Cache::cg>(smem, global, in_range ? 16 : 0);
+        }
     }
 }
 
-template <int Br, int Bc>
-__launch_bounds__(Br * 2, 128 / Br) __global__ void vision_attention_flash_kernel(
+template <int Br, int Bc, bool Ragged = false>
+static __launch_bounds__(Br * 2, 128 / Br) __global__ void vision_attention_flash_kernel(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
     const __nv_bfloat16* __restrict__ v, const VisionAttentionTile* __restrict__ tiles,
     std::int32_t patches, std::int32_t uniform_segment_length, __nv_bfloat16* __restrict__ out,
+    const std::int32_t* bounds, std::int32_t segments,
     std::int64_t q_stride_d, std::int64_t q_stride_h, std::int64_t q_stride_t,
     std::int64_t k_stride_d, std::int64_t k_stride_h, std::int64_t k_stride_t,
     std::int64_t v_stride_d, std::int64_t v_stride_h, std::int64_t v_stride_t) {
@@ -121,7 +137,26 @@ __launch_bounds__(Br * 2, 128 / Br) __global__ void vision_attention_flash_kerne
     constexpr float ScaleLog2E  = 0.11785113019775792073f * 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;
 
+    const std::int64_t block_begin = static_cast<std::int64_t>(blockIdx.x) * Br;
+    const int block_end = static_cast<int>(block_begin + Br < patches ? block_begin + Br : patches);
+    int first_segment = 0;
+    if constexpr (Ragged) {
+        int high = segments;
+        while (first_segment + 1 < high) {
+            const int mid = first_segment + (high - first_segment) / 2;
+            if (bounds[mid] <= block_begin) { first_segment = mid; } else { high = mid; }
+        }
+    }
+    for (int segment_index = first_segment;
+         segment_index < (Ragged ? segments : 1) &&
+             (!Ragged || bounds[segment_index] < block_end);
+         ++segment_index) {
     VisionAttentionTile tile;
+    if constexpr (Ragged) {
+        const int begin = bounds[segment_index];
+        const int end = bounds[segment_index + 1];
+        tile = {static_cast<int>(block_begin > begin ? block_begin : begin), begin, end, 0};
+    } else
     if (tiles != nullptr) {
         tile = tiles[blockIdx.x];
     } else if (uniform_segment_length > 0) {
@@ -134,6 +169,7 @@ __launch_bounds__(Br * 2, 128 / Br) __global__ void vision_attention_flash_kerne
         tile = {static_cast<std::int32_t>(blockIdx.x) * Br, 0, patches, 0};
     }
     if (tile.q0 < 0) { return; }
+    const int query_end = Ragged && block_end < tile.end ? block_end : tile.end;
     const int head = static_cast<int>(blockIdx.y);
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
@@ -168,7 +204,7 @@ __launch_bounds__(Br * 2, 128 / Br) __global__ void vision_attention_flash_kerne
     const unsigned v_as = static_cast<unsigned>((lane >> 4) << 4);
     const unsigned v_r  = static_cast<unsigned>(b_rin << 4);
 
-    vision_attention_stage_q<Br, Threads>(q_s, q, tile.q0, tile.end, head, tid, q_stride_d,
+    vision_attention_stage_q<Br, Threads>(q_s, q, tile.q0, query_end, head, tid, q_stride_d,
                                           q_stride_h, q_stride_t);
 
     float acc[PVNt][4];
@@ -241,7 +277,7 @@ __launch_bounds__(Br * 2, 128 / Br) __global__ void vision_attention_flash_kerne
         const int row1       = row0 + 8;
         const int query0     = tile.q0 + row0;
         const int query1     = tile.q0 + row1;
-        const bool full_tile = tile.q0 + Br <= tile.end && key0 + Bc <= tile.end;
+        const bool full_tile = tile.q0 + Br <= query_end && key0 + Bc <= tile.end;
         float block_max0     = -CUDART_INF_F;
         float block_max1     = -CUDART_INF_F;
         if (full_tile) {
@@ -255,10 +291,10 @@ __launch_bounds__(Br * 2, 128 / Br) __global__ void vision_attention_flash_kerne
             for (int nt = 0; nt < QKNt; ++nt) {
                 const int key_a = key0 + nt * 8 + 2 * lid;
                 const int key_b = key_a + 1;
-                score[nt][0] = query0 < tile.end && key_a < tile.end ? score[nt][0] : -CUDART_INF_F;
-                score[nt][1] = query0 < tile.end && key_b < tile.end ? score[nt][1] : -CUDART_INF_F;
-                score[nt][2] = query1 < tile.end && key_a < tile.end ? score[nt][2] : -CUDART_INF_F;
-                score[nt][3] = query1 < tile.end && key_b < tile.end ? score[nt][3] : -CUDART_INF_F;
+                score[nt][0] = query0 < query_end && key_a < tile.end ? score[nt][0] : -CUDART_INF_F;
+                score[nt][1] = query0 < query_end && key_b < tile.end ? score[nt][1] : -CUDART_INF_F;
+                score[nt][2] = query1 < query_end && key_a < tile.end ? score[nt][2] : -CUDART_INF_F;
+                score[nt][3] = query1 < query_end && key_b < tile.end ? score[nt][3] : -CUDART_INF_F;
                 block_max0   = fmaxf(block_max0, fmaxf(score[nt][0], score[nt][1]));
                 block_max1   = fmaxf(block_max1, fmaxf(score[nt][2], score[nt][3]));
             }
@@ -276,6 +312,7 @@ __launch_bounds__(Br * 2, 128 / Br) __global__ void vision_attention_flash_kerne
         float block_sum0 = 0.0f;
         float block_sum1 = 0.0f;
         unsigned p_frag[PVKs][4];
+        unsigned p_low[Ragged ? PVKs : 1][4];
 #pragma unroll
         for (int nt = 0; nt < QKNt; ++nt) {
             const float p00 = score[nt][0] > -CUDART_INF_F
@@ -296,9 +333,17 @@ __launch_bounds__(Br * 2, 128 / Br) __global__ void vision_attention_flash_kerne
             if ((nt & 1) == 0) {
                 p_frag[pk][0] = pack_bf16x2(p00, p01);
                 p_frag[pk][1] = pack_bf16x2(p10, p11);
+                if constexpr (Ragged) {
+                    p_low[pk][0] = vision_attention_pack_residual(p00, p01);
+                    p_low[pk][1] = vision_attention_pack_residual(p10, p11);
+                }
             } else {
                 p_frag[pk][2] = pack_bf16x2(p00, p01);
                 p_frag[pk][3] = pack_bf16x2(p10, p11);
+                if constexpr (Ragged) {
+                    p_low[pk][2] = vision_attention_pack_residual(p00, p01);
+                    p_low[pk][3] = vision_attention_pack_residual(p10, p11);
+                }
             }
         }
 
@@ -343,10 +388,19 @@ __launch_bounds__(Br * 2, 128 / Br) __global__ void vision_attention_flash_kerne
             }
             mma_bf16(acc[n2][0], acc[n2][1], acc[n2][2], acc[n2][3], p_frag[pk][0], p_frag[pk][1],
                      p_frag[pk][2], p_frag[pk][3], vf[cur][0], vf[cur][1]);
+            if constexpr (Ragged) {
+                mma_bf16(acc[n2][0], acc[n2][1], acc[n2][2], acc[n2][3], p_low[pk][0],
+                         p_low[pk][1], p_low[pk][2], p_low[pk][3], vf[cur][0], vf[cur][1]);
+            }
             if (n2 + 1 < PVNt) {
                 mma_bf16(acc[n2 + 1][0], acc[n2 + 1][1], acc[n2 + 1][2], acc[n2 + 1][3],
                          p_frag[pk][0], p_frag[pk][1], p_frag[pk][2], p_frag[pk][3], vf[cur][2],
                          vf[cur][3]);
+                if constexpr (Ragged) {
+                    mma_bf16(acc[n2 + 1][0], acc[n2 + 1][1], acc[n2 + 1][2], acc[n2 + 1][3],
+                             p_low[pk][0], p_low[pk][1], p_low[pk][2], p_low[pk][3],
+                             vf[cur][2], vf[cur][3]);
+                }
             }
         }
     }
@@ -360,16 +414,28 @@ __launch_bounds__(Br * 2, 128 / Br) __global__ void vision_attention_flash_kerne
         const int d0     = n * 8 + 2 * lid;
         const int query0 = tile.q0 + warp_row0 + gid;
         const int query1 = query0 + 8;
-        if (query0 < tile.end) {
+        if (query0 < query_end) {
             const std::int64_t offset =
                 (static_cast<std::int64_t>(query0) * kVisionAttentionHeads + head) * D + d0;
-            store_vec(&out[offset], pack_bf16x2(acc[n][0] * inv_l0, acc[n][1] * inv_l0));
+            if constexpr (Ragged) {
+                out[offset] = __float2bfloat16(acc[n][0] * inv_l0);
+                out[offset + 1] = __float2bfloat16(acc[n][1] * inv_l0);
+            } else {
+                store_vec(&out[offset], pack_bf16x2(acc[n][0] * inv_l0, acc[n][1] * inv_l0));
+            }
         }
-        if (query1 < tile.end) {
+        if (query1 < query_end) {
             const std::int64_t offset =
                 (static_cast<std::int64_t>(query1) * kVisionAttentionHeads + head) * D + d0;
-            store_vec(&out[offset], pack_bf16x2(acc[n][2] * inv_l1, acc[n][3] * inv_l1));
+            if constexpr (Ragged) {
+                out[offset] = __float2bfloat16(acc[n][2] * inv_l1);
+                out[offset + 1] = __float2bfloat16(acc[n][3] * inv_l1);
+            } else {
+                store_vec(&out[offset], pack_bf16x2(acc[n][2] * inv_l1, acc[n][3] * inv_l1));
+            }
         }
+    }
+    if constexpr (Ragged) { __syncthreads(); }
     }
 }
 

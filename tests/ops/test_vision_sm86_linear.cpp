@@ -184,10 +184,9 @@ int main() {
         for (int device = 0; device < count; ++device) {
             cudaDeviceProp properties{};
             check(cudaGetDeviceProperties(&properties, device));
-            if (properties.major == 8 && (properties.minor == 6 || properties.minor == 9)) {
-                selected = device;
-                break;
-            }
+            const int arch = properties.major * 10 + properties.minor;
+            if (arch == NINFER_AUX_VISION_ARCH) auxiliary = device;
+            if (arch == 70) text = device;
         }
         if (auxiliary < 0 || text < 0) return 77;
         check(cudaSetDevice(text));

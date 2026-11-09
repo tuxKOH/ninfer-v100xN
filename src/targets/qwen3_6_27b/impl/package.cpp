@@ -126,10 +126,15 @@ Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&
                                 std::shared_ptr<DeviceContext> auxiliary_context) {
     if (plan.impl_ == nullptr) { throw std::invalid_argument("target load plan is empty"); }
     const auto& bindings = plan.impl_->plan.bindings;
+#ifdef NINFER_AUX_VISION_ARCH
+    constexpr int auxiliary_vision_arch = NINFER_AUX_VISION_ARCH;
+#else
+    constexpr int auxiliary_vision_arch = 86;
+#endif
     if (bindings.auxiliary_vision_slot.has_value() != static_cast<bool>(auxiliary_context) ||
         (auxiliary_context && (!bindings.auxiliary_vision_device ||
                                auxiliary_context->device != *bindings.auxiliary_vision_device ||
-                               auxiliary_context->sm() != 86))) {
+                               auxiliary_context->sm() != auxiliary_vision_arch))) {
         throw std::invalid_argument("auxiliary Vision context does not match the load plan");
     }
     auto impl = std::make_unique<LoadedModel::Impl>(plan.impl_->weights_profile,

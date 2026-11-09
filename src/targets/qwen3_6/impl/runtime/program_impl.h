@@ -305,7 +305,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
             "Qwen3.6 loaded weights do not match the frozen startup features");
     }
     if (auxiliary) {
-#ifdef NINFER_ENABLE_SM86_VISION
+#ifdef NINFER_AUX_VISION_ARCH
         constexpr std::uint32_t segment_limit = 768 / 2;
         auxiliary_vision = std::make_unique<qwen3_6::vision_sm86::Backend>(
             auxiliary->device, *auxiliary->weights, auxiliary->owner, VisionConfig::output_hidden,

@@ -90,28 +90,31 @@ omitted at startup.
 
 ### Separate GPU for Vision
 
-The experimental mixed build runs the SM70 text backend and a separate SM86 Vision backend in the
-same process. Configure it with `-DCMAKE_CUDA_ARCHITECTURES=70 -DNINFER_ENABLE_SM86_VISION=ON`.
-The option defaults to off and requires `CMAKE_CUDA_ARCHITECTURES=70`. For example:
+The experimental mixed build runs the SM70 text backend and a separately compiled Vision backend
+in the same process. Set `NINFER_AUX_VISION_ARCH` to `86` for SM86 or `89` for SM89. The
+default is empty, which disables auxiliary Vision. The option requires
+`CMAKE_CUDA_ARCHITECTURES=70` and a CUDA 12.x toolchain that supports both selected architectures.
+For example:
 
 ```bash
-cmake -S . -B build-sm86 -DCMAKE_CUDA_ARCHITECTURES=70 -DNINFER_ENABLE_SM86_VISION=ON
+cmake -S . -B build-sm86 -DCMAKE_CUDA_ARCHITECTURES=70 -DNINFER_AUX_VISION_ARCH=86
 cmake --build build-sm86
 ```
 
-When `BUILD_TESTING=ON`, the option also enables SM86 Vision operator tests. Select their visible
-devices with `CUDA_VISIBLE_DEVICES`, or set `NINFER_TEST_CUDA_VISIBLE_DEVICES` at CMake
-configuration time to inject that value into CTest. The tests skip when no suitable SM86 device is
-visible.
+When `BUILD_TESTING=ON`, the option also enables auxiliary Vision operator tests. Select their
+visible devices with `CUDA_VISIBLE_DEVICES`, or set `NINFER_TEST_CUDA_VISIBLE_DEVICES` at CMake
+configuration time to inject that value into CTest. The tests need a device matching the selected
+auxiliary architecture and skip if one is not visible. SM86 operator tests and a short mixed-device
+serving smoke test have run on an RTX A2000. SM89 is a compile target, not a tested serving claim.
 
 Pass `--vision --vision-device gpu --vision-gpu N` to place the Vision encoder and its weights
-on a separate SM86 device. `--vision-device gpu` is the default, but `--vision-gpu` requires
+on a separate device matching the compiled auxiliary architecture. `--vision-device gpu` is the default, but `--vision-gpu` requires
 `--vision` and cannot be combined with `--vision-device cpu`. Without `--vision-gpu`, GPU Vision
 uses the primary text GPU. `N` is a non-negative CUDA **logical ordinal after**
 `CUDA_VISIBLE_DEVICES` filtering and reordering, not an `nvidia-smi` index or UUID. The selected
 device must differ from every text execution device and any expert storage device. A build without
-the option, an unavailable device, or a device other than SM86 cannot use this route. For stable
-mapping, obtain device UUIDs with `nvidia-smi -L`, then list them in the desired order:
+the option, an unavailable device, or a device that does not match the selected architecture cannot
+use this route. For stable mapping, obtain device UUIDs with `nvidia-smi -L`, then list them in the desired order:
 
 ```bash
 CUDA_VISIBLE_DEVICES=GPU-<text-uuid>,GPU-<vision-uuid> \
@@ -122,7 +125,7 @@ CUDA_VISIBLE_DEVICES=GPU-<text-uuid>,GPU-<vision-uuid> \
 Replace both UUID placeholders with the full UUIDs reported for the devices. In this example,
 the text device is logical 0 and the Vision device is logical 1 regardless of their physical
 indices. For TP2, list both SM70 text devices first, select them with `--tp 2 --devices 0,1`,
-and select the SM86 device with `--vision-gpu 2`.
+and select the matching auxiliary device with `--vision-gpu 2`.
 
 This route is limited to the Qwen3.6/3.8 27B target and artifacts with execution-qualified Vision
 weights. The GGUF-derived Q4_K_M and native FP8 profiles do not support Vision; QUASAR Vision

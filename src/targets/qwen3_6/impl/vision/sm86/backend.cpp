@@ -3,6 +3,7 @@
 #include "targets/qwen3_6/impl/vision/sm86/elementwise.h"
 #include "targets/qwen3_6/impl/vision/sm86/linear.h"
 #include "targets/qwen3_6/impl/frontend/preparation_control.h"
+#include "targets/qwen3_6/impl/vision/schedule.h"
 #include "core/device.h"
 #include "core/layout.h"
 
@@ -35,60 +36,42 @@ private:
     int previous_ = 0;
 };
 
-struct Layout {
-    TensorRegion positions, segments, indices, coefficients, x, patches;
-    TensorRegion attended, qkv, norm1, projected, up, norm2, down, normalized, merger;
-    std::size_t bytes;
-};
-
-Layout layout(std::size_t patches, std::size_t tokens, std::size_t segments) {
-    if (!tokens || patches != mul(tokens, C::merge_unit) || !segments || segments > tokens ||
-        patches > std::size_t(std::numeric_limits<std::int32_t>::max()) ||
-        segments >= std::size_t(std::numeric_limits<std::int32_t>::max()))
-        throw std::invalid_argument("SM86 Vision invalid workspace dimensions");
-    auto p = static_cast<std::int32_t>(patches);
-    auto t = static_cast<std::int32_t>(tokens);
-    auto s = static_cast<std::int32_t>(segments);
-    LayoutBuilder b;
-    Layout l{};
-    auto add = [&](DType type, std::initializer_list<std::int32_t> shape, const char* name) {
-        return b.add_tensor(type, shape, alignment, name);
-    };
-    l.positions = add(DType::I32, {p, 2}, "vision positions");
-    l.segments = add(DType::I32, {s + 1}, "vision segments");
-    l.indices = add(DType::I32, {4, p}, "vision indices");
-    l.coefficients = add(DType::FP32, {4, p}, "vision coefficients");
-    l.x = add(DType::BF16, {C::hidden, p}, "vision residual");
-    l.patches = add(DType::BF16, {C::patch_dim, p}, "vision patches");
-    {
-        auto scope = b.scope();
-        l.attended = add(DType::BF16, {C::hidden, p}, "vision attended");
-        {
-            auto inner = b.scope();
-            l.qkv = add(DType::BF16, {3 * C::hidden, p}, "vision qkv");
-            {
-                auto norm = b.scope();
-                l.norm1 = add(DType::BF16, {C::hidden, p}, "vision norm1");
-            }
-            if (attention_workspace_bytes(p, s) != 0)
-                throw std::logic_error("SM86 Vision attention workspace contract changed");
-        }
-        l.projected = add(DType::BF16, {C::hidden, p}, "vision projected");
-    }
-    {
-        auto scope = b.scope();
-        l.up = add(DType::BF16, {C::intermediate, p}, "vision up");
-        {
-            auto inner = b.scope();
-            l.norm2 = add(DType::BF16, {C::hidden, p}, "vision norm2");
-        }
-        l.down = add(DType::BF16, {C::hidden, p}, "vision down");
-    }
-    l.normalized = add(DType::BF16, {C::hidden, p}, "vision merger norm");
-    l.merger = add(DType::BF16, {C::merger_hidden, t}, "vision merger hidden");
-    l.bytes = b.finish(alignment, "vision workspace");
-    return l;
+vision_schedule::Layout layout(std::size_t patches, std::size_t tokens, std::size_t segments) {
+    if (segments > tokens) throw std::invalid_argument("SM86 Vision invalid workspace dimensions");
+    return vision_schedule::build_layout(patches, tokens, segments, alignment,
+        [](std::int32_t p, std::int32_t s) {
+            const auto bytes = attention_workspace_bytes(p, s);
+            if (bytes != 0) throw std::logic_error("SM86 Vision attention workspace contract changed");
+            return bytes;
+        });
 }
+
+struct AuxiliaryVisionOps {
+    cudaStream_t stream;
+    const PreparationControl& control;
+    void copy(const void* src, Tensor& dst) const {
+        CUDA_CHECK(cudaMemcpyAsync(dst.data, src, dst.bytes(), cudaMemcpyHostToDevice, stream));
+    }
+    void check_layer() const { frontend_internal::check_preparation_control(control, "SM86 Vision"); }
+    void linear(const Tensor& x, const Weight& w, Tensor& y) const { vision_sm86::linear(x, w, y, stream); }
+    void add_bias(const Tensor& b, Tensor& x) const { vision_sm86::add_bias(b, x, stream); }
+    void layer_norm(const Tensor& x, const Tensor& w, const Tensor& b, Tensor& y) const {
+        vision_sm86::layer_norm(x, w, b, C::norm_epsilon, y, stream);
+    }
+    void position_add(const Tensor& table, const Tensor& indices, const Tensor& weights, Tensor& x) const {
+        vision_sm86::position_add(table, indices, weights, x, stream);
+    }
+    void rope(const Tensor& positions, Tensor& q, Tensor& k) const {
+        vision_sm86::rope_2d(positions, q, k, stream);
+    }
+    void attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& segments,
+                   DeviceSpan, Tensor& out) const {
+        vision_sm86::attention_cu_seqlens(q, k, v, segments, out, stream);
+    }
+    void residual_add(const Tensor& x, Tensor& y) const { vision_sm86::residual_add(x, y, stream); }
+    void gelu_tanh(Tensor& x) const { vision_sm86::gelu_tanh(x, stream); }
+    void gelu_exact(Tensor& x) const { vision_sm86::gelu_exact(x, stream); }
+};
 
 void device_pointer(const void* ptr, int device) {
     if (!ptr) throw std::invalid_argument("SM86 Vision null weight pointer");
@@ -181,9 +164,7 @@ void validate_item(std::span<const std::uint16_t> patches, const VisionItemContr
             throw std::invalid_argument("SM86 Vision position index out of bounds");
 }
 
-void copy(const void* src, Tensor& dst, cudaStream_t stream) {
-    CUDA_CHECK(cudaMemcpyAsync(dst.data, src, dst.bytes(), cudaMemcpyHostToDevice, stream));
-}
+
 
 struct Drain {
     cudaStream_t stream;
@@ -201,8 +182,10 @@ Backend::Backend(int device, const VisionWeights& weights, std::shared_ptr<const
     DeviceGuard guard(device_);
     cudaDeviceProp properties{};
     CUDA_CHECK(cudaGetDeviceProperties(&properties, device_));
-    if (properties.major != 8 || properties.minor != 6)
-        throw std::invalid_argument("SM86 Vision requires an SM86 device");
+    if (properties.major * 10 + properties.minor != NINFER_AUX_VISION_ARCH)
+        throw std::invalid_argument("auxiliary Vision requires an SM" +
+            std::to_string(NINFER_AUX_VISION_ARCH) + " device; selected device is SM" +
+            std::to_string(properties.major * 10 + properties.minor));
     validate_weights(weights_, output_hidden_, device_);
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
 }
@@ -253,46 +236,26 @@ std::shared_ptr<const std::vector<std::uint16_t>> Backend::encode(
     auto result = std::make_shared<std::vector<std::uint16_t>>(elements);
     Drain drain{stream_};
     DeviceSpan backing{workspace.p, workspace.bytes};
-    const int p = static_cast<int>(item.patch_count), t = static_cast<int>(item.merged_count);
-    Tensor positions = l.positions.bind(backing), segments = l.segments.bind(backing);
-    Tensor indices = l.indices.bind(backing), coefficients = l.coefficients.bind(backing);
-    Tensor x = l.x.bind(backing), input = l.patches.bind(backing);
-    copy(item.position_ids.data(), positions, stream_); copy(item.cu_seqlens.data(), segments, stream_);
-    copy(item.position_table_indices.data(), indices, stream_);
-    copy(item.position_table_weights.data(), coefficients, stream_); copy(patches.data(), input, stream_);
     const auto& w = weights_.common;
-    linear(input, w.patch_embedding, x, stream_); add_bias(w.patch_embedding_bias, x, stream_);
-    Tensor table = w.position_embedding.reshape({C::hidden, C::position_embeddings});
-    position_add(table, indices, coefficients, x, stream_);
-    for (const auto& block : w.layers) {
-        frontend_internal::check_preparation_control(control, "SM86 Vision");
-        Tensor attended = l.attended.bind(backing), qkv = l.qkv.bind(backing), norm = l.norm1.bind(backing);
-        layer_norm(x, block.norm1_weight, block.norm1_bias, C::norm_epsilon, norm, stream_);
-        linear(norm, block.qkv, qkv, stream_); add_bias(block.qkv_bias, qkv, stream_);
-        const std::size_t plane = C::hidden * sizeof(std::uint16_t);
-        Tensor q(qkv.data, DType::BF16, {C::head_dim, C::heads, p});
-        Tensor k(static_cast<unsigned char*>(qkv.data) + plane, DType::BF16, {C::head_dim, C::heads, p});
-        Tensor v(static_cast<unsigned char*>(qkv.data) + 2 * plane, DType::BF16, {C::head_dim, C::heads, p});
-        q.nb[2] = k.nb[2] = v.nb[2] = qkv.nb[1];
-        rope_2d(positions, q, k, stream_);
-        Tensor heads = attended.view({C::head_dim, C::heads, p});
-        attention_cu_seqlens(q, k, v, segments, heads, stream_);
-        Tensor projected = l.projected.bind(backing);
-        linear(attended, block.output, projected, stream_); add_bias(block.output_bias, projected, stream_);
-        residual_add(projected, x, stream_);
-        Tensor up = l.up.bind(backing), down = l.down.bind(backing), norm2 = l.norm2.bind(backing);
-        layer_norm(x, block.norm2_weight, block.norm2_bias, C::norm_epsilon, norm2, stream_);
-        linear(norm2, block.fc1, up, stream_); add_bias(block.fc1_bias, up, stream_);
-        gelu_tanh(up, stream_); linear(up, block.fc2, down, stream_);
-        add_bias(block.fc2_bias, down, stream_); residual_add(down, x, stream_);
+    vision_schedule::Weights weights{};
+    weights.patch = &w.patch_embedding;
+    weights.patch_bias = &w.patch_embedding_bias;
+    weights.position = &w.position_embedding;
+    for (std::size_t i = 0; i < w.layers.size(); ++i) {
+        const auto& b = w.layers[i];
+        weights.blocks[i] = {&b.norm1_weight, &b.norm1_bias, &b.qkv, &b.qkv_bias,
+                             &b.output, &b.output_bias, &b.norm2_weight, &b.norm2_bias,
+                             &b.fc1, &b.fc1_bias, &b.fc2, &b.fc2_bias};
     }
-    Tensor normalized = l.normalized.bind(backing), hidden = l.merger.bind(backing);
-    layer_norm(x, w.merger_norm_weight, w.merger_norm_bias, C::norm_epsilon, normalized, stream_);
-    Tensor merged = normalized.view({C::merger_hidden, t});
-    linear(merged, w.merger_fc1, hidden, stream_); add_bias(w.merger_fc1_bias, hidden, stream_);
-    gelu_exact(hidden, stream_);
-    Tensor output(output_buffer.p, DType::BF16, {output_hidden_, t});
-    linear(hidden, weights_.merger_fc2, output, stream_); add_bias(weights_.merger_fc2_bias, output, stream_);
+    weights.merger_norm_weight = &w.merger_norm_weight;
+    weights.merger_norm_bias = &w.merger_norm_bias;
+    weights.merger_fc1 = &w.merger_fc1;
+    weights.merger_fc1_bias = &w.merger_fc1_bias;
+    weights.merger_fc2 = &weights_.merger_fc2;
+    weights.merger_fc2_bias = &weights_.merger_fc2_bias;
+    Tensor output(output_buffer.p, DType::BF16, {output_hidden_, static_cast<int>(item.merged_count)});
+    AuxiliaryVisionOps operations{stream_, control};
+    vision_schedule::execute(l, backing, patches, item, weights, output, operations);
     CUDA_CHECK(cudaMemcpyAsync(result->data(), output.data, output.bytes(), cudaMemcpyDeviceToHost, stream_));
     CUDA_CHECK(cudaStreamSynchronize(stream_));
     drain.stream = nullptr;

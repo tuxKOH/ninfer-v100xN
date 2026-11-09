@@ -395,7 +395,7 @@ add_library(ninfer_engine STATIC
 ninfer_internal_includes(ninfer_engine)
 target_include_directories(ninfer_engine PUBLIC ${PROJECT_SOURCE_DIR}/include)
 
-if(NINFER_ENABLE_SM86_VISION)
+if(NOT NINFER_AUX_VISION_ARCH STREQUAL "")
   add_library(ninfer_vision_sm86 STATIC
     targets/qwen3_6/impl/vision/sm86/backend.cpp
     targets/qwen3_6/impl/vision/sm86/linear.cu
@@ -405,9 +405,10 @@ if(NINFER_ENABLE_SM86_VISION)
   target_include_directories(ninfer_vision_sm86 PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/targets/qwen3_6/export)
   ninfer_cuda_archive(ninfer_vision_sm86)
-  set_target_properties(ninfer_vision_sm86 PROPERTIES CUDA_ARCHITECTURES 86)
+  set_target_properties(ninfer_vision_sm86 PROPERTIES CUDA_ARCHITECTURES "${NINFER_AUX_VISION_ARCH}")
   target_link_libraries(ninfer_vision_sm86 PRIVATE ninfer_core CUDA::cudart)
-  target_compile_definitions(ninfer_engine PRIVATE NINFER_ENABLE_SM86_VISION=1)
+  target_compile_definitions(ninfer_vision_sm86 PRIVATE NINFER_AUX_VISION_ARCH=${NINFER_AUX_VISION_ARCH})
+  target_compile_definitions(ninfer_engine PRIVATE NINFER_AUX_VISION_ARCH=${NINFER_AUX_VISION_ARCH})
   target_link_libraries(ninfer_engine PRIVATE ninfer_vision_sm86)
 endif()
 

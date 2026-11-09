@@ -403,9 +403,9 @@ int main() {
     for (int i = 0; i < count; ++i) {
         cudaDeviceProp prop{};
         cuda_check(cudaGetDeviceProperties(&prop, i), "cudaGetDeviceProperties");
-        if (prop.major == 8 && (prop.minor == 6 || prop.minor == 9)) { device = i; break; }
+        if (prop.major * 10 + prop.minor == NINFER_AUX_VISION_ARCH) { device = i; break; }
     }
-    if (device < 0) { std::cout << "SKIP: SM86 or SM89 required\n"; return 77; }
+    if (device < 0) { std::cout << "SKIP: SM" << NINFER_AUX_VISION_ARCH << " required\n"; return 77; }
     cuda_check(cudaSetDevice(device), "cudaSetDevice");
     int failures = 0;
     if (vision::attention_workspace_bytes(9, 3) != 0) { std::cerr << "attention workspace nonzero\n"; ++failures; }

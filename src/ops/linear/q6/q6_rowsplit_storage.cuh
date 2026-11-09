@@ -16,6 +16,29 @@ struct Q6RowSplitStorage {
     static constexpr int kScaleBytesPerGroup = 2;
 };
 
+struct Q6ScalarDecodeAtom {
+    static constexpr int kGroupK = Q6RowSplitStorage::kGroupK;
+
+    __device__ static __forceinline__ void
+    decode_pair(std::uint8_t packed, std::uint8_t high, std::uint16_t scale_bits, int lane,
+                float& w0, float& w1) {
+        const int shift = (lane & 1) * 4;
+        const int q0 = ((static_cast<int>(packed & 0x0fu) | (((high >> shift) & 3) << 4)) ^ 0x20) - 0x20;
+        const int q1 = ((static_cast<int>(packed >> 4) | (((high >> (shift + 2)) & 3) << 4)) ^ 0x20) - 0x20;
+        const float scale = __half2float(__ushort_as_half(scale_bits));
+        w0 = static_cast<float>(q0) * scale;
+        w1 = static_cast<float>(q1) * scale;
+    }
+
+    __device__ static __forceinline__ void
+    load_pair(const std::uint8_t* codes, const std::uint8_t* high, const std::uint8_t* scales,
+              std::int64_t group, int lane, float& w0, float& w1) {
+        decode_pair(codes[group * Q6RowSplitStorage::kCodeBytesPerGroup + lane],
+                    high[group * Q6RowSplitStorage::kHighBytesPerGroup + (lane >> 1)],
+                    *reinterpret_cast<const std::uint16_t*>(scales + group * 2), lane, w0, w1);
+    }
+};
+
 struct Q6SimtDecodeAtom {
     __device__ static __forceinline__ void decode_eight(std::uint32_t packed,
                                                         std::uint16_t high_bits,
@@ -42,20 +65,15 @@ struct Q6MmaDecodeAtom {
                                                                  const std::uint8_t* scale_ptr,
                                                                  std::int64_t staged_group_index,
                                                                  int lane) {
-        const float scale =
-            __half2float(__ushort_as_half(*reinterpret_cast<const std::uint16_t*>(scale_ptr)));
         const std::uint8_t packed =
             staged_codes[staged_group_index * Q6RowSplitStorage::kCodeBytesPerGroup + lane];
         const std::uint8_t high_byte =
             staged_high[staged_group_index * Q6RowSplitStorage::kHighBytesPerGroup + (lane >> 1)];
-        const int shift = (lane & 1) * 4;
-        const int q0 =
-            ((static_cast<int>(packed & 0x0fu) | (((high_byte >> shift) & 3) << 4)) ^ 0x20) - 0x20;
-        const int q1 =
-            ((static_cast<int>(packed >> 4) | (((high_byte >> (shift + 2)) & 3) << 4)) ^ 0x20) -
-            0x20;
-        return __floats2bfloat162_rn(static_cast<float>(q0) * scale,
-                                     static_cast<float>(q1) * scale);
+        float w0, w1;
+        Q6ScalarDecodeAtom::decode_pair(packed, high_byte,
+                                      *reinterpret_cast<const std::uint16_t*>(scale_ptr),
+                                      lane, w0, w1);
+        return __floats2bfloat162_rn(w0, w1);
     }
 };
 

@@ -128,7 +128,7 @@ template <>
 double Program<Variant>::prepare_media(PreparedPrompt& prompt, const PreparationControl& control) const {
     auto& data = PreparedPromptAccess::mutable_view(prompt);
     if (!data.has_media()) { return 0.0; }
-#ifdef NINFER_ENABLE_SM86_VISION
+#ifdef NINFER_AUX_VISION_ARCH
     if (impl_->auxiliary_vision_enabled) {
         const auto controls = build_vision_control(data);
         std::size_t total = 0;

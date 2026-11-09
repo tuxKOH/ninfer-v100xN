@@ -1,6 +1,12 @@
 #include "targets/qwen3_6/impl/vision/sm86/linear.h"
 
 #include "core/device.h"
+#include "ops/linear/q4/q4_rowsplit_storage.cuh"
+#include "ops/linear/q5/q5_rowsplit_gemm_simt.cuh"
+#include "ops/linear/q6/q6_rowsplit_storage.cuh"
+#include "ops/linear/w8/w8_rowsplit_gemm_simt.cuh"
+
+#include <algorithm>
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -102,119 +108,67 @@ void validate_weight(const Weight& w) {
     }
 }
 
-template <int Bits>
-__global__ void linear_kernel(const __nv_bfloat16* x, const std::uint8_t* codes,
-                              const std::uint8_t* high, const __half* scales,
-                              __nv_bfloat16* out, int n, int k, int padded_k,
-                              std::uint64_t total) {
-    constexpr int group_size = Bits == 8 ? 32 : 64;
-    constexpr int high_per_group = Bits == 5 ? 8 : (Bits == 6 ? 16 : 0);
-    const int lane = threadIdx.x & 31;
-    const std::uint64_t warp = (static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x) / 32;
-    const std::uint64_t warp_count = static_cast<std::uint64_t>(gridDim.x) * blockDim.x / 32;
-    const int groups_per_row = padded_k / group_size;
-    for (std::uint64_t index = warp; index < total; index += warp_count) {
-        const int row = static_cast<int>(index % n);
-        const std::uint64_t token = index / n;
-        float sum = 0.0f;
-        for (int col = lane; col < k; col += 32) {
-            const std::uint64_t g = static_cast<std::uint64_t>(row) * groups_per_row + col / group_size;
-            const int within = col % group_size;
-            int q;
-            if constexpr (Bits == 8) {
-                const int byte = codes[g * 32 + within];
-                q = byte < 128 ? byte : byte - 256;
-            } else {
-                const int packed = codes[g * 32 + within / 2];
-                int value = (packed >> ((within & 1) * 4)) & 15;
-                if constexpr (Bits == 5 || Bits == 6) {
-                    constexpr int high_bits = Bits - 4;
-                    const int bit = within * high_bits;
-                    value |= ((high[g * high_per_group + bit / 8] >> (bit % 8)) &
-                              ((1 << high_bits) - 1)) << 4;
-                }
-                q = (value ^ (1 << (Bits - 1))) - (1 << (Bits - 1));
-            }
-            const float weight = static_cast<float>(q) * __half2float(scales[g]);
-            sum = fmaf(weight, __bfloat162float(x[token * k + col]), sum);
-        }
-        for (int offset = 16; offset > 0; offset /= 2) {
-            sum += __shfl_down_sync(0xffffffffu, sum, offset);
-        }
-        if (lane == 0) out[index] = __float2bfloat16_rn(sum);
-    }
-}
+namespace detail = ninfer::ops::detail;
+struct AuxQ5RowSplitSimtSchedule : detail::Q5RowSplitSimtSchedule {};
+struct AuxW8RowSplitSimtSchedule : detail::W8RowSplitSimtSchedule {};
 
-// Reuse each decoded FP32 weight across 16 tokens. Keeping the dequantized
-// values in FP32 preserves the FP16 scale rather than rounding it to BF16.
-template <int Bits>
-__global__ void linear_tiled_kernel(const __nv_bfloat16* x, const std::uint8_t* codes,
-                                    const std::uint8_t* high, const __half* scales,
-                                    __nv_bfloat16* out, int n, int k, int padded_k,
-                                    int tokens, std::uint64_t tiles) {
-    constexpr int tile = 16;
-    constexpr int tile_k = 32;
-    constexpr int group_size = Bits == 8 ? 32 : 64;
-    constexpr int high_per_group = Bits == 5 ? 8 : (Bits == 6 ? 16 : 0);
-    __shared__ float weights[tile_k][tile + 1];
-    __shared__ float inputs[tile_k][tile + 1];
-    const int tid = threadIdx.x;
-    const int local_row = tid % tile;
-    const int local_token = tid / tile;
-    const std::uint64_t row_tiles = (static_cast<std::uint64_t>(n) + tile - 1) / tile;
-    const int groups_per_row = padded_k / group_size;
+// Keep auxiliary kernel registrations distinct from text kernels compiled for another SM.
 
-    for (std::uint64_t block = blockIdx.x; block < tiles; block += gridDim.x) {
-        const std::uint64_t row0 = (block % row_tiles) * tile;
-        const std::uint64_t token0 = (block / row_tiles) * tile;
-        const std::uint64_t row = row0 + local_row;
-        const std::uint64_t token = token0 + local_token;
-        float sum = 0.0f;
-        for (std::int64_t k0 = 0; k0 < k; k0 += tile_k) {
-            for (int item = tid; item < tile * tile_k; item += tile * tile) {
-                const int kk = item % tile_k;
-                const int r = item / tile_k;
-                const std::uint64_t weight_row = row0 + r;
-                const std::int64_t col = k0 + kk;
-                float value = 0.0f;
-                if (weight_row < static_cast<std::uint64_t>(n) && col < k) {
-                    const std::uint64_t g = weight_row * groups_per_row + col / group_size;
-                    const int within = static_cast<int>(col % group_size);
-                    int q;
-                    if constexpr (Bits == 8) {
-                        const int byte = codes[g * 32 + within];
-                        q = byte < 128 ? byte : byte - 256;
-                    } else {
-                        const int packed = codes[g * 32 + within / 2];
-                        int code = (packed >> ((within & 1) * 4)) & 15;
-                        if constexpr (Bits == 5 || Bits == 6) {
-                            constexpr int high_bits = Bits - 4;
-                            const int bit = within * high_bits;
-                            code |= ((high[g * high_per_group + bit / 8] >> (bit % 8)) &
-                                     ((1 << high_bits) - 1)) << 4;
-                        }
-                        q = (code ^ (1 << (Bits - 1))) - (1 << (Bits - 1));
-                    }
-                    value = static_cast<float>(q) * __half2float(scales[g]);
-                }
-                weights[kk][r] = value;
-                const std::uint64_t input_token = token0 + r;
-                inputs[kk][r] = input_token < static_cast<std::uint64_t>(tokens) && col < k
-                    ? __bfloat162float(x[input_token * static_cast<std::uint64_t>(k) + col])
-                    : 0.0f;
-            }
-            __syncthreads();
-#pragma unroll
-            for (int kk = 0; kk < tile_k; ++kk) {
-                sum = fmaf(weights[kk][local_row], inputs[kk][local_token], sum);
-            }
-            __syncthreads();
-        }
-        if (row < static_cast<std::uint64_t>(n) &&
-            token < static_cast<std::uint64_t>(tokens)) {
-            out[token * static_cast<std::uint64_t>(n) + row] = __float2bfloat16_rn(sum);
+// The shared SIMT GEMM accepts a format schedule. Its scalar tail covers
+// non-aligned K without reading the padded activation region.
+template <int Bits>
+struct ScalarCodec {
+    static constexpr int kGroupK = 64;
+
+    __device__ static void load_pair(const std::uint8_t* codes, const std::uint8_t* high,
+                                     const std::uint8_t* scales, std::int64_t group, int lane,
+                                     float& w0, float& w1) {
+        if constexpr (Bits == 4) {
+            const auto packed = codes[group * 32 + lane];
+            const auto scale = *reinterpret_cast<const std::uint16_t*>(scales + group * 2);
+            detail::Q4SimtDecodeAtom::decode_pair(packed, scale, w0, w1);
+        } else {
+            detail::Q6ScalarDecodeAtom::load_pair(codes, high, scales, group, lane, w0, w1);
         }
     }
+};
+
+template <int Bits>
+struct SimtSchedule {
+    using Codec = ScalarCodec<Bits>;
+    static constexpr int kNibU4 = 32;
+    static constexpr int kHighU4 = Bits == 6 ? 16 : 0;
+    static constexpr int kScaleU32 = 8;
+    static constexpr int kHighBytesPerGroup = Bits == 6 ? 16 : 0;
+
+    __device__ static void dequant_chunk(const uint4* codes, const uint4* high,
+                                         const std::uint32_t* scales, int phase, int lane,
+                                         float (&weights)[8]) {
+        const auto packed = reinterpret_cast<const std::uint32_t*>(codes)[phase * 32 + lane];
+        const auto scale = reinterpret_cast<const std::uint16_t*>(scales)[phase * 4 + (lane >> 3)];
+        if constexpr (Bits == 4) {
+            detail::Q4SimtDecodeAtom::decode_eight(packed, scale, weights);
+        } else {
+            const auto bits = reinterpret_cast<const std::uint16_t*>(high)[phase * 32 + lane];
+            detail::Q6SimtDecodeAtom::decode_eight(packed, bits, scale, weights);
+        }
+    }
+};
+
+template <class Schedule>
+void launch_q_simt(const __nv_bfloat16* x, const Weight& weight, __nv_bfloat16* out,
+                   int tokens, cudaStream_t stream) {
+    constexpr int rows_per_block = 8;
+    constexpr int cols_per_block = 8;
+    const dim3 grid((static_cast<unsigned>(weight.n) + rows_per_block - 1) / rows_per_block,
+                    (static_cast<unsigned>(tokens) + cols_per_block - 1) / cols_per_block);
+    const int full_slabs = weight.k % 8 == 0 ? weight.k / 1024 : 0;
+    detail::q5_rowsplit_gemm_simt_kernel<Schedule, cols_per_block, rows_per_block, 2>
+        <<<grid, rows_per_block * 32, 0, stream>>>(
+            x, static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.qhigh),
+            static_cast<const std::uint8_t*>(weight.scales), out, nullptr,
+            weight.n, weight.n, weight.k, tokens, weight.padded_shape[1], full_slabs);
 }
 
 } // namespace
@@ -228,39 +182,41 @@ void linear(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t str
         overlaps(weight.payload, weight.payload_bytes, out.data, out_bytes)) {
         throw std::invalid_argument("vision linear: output overlaps an input");
     }
-    const auto total = checked_mul(static_cast<std::uint64_t>(weight.n),
-                                   static_cast<std::uint64_t>(x.ne[1]));
-    constexpr unsigned threads = 128;
-    const auto wanted_blocks = (total + 3) / 4;
-    const unsigned blocks = static_cast<unsigned>(wanted_blocks < 65535 ? wanted_blocks : 65535);
+    constexpr int cols_per_block = 8;
+    constexpr int max_tokens_per_launch = 65535 * cols_per_block;
     const auto* input = static_cast<const __nv_bfloat16*>(x.data);
-    const auto* codes = static_cast<const std::uint8_t*>(weight.qdata);
-    const auto* high = static_cast<const std::uint8_t*>(weight.qhigh);
-    const auto* scales = static_cast<const __half*>(weight.scales);
     auto* output = static_cast<__nv_bfloat16*>(out.data);
-#define VISION_LINEAR_LAUNCH(bits) \
-    do { \
-        if (weight.n >= 16 && x.ne[1] >= 16) { \
-            const auto row_tiles = (static_cast<std::uint64_t>(weight.n) + 15) / 16; \
-            const auto token_tiles = (static_cast<std::uint64_t>(x.ne[1]) + 15) / 16; \
-            const auto tiles = checked_mul(row_tiles, token_tiles); \
-            const unsigned tile_blocks = static_cast<unsigned>(tiles < 65535 ? tiles : 65535); \
-            linear_tiled_kernel<bits><<<tile_blocks, 256, 0, stream>>>(input, codes, high, \
-                scales, output, weight.n, weight.k, weight.padded_shape[1], x.ne[1], tiles); \
-        } else { \
-            linear_kernel<bits><<<blocks, threads, 0, stream>>>(input, codes, high, scales, \
-                output, weight.n, weight.k, weight.padded_shape[1], total); \
-        } \
-    } while (false)
-    switch (weight.qtype) {
-    case QType::Q4G64_F16S: VISION_LINEAR_LAUNCH(4); break;
-    case QType::Q5G64_F16S: VISION_LINEAR_LAUNCH(5); break;
-    case QType::Q6G64_F16S: VISION_LINEAR_LAUNCH(6); break;
-    case QType::W8G32_F16S: VISION_LINEAR_LAUNCH(8); break;
-    default: throw std::invalid_argument("vision linear: unsupported weight format");
+    for (std::int64_t offset = 0; offset < x.ne[1]; offset += max_tokens_per_launch) {
+        const int tokens = static_cast<int>(
+            std::min<std::int64_t>(max_tokens_per_launch, x.ne[1] - offset));
+        const auto* x_slice = input + offset * weight.k;
+        auto* out_slice = output + offset * weight.n;
+        switch (weight.qtype) {
+        case QType::Q4G64_F16S:
+            launch_q_simt<SimtSchedule<4>>(x_slice, weight, out_slice, tokens, stream);
+            break;
+        case QType::Q5G64_F16S:
+            launch_q_simt<AuxQ5RowSplitSimtSchedule>(x_slice, weight, out_slice, tokens, stream);
+            break;
+        case QType::Q6G64_F16S:
+            launch_q_simt<SimtSchedule<6>>(x_slice, weight, out_slice, tokens, stream);
+            break;
+        case QType::W8G32_F16S: {
+            const dim3 grid((static_cast<unsigned>(weight.n) + 7) / 8,
+                            (static_cast<unsigned>(tokens) + 7) / 8);
+            const int full_slabs = weight.k % 8 == 0 ? weight.k / 1024 : 0;
+            const detail::W8ContiguousOutput output_tile{out_slice, weight.n};
+            detail::w8_rowsplit_gemm_simt_kernel<AuxW8RowSplitSimtSchedule, 8, 8, 2, false>
+                <<<grid, 256, 0, stream>>>(
+                    x_slice, static_cast<const std::uint8_t*>(weight.qdata),
+                    static_cast<const std::uint8_t*>(weight.scales), output_tile,
+                    weight.n, weight.k, tokens, weight.padded_shape[1], full_slabs);
+            break;
+        }
+        default: throw std::invalid_argument("vision linear: unsupported weight format");
+        }
+        CUDA_CHECK(cudaGetLastError());
     }
-#undef VISION_LINEAR_LAUNCH
-    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace ninfer::targets::qwen3_6::vision_sm86
