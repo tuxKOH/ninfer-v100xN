@@ -204,8 +204,8 @@ public:
         }
     }
 
-    std::size_t finish(bool is_tool_call_response) {
-        if (filter_tool_calls_) { publish_content(tool_filter_.finish(is_tool_call_response)); }
+    std::size_t finish(std::string_view final_content) {
+        if (filter_tool_calls_) { publish_content(tool_filter_.finish(final_content)); }
         return content_bytes_;
     }
 
@@ -551,16 +551,14 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.metrics.speculative_accepted_per_position =
         std::move(result.speculative.accepted_per_position);
 
-    bool is_tool_call_response = false;
     if (prepared.tool_capable) {
         ParsedToolCallOutput parsed =
             parse_qwen_tool_call_output(outcome.text, prepared.tool_name_max_length);
-        outcome.text          = std::move(parsed.content);
-        is_tool_call_response = parsed.is_tool_call_response;
-        if (is_tool_call_response) { outcome.tool_calls = std::move(parsed.tool_calls); }
+        outcome.text = std::move(parsed.content);
+        if (parsed.is_tool_call_response) { outcome.tool_calls = std::move(parsed.tool_calls); }
     }
     if (output_sink) {
-        outcome.streamed_content_bytes = output_sink->finish(is_tool_call_response);
+        outcome.streamed_content_bytes = output_sink->finish(outcome.text);
     }
     return outcome;
 }

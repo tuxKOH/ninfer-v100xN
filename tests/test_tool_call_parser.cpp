@@ -4,6 +4,7 @@
 
 #include <iostream>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -122,7 +123,7 @@ int test_incremental_filter_valid_tool() {
     visible += filter.feed("Calling weather.  \n<tool_");
     visible += filter.feed("call>\n<function=get_weather>");
     visible += filter.feed("\n</function>\n</tool_call>");
-    visible += filter.finish(true);
+    visible += filter.finish("Calling weather.");
     int failures = 0;
     failures += check(visible == "Calling weather.",
                       "valid tool filter did not stream the trimmed content prefix");
@@ -137,18 +138,129 @@ int test_incremental_filter_fallback() {
     std::string restored;
     restored += malformed.feed(original.substr(0, 10));
     restored += malformed.feed(original.substr(10));
-    restored += malformed.finish(false);
+    restored += malformed.finish(original);
 
     ninfer::serve::ToolCallStreamFilter normal;
     std::string ordinary;
     ordinary += normal.feed("ordinary text  ");
-    ordinary += normal.finish(false);
+    ordinary += normal.finish("ordinary text  ");
 
     int failures = 0;
     failures += check(restored == original, "malformed tool filter fallback lost raw bytes");
     failures +=
         check(ordinary == "ordinary text  ", "ordinary filtered output lost trailing whitespace");
     return failures;
+}
+
+int check_stream(const std::string& raw, const std::string& content) {
+    int failures = 0;
+    // Include every byte boundary (also inside UTF-8 and each markup delimiter).
+    for (std::size_t split = 0; split <= raw.size(); ++split) {
+        ninfer::serve::ToolCallStreamFilter filter;
+        std::string streamed = filter.feed(std::string_view(raw).substr(0, split));
+        streamed += filter.feed(std::string_view(raw).substr(split));
+        streamed += filter.finish(content);
+        if (streamed != content || filter.emitted_bytes() != content.size()) {
+            failures += fail("stream/terminal content differs at byte " + std::to_string(split));
+            break;
+        }
+    }
+    ninfer::serve::ToolCallStreamFilter filter;
+    std::string streamed;
+    for (const char byte : raw) { streamed += filter.feed(std::string_view(&byte, 1)); }
+    streamed += filter.finish(content);
+    failures += check(streamed == content, "one-byte stream differs from terminal content");
+    return failures;
+}
+
+int test_literal_tags() {
+    const std::vector<std::string> values{
+        "b = \"start <tool_call> end </tool_call> here\"",
+        "TXT_PARAM = re.compile(r\"<parameter=([a-zA-Z_]+)>(.*?)</parameter>\", re.S)",
+        "unmatched tags: <tool_call> and <function=write> and </function> and </tool_call>",
+        "a literal </parameter> followed by text, not a sibling",
+        "<tool_call><function=example><parameter=value>nested</parameter></function></tool_call>",
+        "before\n<tool_call><function=outer><parameter=x>"
+        "<tool_call><function=inner></function></tool_call>"
+        "</parameter></function></tool_call>\nafter",
+        "{\"tags\":[\"</parameter>\",\"</function>\",\"</tool_call>\"],\"ok\":true}",
+        "\"quoted JSON value with </parameter> inside\"",
+        "多字节内容 <tool_call>保留</tool_call> ✅",
+    };
+    int failures = 0;
+    for (const std::string& value : values) {
+        const std::string raw = "<tool_call>\n<function=write>\n<parameter=content>\n" + value +
+                                "\n</parameter>\n<parameter=path>/tmp/t.py</parameter>\n"
+                                "</function>\n</tool_call>";
+        const auto parsed = ninfer::serve::parse_qwen_tool_call_output(raw, 64);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
+                          "literal tags caused fallback: " + value);
+        if (parsed.tool_calls.size() != 1) { continue; }
+        const Json args = Json::parse(parsed.tool_calls[0].arguments_json);
+        const Json expected = Json::parse(value, nullptr, false);
+        failures += check(args.at("content") == (expected.is_discarded() ? Json(value) : expected),
+                          "literal-tag parameter changed: " + value);
+        failures += check(args.at("path") == "/tmp/t.py" && args.size() == 2,
+                          "literal-tag call lost sibling parameter");
+        failures += check_stream(raw, parsed.content);
+    }
+    return failures;
+}
+
+int test_quoted_opener_before_call() {
+    const std::string prefix =
+        "格式说明：TXT_CALL = re.compile(r\"<tool_call>\\s*<function=([a-z_]+)>\")";
+    const std::string raw = prefix + "\n<tool_call>\n<function=bash>\n"
+                                    "<parameter=command>ls</parameter>\n"
+                                    "</function>\n</tool_call>";
+    const auto parsed = ninfer::serve::parse_qwen_tool_call_output(raw, 64);
+    int failures = check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
+                         "prose quoting opener hid actual call");
+    failures += check(parsed.content == prefix, "prose with quoted opener changed");
+    if (parsed.tool_calls.size() == 1) {
+        failures += check(parsed.tool_calls[0].name == "bash" &&
+                              Json::parse(parsed.tool_calls[0].arguments_json).at("command") == "ls",
+                          "actual call after quoted opener changed");
+    }
+    failures += check_stream(raw, parsed.content);
+    return failures;
+}
+
+int test_malformed_and_ordinary_streams() {
+    const std::vector<std::string> values{
+        "ordinary text  \n",
+        "a literal <tool_call> in prose  \n",
+        "<tool_call><function=broken><parameter=x>truncated",
+        "<tool_call><function=broken>stray text</function></tool_call>",
+        "<tool_call><function=broken><parameter=x>missing close</function></tool_call>",
+        "<tool_call><function=broken><parameter=>value</parameter></function></tool_call>",
+        "<tool_call><function=ok></function></tool_call>\ntrailing text",
+        "<tool_call><function=ok></function></tool_call>\n<tool_call><function=broken>",
+    };
+    int failures = 0;
+    for (const auto& raw : values) {
+        const auto parsed = ninfer::serve::parse_qwen_tool_call_output(raw, 64);
+        failures += check(!parsed.is_tool_call_response && parsed.tool_calls.empty() &&
+                              parsed.content == raw,
+                          "malformed/ordinary content was not preserved: " + raw);
+        failures += check_stream(raw, parsed.content);
+    }
+    return failures;
+}
+
+int test_unclosed_nested_calls() {
+    for (const int depth : {32, 80}) {
+        std::string raw;
+        for (int i = 0; i < depth; ++i) {
+            raw += "<tool_call><function=write><parameter=content>";
+        }
+        raw += "unclosed examples</parameter></function></tool_call>";
+        const auto parsed = ninfer::serve::parse_qwen_tool_call_output(raw, 64);
+        if (parsed.is_tool_call_response || parsed.content != raw || !parsed.tool_calls.empty()) {
+            return fail("unclosed nested examples did not fall back to raw text");
+        }
+    }
+    return 0;
 }
 
 } // namespace
@@ -162,6 +274,10 @@ int main() {
     failures += test_configured_name_limit();
     failures += test_incremental_filter_valid_tool();
     failures += test_incremental_filter_fallback();
+    failures += test_literal_tags();
+    failures += test_quoted_opener_before_call();
+    failures += test_malformed_and_ordinary_streams();
+    failures += test_unclosed_nested_calls();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

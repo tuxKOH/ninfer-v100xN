@@ -9,6 +9,7 @@
 #include <random>
 #include <stdexcept>
 #include <string_view>
+#include <unordered_map>
 
 namespace ninfer::serve {
 namespace {
@@ -64,53 +65,105 @@ std::string new_tool_call_id() {
     return std::string(buf.data());
 }
 
-bool parse_parameter(std::string_view inner, std::size_t& pos, Json& args) {
-    constexpr std::string_view kParamOpen  = "<parameter=";
-    constexpr std::string_view kParamClose = "</parameter>";
-    if (!starts_with_at(inner, pos, kParamOpen)) { return false; }
-    const std::size_t name_begin = pos + kParamOpen.size();
-    const std::size_t name_end   = inner.find('>', name_begin);
-    if (name_end == std::string_view::npos || name_end == name_begin) { return false; }
-    const std::string key       = std::string(inner.substr(name_begin, name_end - name_begin));
-    pos                         = name_end + 1;
-    const std::size_t value_end = inner.find(kParamClose, pos);
-    if (value_end == std::string_view::npos) { return false; }
-    const std::string raw_value = trim_ascii(inner.substr(pos, value_end - pos));
-    Json parsed                 = Json::parse(raw_value, nullptr, false);
-    args[key]                   = parsed.is_discarded() ? Json(raw_value) : parsed;
-    pos                         = value_end + kParamClose.size();
+constexpr std::string_view kToolOpen      = "<tool_call>";
+constexpr std::string_view kToolClose     = "</tool_call>";
+constexpr std::string_view kFunctionOpen  = "<function=";
+constexpr std::string_view kFunctionClose = "</function>";
+constexpr std::string_view kParamOpen     = "<parameter=";
+constexpr std::string_view kParamClose    = "</parameter>";
+
+bool is_call_open(std::string_view text, std::size_t pos) {
+    if (!starts_with_at(text, pos, kToolOpen)) { return false; }
+    pos += kToolOpen.size();
+    skip_ws(text, pos);
+    return starts_with_at(text, pos, kFunctionOpen);
+}
+
+bool consume_call_close(std::string_view text, std::size_t& pos) {
+    std::size_t after = pos;
+    if (!starts_with_at(text, after, kFunctionClose)) { return false; }
+    after += kFunctionClose.size();
+    skip_ws(text, after);
+    if (!starts_with_at(text, after, kToolClose)) { return false; }
+    pos = after + kToolClose.size();
     return true;
 }
 
-bool parse_one_tool_call(std::string_view block, std::size_t max_name_length, ToolCall& out) {
-    constexpr std::string_view kFunctionOpen  = "<function=";
-    constexpr std::string_view kFunctionClose = "</function>";
-    std::size_t pos                           = 0;
-    skip_ws(block, pos);
-    if (!starts_with_at(block, pos, kFunctionOpen)) { return false; }
+struct ParseContext {
+    // A malformed nested example can be encountered from several enclosing values.
+    // Remember its result instead of repeatedly parsing the same suffix.
+    std::unordered_map<std::size_t, std::size_t> nested_ends;
+    bool nesting_limit = false;
+};
+
+bool parse_call_at(std::string_view text, std::size_t& pos, std::size_t max_name_length,
+                   ToolCall& out, ParseContext& context, unsigned nesting = 0) {
+    if (nesting == 64) {
+        context.nesting_limit = true;
+        return false;
+    }
+    if (!is_call_open(text, pos)) { return false; }
+    pos += kToolOpen.size();
+    skip_ws(text, pos);
     const std::size_t name_begin = pos + kFunctionOpen.size();
-    const std::size_t name_end   = block.find('>', name_begin);
+    const std::size_t name_end   = text.find('>', name_begin);
     if (name_end == std::string_view::npos || name_end == name_begin) { return false; }
-    const std::string name = std::string(block.substr(name_begin, name_end - name_begin));
+    const std::string name = std::string(text.substr(name_begin, name_end - name_begin));
     if (!valid_function_name(name, max_name_length)) { return false; }
     pos = name_end + 1;
 
-    const std::size_t function_end = block.find(kFunctionClose, pos);
-    if (function_end == std::string_view::npos) { return false; }
-    const std::string_view params = block.substr(pos, function_end - pos);
-    Json args                     = Json::object();
-    std::size_t param_pos         = 0;
+    Json args = Json::object();
     for (;;) {
-        skip_ws(params, param_pos);
-        if (param_pos >= params.size()) { break; }
-        if (!parse_parameter(params, param_pos, args)) { return false; }
+        skip_ws(text, pos);
+        if (consume_call_close(text, pos)) { break; }
+        if (!starts_with_at(text, pos, kParamOpen)) { return false; }
+        const std::size_t key_begin = pos + kParamOpen.size();
+        const std::size_t key_end   = text.find('>', key_begin);
+        if (key_end == std::string_view::npos || key_end == key_begin) { return false; }
+        const std::string key(text.substr(key_begin, key_end - key_begin));
+        const std::size_t value_begin = key_end + 1;
+        pos = value_begin;
+        for (;;) {
+            pos = text.find('<', pos);
+            if (pos == std::string_view::npos) { return false; }
+            // Only a complete nested call is structural. A lone quoted opener
+            // must not hide the actual parameter/function terminators.
+            if (is_call_open(text, pos)) {
+                auto cached = context.nested_ends.find(pos);
+                if (cached == context.nested_ends.end()) {
+                    std::size_t end = pos;
+                    ToolCall nested;
+                    if (!parse_call_at(text, end, max_name_length, nested, context, nesting + 1)) {
+                        if (context.nesting_limit) { return false; }
+                        end = std::string_view::npos;
+                    }
+                    cached = context.nested_ends.emplace(pos, end).first;
+                }
+                const std::size_t nested_end = cached->second;
+                if (nested_end != std::string_view::npos) {
+                    pos = nested_end;
+                    continue;
+                }
+            }
+            if (starts_with_at(text, pos, kParamClose)) {
+                std::size_t after = pos + kParamClose.size();
+                skip_ws(text, after);
+                std::size_t call_end = after;
+                // Tag spellings inside code/regex strings are data unless the
+                // surrounding grammar can continue with a sibling or call end.
+                if (starts_with_at(text, after, kParamOpen) ||
+                    consume_call_close(text, call_end)) {
+                    const std::string raw = trim_ascii(text.substr(value_begin, pos - value_begin));
+                    Json parsed = Json::parse(raw, nullptr, false);
+                    args[key] = parsed.is_discarded() ? Json(raw) : std::move(parsed);
+                    pos = after;
+                    break;
+                }
+            }
+            ++pos;
+        }
     }
 
-    pos = function_end + kFunctionClose.size();
-    skip_ws(block, pos);
-    if (pos != block.size()) { return false; }
-
-    out.id             = new_tool_call_id();
     out.name           = name;
     out.arguments_json = args.dump();
     return true;
@@ -126,30 +179,26 @@ ParsedToolCallOutput fallback(const std::string& text) {
 
 ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
                                                  std::size_t max_tool_name_length) {
-    constexpr std::string_view kToolOpen  = "<tool_call>";
-    constexpr std::string_view kToolClose = "</tool_call>";
-
-    const std::size_t first = text.find(kToolOpen);
+    std::size_t first = text.find(kToolOpen);
+    while (first != std::string::npos && !is_call_open(text, first)) {
+        first = text.find(kToolOpen, first + kToolOpen.size());
+    }
     if (first == std::string::npos) { return fallback(text); }
 
     ParsedToolCallOutput out;
     out.content = rtrim_ascii(std::string_view(text).substr(0, first));
+    ParseContext context;
 
     std::size_t pos = first;
     while (pos < text.size()) {
         skip_ws(text, pos);
         if (pos >= text.size()) { break; }
-        if (!starts_with_at(text, pos, kToolOpen)) { return fallback(text); }
-        const std::size_t inner_begin = pos + kToolOpen.size();
-        const std::size_t close       = text.find(kToolClose, inner_begin);
-        if (close == std::string::npos) { return fallback(text); }
         ToolCall call;
-        if (!parse_one_tool_call(std::string_view(text).substr(inner_begin, close - inner_begin),
-                                 max_tool_name_length, call)) {
+        if (!parse_call_at(text, pos, max_tool_name_length, call, context)) {
             return fallback(text);
         }
+        call.id = new_tool_call_id();
         out.tool_calls.push_back(std::move(call));
-        pos = close + kToolClose.size();
     }
 
     if (out.tool_calls.empty()) { return fallback(text); }
@@ -160,12 +209,8 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
 std::string ToolCallStreamFilter::feed(std::string_view text) {
     if (finished_) { throw std::logic_error("tool-call stream filter is already finished"); }
     if (text.empty()) { return {}; }
-    if (saw_tool_marker_) {
-        tool_region_.append(text);
-        return {};
-    }
+    if (saw_tool_marker_) { return {}; }
 
-    constexpr std::string_view kToolOpen = "<tool_call>";
     pending_.append(text);
     const std::size_t marker = pending_.find(kToolOpen);
     if (marker != std::string::npos) {
@@ -175,7 +220,6 @@ std::string ToolCallStreamFilter::feed(std::string_view text) {
             --safe_end;
         }
         std::string visible = pending_.substr(0, safe_end);
-        tool_region_        = pending_.substr(safe_end);
         pending_.clear();
         saw_tool_marker_ = true;
         emitted_bytes_ += visible.size();
@@ -193,17 +237,16 @@ std::string ToolCallStreamFilter::feed(std::string_view text) {
     return visible;
 }
 
-std::string ToolCallStreamFilter::finish(bool is_tool_call_response) {
+std::string ToolCallStreamFilter::finish(std::string_view final_content) {
     if (finished_) { throw std::logic_error("tool-call stream filter is already finished"); }
     finished_ = true;
-    if (is_tool_call_response) {
-        pending_.clear();
-        tool_region_.clear();
-        return {};
+    if (emitted_bytes_ > final_content.size()) {
+        throw std::logic_error("streamed tool-call prefix exceeds terminal content");
     }
-    std::string tail = std::move(pending_);
-    tail += tool_region_;
-    tool_region_.clear();
+    // The first literal marker may precede the real call (e.g. a regex in prose).
+    // Publish all remaining parsed content, or all raw content on parse failure.
+    std::string tail(final_content.substr(emitted_bytes_));
+    pending_.clear();
     emitted_bytes_ += tail.size();
     return tail;
 }

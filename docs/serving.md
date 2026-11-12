@@ -513,6 +513,13 @@ and content indices remain stable, and concatenated deltas equal the terminal It
 does not emit the Chat Completions `[DONE]` sentinel. With tools enabled, ordinary answer text still
 streams immediately; only an ambiguous `<tool_call>` suffix or the structured tool region is held.
 Malformed tool markup is flushed back as ordinary text without losing bytes.
+The shared Chat/Responses/Anthropic tool parser recognizes `<tool_call>` followed by a
+`<function=...>` header, rather than bare tag mentions in prose. Parameter values can contain
+literal tag strings and complete nested call examples; their original values are retained.
+A parameter terminator must lead to another parameter or the function/call closing pair.
+This unescaped format remains ambiguous if literal data exactly reproduces those boundaries.
+Truncated calls or ordinary text after the tool-call suffix fall back to the complete raw text;
+streamed and non-streamed content agree, including prose that quotes a tag before a real call.
 
 ### Local response state and resources
 
@@ -883,6 +890,14 @@ or usage accounting. If a stop truncates a multi-token MTP or DFlash round, the 
 exact accepted target prefix so a following compatible turn can still reuse it. Output-limit and
 context-capacity finishes map to `length`/ `max_tokens`; ordinary model or string stops map to
 `stop`/ `end_turn`.
+
+To diagnose a long task that stops without an error, retain the final response/SSE event and
+the matching `[req ...] done finish=...` line or JSONL `request_done` record. The log distinguishes
+`output_limit`, `context_capacity`, model/string stops and `cancelled`; reaching a token limit is
+a normal completion. If no completion record exists, retain the last throughput/error lines and
+the exact launch command and request output limit. The preparation/admission timeout does not
+impose a 20-minute generation deadline. A tool-call response waits for the client to execute
+the tool and submit its result; the server does not continue an agent task by itself.
 
 Function tools are rendered into the model prompt and generated calls are parsed into protocol
 responses. NInfer does not execute tools and does not enforce client JSON Schema through constrained
