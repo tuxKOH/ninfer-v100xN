@@ -1,6 +1,7 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
+#include <ninfer/types.h>
 
 #include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
@@ -125,9 +126,55 @@ Program<Variant>::~Program() noexcept = default;
 
 template <>
 double Program<Variant>::prepare_media(PreparedPrompt& prompt, const PreparationControl& control) const {
-    if (!impl_->model.vision || !impl_->model.vision->host) { return 0.0; }
     auto& data = PreparedPromptAccess::mutable_view(prompt);
     if (!data.has_media()) { return 0.0; }
+#ifdef NINFER_AUX_VISION_ARCH
+    if (impl_->auxiliary_vision_enabled) {
+        const auto controls = build_vision_control(data);
+        std::size_t total = 0;
+        for (const auto& item : controls.items) {
+            if (item.merged_count > impl_->vision_max_tokens - total) {
+                throw std::invalid_argument("Vision request exceeds the configured token budget");
+            }
+            total += item.merged_count;
+        }
+        struct Lease {
+            std::shared_ptr<detail::NINFER_QWEN36_RUNTIME_NS::VisionHostBudget> budget;
+            std::size_t bytes = 0;
+            ~Lease() {
+                std::lock_guard lock(budget->mutex);
+                budget->used -= bytes;
+            }
+        };
+        return impl_->host_vision_cache.prepare_with(
+            data, control, detail::NINFER_QWEN36_RUNTIME_NS::VisionConfig::output_hidden,
+            [&](std::span<const std::uint16_t> patches, const VisionItemControl& item,
+                const PreparationControl& preparation) {
+                const std::size_t bytes = item.merged_count *
+                    detail::NINFER_QWEN36_RUNTIME_NS::VisionConfig::output_hidden *
+                    sizeof(std::uint16_t);
+                auto lease = std::make_shared<Lease>();
+                lease->budget = impl_->vision_host_budget;
+                {
+                    std::lock_guard lock(lease->budget->mutex);
+                    if (bytes > lease->budget->capacity - lease->budget->used) {
+                        throw RequestError(RequestErrorKind::Overloaded,
+                                           "Vision staged host memory limit exceeded");
+                    }
+                    lease->budget->used += bytes;
+                    lease->bytes = bytes;
+                }
+                auto encoded = impl_->auxiliary_vision->encode(patches, item, preparation);
+                struct OwnedOutput {
+                    std::shared_ptr<Lease> lease;
+                    std::shared_ptr<const std::vector<std::uint16_t>> output;
+                };
+                auto owned = std::make_shared<OwnedOutput>(OwnedOutput{std::move(lease), std::move(encoded)});
+                return std::shared_ptr<const std::vector<std::uint16_t>>(owned, owned->output.get());
+            });
+    }
+#endif
+    if (!impl_->model.vision || !impl_->model.vision->host) { return 0.0; }
     return impl_->host_vision_cache.prepare(*impl_->model.vision->host, data, control);
 }
 
@@ -269,14 +316,14 @@ std::unique_ptr<Program<Variant>>
 create_program<Variant>(const Variant::ModelView& model,
                         std::span<const Variant::ModelView* const> peer_models,
                         Variant::WeightsProfile weights_profile, SequencePlan<Variant>&& plan,
-                        ExecutionContext& execution) {
+                        ExecutionContext& execution, const AuxiliaryVision* auxiliary) {
     if (plan.impl_ == nullptr) { throw std::invalid_argument("sequence plan is empty"); }
     if (plan.impl_->weights_profile != weights_profile) {
         throw std::invalid_argument(
             "loaded model weights profile does not match the sequence plan");
     }
     auto impl =
-        std::make_unique<detail::ProgramImpl<Variant>>(model, peer_models, *plan.impl_, execution);
+        std::make_unique<detail::ProgramImpl<Variant>>(model, peer_models, *plan.impl_, execution, auxiliary);
     plan.impl_.reset();
     return std::unique_ptr<Program<Variant>>(new Program<Variant>(std::move(impl)));
 }

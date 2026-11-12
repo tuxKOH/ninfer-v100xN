@@ -1,8 +1,10 @@
 #include "ninfer/engine.h"
 
+#include <charconv>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <sys/resource.h>
@@ -48,17 +50,29 @@ int main(int argc, char** argv) {
         bool cpu = false, image = false, eager = false, vision = true;
         std::size_t wanted = 85000;
         std::uint32_t output_tokens = 129;
+        std::optional<int> vision_gpu;
         for (int i = 1; i < argc; ++i) {
             const std::string flag = argv[i];
             if (flag == "--cpu") { cpu = true; }
             else if (flag == "--image") { image = true; }
             else if (flag == "--eager") { eager = true; }
             else if (flag == "--no-vision") { vision = false; }
+            else if (flag == "--vision-gpu" && i + 1 < argc) {
+                const std::string value = argv[++i];
+                int ordinal = 0;
+                const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), ordinal);
+                if (error != std::errc{} || end != value.data() + value.size() || ordinal < 0) {
+                    throw std::invalid_argument("--vision-gpu requires a non-negative CUDA ordinal");
+                }
+                vision_gpu = ordinal;
+            }
             else if (flag == "--prompt-tokens" && i + 1 < argc) { wanted = std::stoul(argv[++i]); }
             else if (flag == "--output-tokens" && i + 1 < argc) { output_tokens = std::stoul(argv[++i]); }
             else { throw std::invalid_argument("unknown Vision qualification option: " + flag); }
         }
-        if ((!vision && (cpu || image)) || wanted < 256 || wanted > 85000 || output_tokens < 2) {
+        if ((!vision && (cpu || image || vision_gpu)) || (cpu && vision_gpu) ||
+            (vision_gpu && (*vision_gpu == 0 || *vision_gpu == 1)) ||
+            wanted < 256 || wanted > 85000 || output_tokens < 2) {
             throw std::invalid_argument("invalid Vision qualification dimensions/options");
         }
         ninfer::EngineOptions options;
@@ -72,6 +86,7 @@ int main(int argc, char** argv) {
         options.prefill_chunk = 1024;
         options.enable_vision = vision;
         options.vision_device = cpu ? ninfer::VisionDevice::Cpu : ninfer::VisionDevice::Gpu;
+        options.vision_gpu = vision_gpu;
         options.vision_max_tokens = 4096;
         options.volta_long_attention = true;
         options.use_cuda_graph = !eager;

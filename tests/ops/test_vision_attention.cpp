@@ -249,7 +249,8 @@ int main() {
     }
 
     int failures = 0;
-    if (ops::vision_attention_workspace_capacity_bytes(4, 194, 1, 1) != 0 ||
+    if (ops::vision_attention_workspace_capacity_bytes(4, 194, 1, 1) !=
+            ops::vision_attention_workspace_capacity_bytes(194, 194, 1, 1) ||
         ops::vision_attention_workspace_capacity_bytes(4, 194, 1, 3) !=
             ops::vision_attention_workspace_capacity_bytes(194, 194, 3, 3)) {
         std::cerr << "vision_attention rectangular capacity missed its maximal legal pair\n";

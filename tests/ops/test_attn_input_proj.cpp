@@ -19,6 +19,19 @@ using namespace ninfer::test::direct_bf16_weight;
 using namespace ninfer::test::input_projection;
 
 namespace {
+bool supports_low_precision_activation(int minimum_sm) {
+#if defined(NINFER_VOLTA_BUILD) || defined(NINFER_SM8X_COMPAT)
+    (void)minimum_sm;
+    return false;
+#else
+    int device = 0;
+    cudaDeviceProp props{};
+    cuda_check(cudaGetDevice(&device), "attention projection device");
+    cuda_check(cudaGetDeviceProperties(&props, device), "attention projection properties");
+    return props.major * 10 + props.minor >= minimum_sm;
+#endif
+}
+
 
 // This criterion belongs to the complete A16 attention-input-projection Op.
 constexpr ReductionCriterion kAttnInputProjA16Tolerance{2.9e-3, 4.0e-3, 4.5e-3};
@@ -308,9 +321,11 @@ int run_nvfp4_target() {
     for (const std::int32_t tokens : {1, 2, 4, 8, 16, 20, 32, 33}) {
         failures += run_nvfp4_target_case(parent, tokens);
     }
-    failures += run_nvfp4_target_case(parent, 4, ops::LinearPolicy::AllowA4);
-    failures += run_nvfp4_target_case(parent, 17, ops::LinearPolicy::AllowA4);
-    failures += run_nvfp4_target_case(parent, 1024, ops::LinearPolicy::AllowA4);
+    if (supports_low_precision_activation(120)) {
+        failures += run_nvfp4_target_case(parent, 4, ops::LinearPolicy::AllowA4);
+        failures += run_nvfp4_target_case(parent, 17, ops::LinearPolicy::AllowA4);
+        failures += run_nvfp4_target_case(parent, 1024, ops::LinearPolicy::AllowA4);
+    }
     return failures;
 }
 
@@ -387,14 +402,21 @@ int run_fp8_target() {
         QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, ops::LinearPolicy::AllowA8, 1024, 1024);
     const std::size_t a16 = ops::attn_input_proj_workspace_capacity_bytes(
         QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, ops::LinearPolicy::A16Only, 1, 2048);
+#ifdef NINFER_VOLTA_BUILD
+    const bool a16_mismatch = a16 == 0 || a16 != ops::attn_input_proj_workspace_capacity_bytes(
+        QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, ops::LinearPolicy::A16Only, 2048, 2048);
+#else
+    const bool a16_mismatch = a16 != 0;
+#endif
     if (one != 0 || ten != 0 || eleven == 0 || forty_eight <= eleven ||
-        hot_interval != forty_eight || exact_1024 <= forty_eight || a16 != 0) {
+        hot_interval != forty_eight || exact_1024 <= forty_eight || a16_mismatch) {
         std::cerr << "FP8 attention input workspace interval contract mismatch\n";
         ++failures;
     }
     failures += run_fp8_target_case(parent, 1, ops::LinearPolicy::A16Only);
     failures += run_fp8_target_case(parent, 2, ops::LinearPolicy::A16Only);
     for (const std::int32_t tokens : {1, 2, 10, 11, 48, 65, 1024}) {
+        if (tokens >= 11 && !supports_low_precision_activation(89)) { continue; }
         failures += run_fp8_target_case(parent, tokens, ops::LinearPolicy::AllowA8);
     }
     return failures;

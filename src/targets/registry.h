@@ -19,7 +19,7 @@ using Qwen3_6_27B    = qwen3_6_27b::Package;
 using Qwen3_6_35BA3B = qwen3_6_35b_a3b::Package;
 
 struct LoadedQwen3_6_27B {
-    std::unique_ptr<Qwen3_6_27B::LoadedModel> model;
+    std::shared_ptr<Qwen3_6_27B::LoadedModel> model;
     Qwen3_6_27B::Frontend frontend;
 
     LoadedQwen3_6_27B(std::unique_ptr<Qwen3_6_27B::LoadedModel> stable_model,

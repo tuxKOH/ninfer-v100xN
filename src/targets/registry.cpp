@@ -5,12 +5,17 @@
 #include "artifact/reader.h"
 #include "core/device.h"
 #include "runtime/engine/kv_capacity.h"
+#ifdef NINFER_AUX_VISION_ARCH
+#include "targets/qwen3_6/impl/vision/sm86/backend.h"
+#endif
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -60,6 +65,10 @@ void validate_options(const EngineOptions& options) {
     }
     if (options.media_preprocess_threads > 64) {
         throw std::invalid_argument("Engine media_preprocess_threads must be in [0,64]");
+    }
+    if (options.vision_gpu &&
+        (!options.enable_vision || options.vision_device != VisionDevice::Gpu)) {
+        throw std::invalid_argument("vision_gpu requires enabled GPU Vision");
     }
 }
 
@@ -142,9 +151,45 @@ ConstructedTarget construct_registered(const EngineOptions& options, ExecutionCo
     const ModelSamplingDefaults sampling_defaults = Target::sampling_defaults(identity.model_id);
     const int tp                                  = execution.device_count;
     DeviceContext& device                         = execution.primary();
+    std::shared_ptr<DeviceContext> auxiliary;
+    std::unique_ptr<ScopedDevice> restore_device;
+    std::optional<int> auxiliary_slot;
+    if (options.vision_gpu) {
+        if constexpr (!std::is_same_v<Target, Qwen3_6_27B>) {
+            throw std::invalid_argument("auxiliary GPU Vision is supported only for Qwen3.6 27B");
+        }
+#ifndef NINFER_AUX_VISION_ARCH
+        throw std::invalid_argument("auxiliary GPU Vision is not enabled in this build");
+#endif
+        const int selected = *options.vision_gpu;
+        if (selected < 0) { throw std::invalid_argument("invalid Vision CUDA device id"); }
+        for (int rank = 0; rank < tp; ++rank) {
+            if (execution.dev[static_cast<std::size_t>(rank)]->device == selected) {
+                throw std::invalid_argument("Vision CUDA device must differ from execution devices");
+            }
+        }
+        if (execution.has_storage() && execution.storage->device == selected) {
+            throw std::invalid_argument("Vision CUDA device must differ from the storage device");
+        }
+        const int slot = tp + (execution.has_storage() ? 1 : 0);
+        if (slot >= static_cast<int>(artifact::kMaximumDevices)) {
+            throw std::invalid_argument("no materialization slot available for Vision CUDA device");
+        }
+        restore_device = std::make_unique<ScopedDevice>(device.device);
+        auxiliary = std::make_shared<DeviceContext>(selected);
+#ifdef NINFER_AUX_VISION_ARCH
+        if (auxiliary->sm() != NINFER_AUX_VISION_ARCH) {
+            throw std::invalid_argument("auxiliary GPU Vision requires an SM" +
+                std::to_string(NINFER_AUX_VISION_ARCH) + " CUDA device; selected device is SM" +
+                std::to_string(auxiliary->sm()));
+        }
+#endif
+        CUDA_CHECK(cudaSetDevice(device.device));
+        auxiliary_slot = slot;
+    }
 
     const int materialization_devices = tp + (execution.has_storage() ? 1 : 0);
-    artifact::Binder binder(reader, materialization_devices, execution.has_storage());
+    artifact::Binder binder(reader, materialization_devices, execution.has_storage(), auxiliary_slot);
     auto load_plan = Target::plan_load(binder, options, weights_profile);
     // The curve describes one device's geometry: TP splits heads, PP splits layers.
     // Resolve the symmetric runtime reservation against the smallest device budget.
@@ -162,11 +207,47 @@ ConstructedTarget construct_registered(const EngineOptions& options, ExecutionCo
 
     auto progress     = artifact_progress(options.load_progress);
     enable_weight_storage_peer(execution);
-    auto materialized = artifact::materialize(reader, load_plan.materialization(), execution,
-                                              progress.callback ? &progress : nullptr);
+    artifact::MaterializedArtifact materialized;
+    if (auxiliary) {
+        const std::size_t available = runtime_bytes_after_planned_weights(
+            load_plan.materialization().device_capacity_bytes[static_cast<std::size_t>(*auxiliary_slot)],
+            auxiliary->device);
+#ifdef NINFER_AUX_VISION_ARCH
+        constexpr std::uint32_t kFrontendSegmentLimit = 768 / 2;
+        const auto tokens = std::min(options.max_context, options.vision_max_tokens);
+        const auto required = qwen3_6::vision_sm86::Backend::device_capacity_bytes(
+            5120, tokens, kFrontendSegmentLimit);
+        if (required > available) {
+            throw std::invalid_argument("auxiliary Vision workspace and output require " +
+                std::to_string(required) + " bytes, but only " + std::to_string(available) +
+                " bytes remain after planned weights");
+        }
+#else
+        (void)available;
+#endif
+        std::vector<DeviceContext*> devices;
+        devices.reserve(static_cast<std::size_t>(materialization_devices + 1));
+        for (int rank = 0; rank < tp; ++rank) {
+            devices.push_back(&*execution.dev[static_cast<std::size_t>(rank)]);
+        }
+        if (execution.has_storage()) { devices.push_back(&*execution.storage); }
+        devices.push_back(auxiliary.get());
+        materialized = artifact::materialize(reader, load_plan.materialization(), devices,
+                                             progress.callback ? &progress : nullptr);
+    } else {
+        materialized = artifact::materialize(reader, load_plan.materialization(), execution,
+                                             progress.callback ? &progress : nullptr);
+    }
     const artifact::MaterializationStats stats = materialized.stats();
 
-    auto model = Target::construct_loaded_model(std::move(load_plan), std::move(materialized));
+    auto model = [&] {
+        if constexpr (std::is_same_v<Target, Qwen3_6_27B>) {
+            return Target::construct_loaded_model(std::move(load_plan), std::move(materialized),
+                                                  auxiliary);
+        } else {
+            return Target::construct_loaded_model(std::move(load_plan), std::move(materialized));
+        }
+    }();
     for (int rank = 0; rank < tp; ++rank) {
         execution.dev[static_cast<std::size_t>(rank)]->synchronize();
     }
@@ -225,6 +306,15 @@ ConstructedTarget construct_registered(const EngineOptions& options, ExecutionCo
         row.free_after_startup_bytes = current_free_device_bytes(row.device);
         row.total_bytes              = current_total_device_bytes(row.device);
     }
+    if (auxiliary) {
+        const auto slot = static_cast<std::size_t>(*auxiliary_slot);
+        DeviceMemoryReport& row = summary.devices[slot];
+        row.device = auxiliary->device;
+        row.weights_bytes = stats.per_device_capacity_bytes[slot];
+        row.reserved_bytes = row.weights_bytes;
+        row.free_after_startup_bytes = current_free_device_bytes(row.device);
+        row.total_bytes = current_total_device_bytes(row.device);
+    }
     summary.target               = std::string(target_key);
     summary.model_id             = identity.model_id;
     summary.weights_id           = identity.weights_id;
@@ -255,7 +345,7 @@ Qwen3_6_27BInstance::Qwen3_6_27BInstance(std::unique_ptr<LoadedQwen3_6_27B> stab
     : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
       request_memory(execution.primary(), sequence_plan.request_transient_capacity_bytes()),
       capacity(sequence_plan.capacity()),
-      program(Qwen3_6_27B::create_program(*loaded->model, std::move(sequence_plan), execution)) {}
+      program(Qwen3_6_27B::create_program(loaded->model, std::move(sequence_plan), execution)) {}
 
 Qwen3_6_27BInstance::~Qwen3_6_27BInstance() = default;
 

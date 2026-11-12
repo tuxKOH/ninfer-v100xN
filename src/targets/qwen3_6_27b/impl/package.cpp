@@ -111,22 +111,36 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
 
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
-    if (binder.device_count() != options.tp * options.pp) {
-        throw std::invalid_argument("artifact binder device count does not match tp * pp");
+    if (binder.execution_storage_device_count() != options.tp * options.pp) {
+        throw std::invalid_argument("artifact binder execution/storage count does not match tp * pp");
     }
     return LoadPlan(std::make_unique<LoadPlan::Impl>(
         weights_profile,
         detail::bind_artifact(binder, weights_profile, qwen3_6::startup_features(options),
-                              options.tp, options.pp),
+                              options.tp, options.pp, options.vision_gpu),
         options.tp));
 }
 
 std::unique_ptr<Package::LoadedModel>
-Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&& materialized) {
+Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&& materialized,
+                                std::shared_ptr<DeviceContext> auxiliary_context) {
     if (plan.impl_ == nullptr) { throw std::invalid_argument("target load plan is empty"); }
+    const auto& bindings = plan.impl_->plan.bindings;
+#ifdef NINFER_AUX_VISION_ARCH
+    constexpr int auxiliary_vision_arch = NINFER_AUX_VISION_ARCH;
+#else
+    constexpr int auxiliary_vision_arch = 86;
+#endif
+    if (bindings.auxiliary_vision_slot.has_value() != static_cast<bool>(auxiliary_context) ||
+        (auxiliary_context && (!bindings.auxiliary_vision_device ||
+                               auxiliary_context->device != *bindings.auxiliary_vision_device ||
+                               auxiliary_context->sm() != auxiliary_vision_arch))) {
+        throw std::invalid_argument("auxiliary Vision context does not match the load plan");
+    }
     auto impl = std::make_unique<LoadedModel::Impl>(plan.impl_->weights_profile,
                                                    std::move(plan.impl_->plan.bindings),
-                                                   std::move(materialized), plan.impl_->tp);
+                                                   std::move(materialized), plan.impl_->tp,
+                                                   std::move(auxiliary_context));
     plan.impl_.reset();
     return std::unique_ptr<LoadedModel>(new LoadedModel(std::move(impl)));
 }
@@ -151,20 +165,25 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
 }
 
 std::unique_ptr<Package::Program>
-Package::create_program(const LoadedModel& model, SequencePlan&& plan,
+Package::create_program(std::shared_ptr<const LoadedModel> model, SequencePlan&& plan,
                         ExecutionContext& execution) {
-    if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
-    const detail::LoadedModelData& data = model.impl_->data;
+    if (!model || model->impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
+    const detail::LoadedModelData& data = model->impl_->data;
     if (data.tp * data.pp != execution.device_count) {
         throw std::invalid_argument(
             "loaded model shard width does not match the execution context");
     }
     std::array<const detail::RuntimeModelView*, kMaximumExecutionDevices - 1> peers{};
     for (int rank = 1; rank < execution.device_count; ++rank) { peers[rank - 1] = &data.view(rank); }
+    std::optional<qwen3_6::AuxiliaryVision> auxiliary;
+    if (data.auxiliary_vision) {
+        auxiliary.emplace(qwen3_6::AuxiliaryVision{
+            data.auxiliary_vision->physical_device, &data.auxiliary_vision->weights, model});
+    }
     return qwen3_6::create_program<detail::Variant>(
         data.runtime, std::span(peers).first(execution.device_count - 1),
-                                                   model.impl_->weights_profile, std::move(plan),
-                                                   execution);
+        model->impl_->weights_profile, std::move(plan), execution,
+        auxiliary ? &*auxiliary : nullptr);
 }
 
 } // namespace ninfer::targets::qwen3_6_27b

@@ -41,6 +41,18 @@ int parse_device(const char* text) {
     return static_cast<int>(value);
 }
 
+int parse_vision_gpu(const char* text) {
+    const std::string_view input(text);
+    if (input.empty() || input.find_first_not_of("0123456789") != std::string_view::npos) {
+        throw std::invalid_argument(std::string("invalid vision-gpu: ") + text);
+    }
+    const std::uint64_t value = parse_u64(text, "vision-gpu");
+    if (value > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
+        throw std::invalid_argument(std::string("invalid vision-gpu: ") + text);
+    }
+    return static_cast<int>(value);
+}
+
 int parse_tp(const char* text) {
     const std::uint64_t value = parse_u64(text, "tp");
     if (value != 1 && value != 2 && value != 4) {
@@ -129,13 +141,14 @@ std::string usage_text(const char* argv0) {
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--ignore-eos]\n"
-           "       [--reasoning-effort low|medium|xhigh] [--vision] [--vision-device gpu|cpu] [--vision-max-tokens N]\n"
+           "       [--reasoning-effort low|medium|xhigh] [--vision] [--vision-device gpu|cpu] [--vision-gpu N] [--vision-max-tokens N]\n"
            "       [--no-cuda-graph]\n"
            "\n"
            "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
            "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
            "media sources may be local paths, HTTP(S) URLs, or base64 data URIs.\n"
            "--vision enables image/video input; --vision-device gpu (default) or cpu selects the encoder.\n"
+           "--vision-gpu N selects a separate logical CUDA ordinal; requires GPU Vision and backend support.\n"
            "--prefix-cache-tokens N: historical host KV budget, default 384000; 0 disables history.\n"
            "--volta-long-attention selects experimental complete-history SM70 TP2/TP4 INT8 attention (1..8 requests); floating-point output may differ.\n"
            "--volta-fast-decode selects experimental QUASAR TP2/TP4 Text NVFP4 FP32 epilogues and packed MTP W8; output may differ.\n"
@@ -266,6 +279,8 @@ Options parse_options(int argc, char** argv) {
             if (selected == "gpu") { options.vision_device = VisionDevice::Gpu; }
             else if (selected == "cpu") { options.vision_device = VisionDevice::Cpu; }
             else { throw std::invalid_argument("--vision-device must be gpu or cpu"); }
+        } else if (arg == "--vision-gpu") {
+            options.vision_gpu = parse_vision_gpu(value(arg));
         } else if (arg == "--vision-max-tokens") {
             options.vision_max_tokens = parse_u32(value(arg), "vision-max-tokens");
         } else if (arg == "--no-cuda-graph") {
@@ -344,6 +359,9 @@ Options parse_options(int argc, char** argv) {
     product::validate_speculative_cli_options(options.speculative);
     if (!options.enable_vision && options.vision_device == VisionDevice::Cpu) {
         throw std::invalid_argument("--vision-device cpu requires --vision");
+    }
+    if (options.vision_gpu && (!options.enable_vision || options.vision_device != VisionDevice::Gpu)) {
+        throw std::invalid_argument("--vision-gpu requires --vision and --vision-device gpu");
     }
     if (options.vision_max_tokens == 0 || options.vision_max_tokens > kMaximumVisionTokenBudget) {
         throw std::invalid_argument("--vision-max-tokens must be in [1,32768]");

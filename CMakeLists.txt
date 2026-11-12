@@ -18,7 +18,9 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
   if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13)
     message(FATAL_ERROR "Volta sm_70 requires CUDA 12.8; CUDA 13 removed Volta compilation")
   endif()
-  add_compile_definitions(NINFER_VOLTA_BUILD=1)
+  # The auxiliary Vision archive has its own architecture compilation target.
+  add_compile_definitions(
+    $<$<NOT:$<STREQUAL:$<TARGET_PROPERTY:NAME>,ninfer_vision_sm86>>:NINFER_VOLTA_BUILD=1>)
   include(FetchContent)
   set(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable only the header library")
   set(CUTLASS_ENABLE_TESTS OFF CACHE BOOL "Disable CUTLASS tests")
@@ -42,6 +44,17 @@ endif()
 option(NINFER_BUILD_APPS "Build the NInfer CLI and server" ON)
 option(BUILD_TESTING "Build NInfer tests" OFF)
 option(NINFER_BUILD_BENCHMARKS "Build NInfer benchmarks" OFF)
+set(NINFER_AUX_VISION_ARCH "" CACHE STRING
+  "Auxiliary Vision CUDA architecture (86 or 89); empty disables auxiliary Vision")
+set_property(CACHE NINFER_AUX_VISION_ARCH PROPERTY STRINGS "" 86 89)
+if(NOT NINFER_AUX_VISION_ARCH STREQUAL "")
+  if(NOT NINFER_AUX_VISION_ARCH MATCHES "^(86|89)$")
+    message(FATAL_ERROR "NINFER_AUX_VISION_ARCH must be empty, 86 or 89; got '${NINFER_AUX_VISION_ARCH}'")
+  endif()
+  if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+    message(FATAL_ERROR "NINFER_AUX_VISION_ARCH requires CMAKE_CUDA_ARCHITECTURES=70")
+  endif()
+endif()
 # CUDA device selection is a runtime concern. When set, CTest injects this value as
 # CUDA_VISIBLE_DEVICES so tests using logical devices 0/1 can run on a selected pair on
 # multi-GPU hosts without changing the product's device numbering or compile target.

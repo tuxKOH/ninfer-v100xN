@@ -10,6 +10,7 @@
 #include <limits>
 #include <span>
 #include <memory>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -34,21 +35,54 @@ std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment, const char*
     return checked_add(value, alignment - 1, label) / alignment * alignment;
 }
 
+class CurrentDeviceGuard {
+public:
+    CurrentDeviceGuard() { CUDA_CHECK(cudaGetDevice(&previous_)); }
+    ~CurrentDeviceGuard() { (void)cudaSetDevice(previous_); }
+private:
+    int previous_ = 0;
+};
+
+class LoadStreamGuard {
+public:
+    explicit LoadStreamGuard(std::span<DeviceContext* const> devices) : devices_(devices) {}
+    ~LoadStreamGuard() {
+        for (DeviceContext* device : devices_) {
+            (void)cudaSetDevice(device->device);
+            (void)cudaStreamSynchronize(device->load_stream);
+        }
+    }
+private:
+    std::span<DeviceContext* const> devices_;
+};
+
 // One staging buffer plus a completion event per destination device: a slot may only be refilled
 // once every device has finished reading it.
 class Slot {
 public:
     Slot(std::size_t bytes, std::span<DeviceContext* const> devices) : buffer(bytes) {
-        for (std::size_t i = 0; i < devices.size(); ++i) {
-            CUDA_CHECK(cudaSetDevice(devices[i]->device));
-            CUDA_CHECK(cudaEventCreateWithFlags(&events[i], cudaEventDisableTiming));
+        try {
+            for (std::size_t i = 0; i < devices.size(); ++i) {
+                devices_[i] = devices[i];
+                CUDA_CHECK(cudaSetDevice(devices[i]->device));
+                CUDA_CHECK(cudaEventCreateWithFlags(&events[i], cudaEventDisableTiming));
+            }
+        } catch (...) {
+            cleanup();
+            throw;
         }
     }
 
-    ~Slot() {
+    ~Slot() { cleanup(); }
+
+    void cleanup() noexcept {
         for (std::size_t i = 0; i < events.size(); ++i) {
-            if (pending[i]) { (void)cudaEventSynchronize(events[i]); }
+            if (devices_[i] == nullptr) { continue; }
+            (void)cudaSetDevice(devices_[i]->device);
+            // A copy can be queued before its completion event is recorded.
+            (void)cudaStreamSynchronize(devices_[i]->load_stream);
             if (events[i] != nullptr) { (void)cudaEventDestroy(events[i]); }
+            events[i] = nullptr;
         }
     }
 
@@ -64,6 +98,7 @@ public:
     PinnedHostBuffer buffer;
     std::array<cudaEvent_t, kMaximumDevices> events{};
     std::array<bool, kMaximumDevices> pending{};
+    std::array<DeviceContext*, kMaximumDevices> devices_{};
 };
 
 struct CopyRange {
@@ -108,9 +143,26 @@ struct MaterializedArtifact::VirtualMapping {
 };
 
 MaterializedArtifact::MaterializedArtifact() = default;
-MaterializedArtifact::~MaterializedArtifact() = default;
+MaterializedArtifact::~MaterializedArtifact() {
+    int previous = 0;
+    const bool restore = cudaGetDevice(&previous) == cudaSuccess;
+    virtual_mappings_.clear();
+    for (std::size_t i = 0; i < device_arena_.size(); ++i) {
+        if (device_arena_[i]) {
+            (void)cudaSetDevice(physical_devices_[i]);
+            device_arena_[i].reset();
+        }
+    }
+    if (restore) { (void)cudaSetDevice(previous); }
+}
 MaterializedArtifact::MaterializedArtifact(MaterializedArtifact&&) noexcept = default;
-MaterializedArtifact& MaterializedArtifact::operator=(MaterializedArtifact&&) noexcept = default;
+MaterializedArtifact& MaterializedArtifact::operator=(MaterializedArtifact&& other) noexcept {
+    if (this != &other) {
+        this->~MaterializedArtifact();
+        new (this) MaterializedArtifact(std::move(other));
+    }
+    return *this;
+}
 
 std::string driver_error(CUresult result) {
     const char* name = nullptr;
@@ -255,10 +307,26 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
                                  std::span<DeviceContext* const> devices, LoadProgress* progress) {
     const int device_count = plan.device_count;
     if (device_count < 1 || device_count > static_cast<int>(kMaximumDevices) ||
-        devices.size() < static_cast<std::size_t>(device_count)) {
-        throw ArtifactError("materialization plan and execution context disagree on device count");
+        devices.size() != static_cast<std::size_t>(device_count) ||
+        plan.execution_storage_device_count < 1 ||
+        plan.execution_storage_device_count > device_count ||
+        (plan.auxiliary_device
+             ? (*plan.auxiliary_device != plan.execution_storage_device_count ||
+                device_count != plan.execution_storage_device_count + 1)
+             : device_count != plan.execution_storage_device_count)) {
+        throw ArtifactError("materialization plan and device slots disagree");
     }
+    for (std::size_t i = 0; i < devices.size(); ++i) {
+        if (devices[i] == nullptr) { throw ArtifactError("null materialization device"); }
+        for (std::size_t j = 0; j < i; ++j) {
+            if (devices[i]->device == devices[j]->device) {
+                throw ArtifactError("materialization devices must be distinct");
+            }
+        }
+    }
+    CurrentDeviceGuard current_device;
     MaterializedArtifact out;
+    LoadStreamGuard load_streams(devices);
     out.objects_.resize(plan.object_count);
     out.stats_.device_count = device_count;
     for (int index = 0; index < device_count; ++index) {
@@ -292,18 +360,16 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
             checked_add(out.stats_.device_capacity_bytes, plan.device_capacity_bytes[slot],
                         "device capacity overflows u64");
     }
-    // One placement per (object, device); every device tensor has a device-0 placement, so
-    // counting those keeps `tensor_count` the number of distinct tensors at any tp.
-    out.stats_.tensor_count = static_cast<std::size_t>(
-        std::count_if(plan.device_objects.begin(), plan.device_objects.end(),
-                      [](const DeviceMaterialization& placement) { return placement.device == 0; }));
-    out.stats_.tensor_count += plan.virtual_objects.size();
+    std::vector<bool> counted(plan.object_count, false);
+    for (const auto& placement : plan.device_objects) { counted.at(placement.object.index) = true; }
+    for (const auto& placement : plan.virtual_objects) { counted.at(placement.object.index) = true; }
+    out.stats_.tensor_count = static_cast<std::size_t>(std::count(counted.begin(), counted.end(), true));
     out.stats_.resource_count = 0;
 
     for (const HostMaterialization& placement : plan.host_objects) {
         if (std::holds_alternative<ResourceDescriptor>(reader.objects().at(placement.object.index))) {
             ++out.stats_.resource_count;
-        } else { ++out.stats_.tensor_count; }
+        } else if (!counted.at(placement.object.index)) { ++out.stats_.tensor_count; }
         auto& resource            = out.objects_.at(placement.object.index).resource;
         const PayloadSpan payload = reader.payload(reader.objects().at(placement.object.index));
         resource.assign(payload.data.begin(), payload.data.end());
@@ -321,12 +387,16 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     // one full-shape pointer with the original plane offsets; each physical plane slice is fed by
     // its own device load stream, so the normal direct-I/O pipeline below remains unchanged.
     if (!plan.virtual_objects.empty()) {
+        if (plan.execution_storage_device_count != static_cast<int>(kVirtualStorageDevices)) {
+            throw ArtifactError("virtual materialization requires two execution/storage slots");
+        }
         CUDA_CHECK(cudaSetDevice(devices[0]->device));
     }
     for (const VirtualDeviceMaterialization& placement : plan.virtual_objects) {
         const PayloadSpan payload = reader.payload(reader.objects().at(placement.object.index));
-        auto mapping = create_virtual_mapping(placement, devices);
-        const CUdeviceptr base = mapping->base;
+        auto mapping = create_virtual_mapping(placement, devices.first(kVirtualStorageDevices));
+        out.virtual_mappings_.push_back(std::move(mapping));
+        const CUdeviceptr base = out.virtual_mappings_.back()->base;
         auto& object = out.objects_.at(placement.object.index);
         object.device[0]       = reinterpret_cast<void*>(base);
         object.device_bytes[0] = placement.virtual_bytes;
@@ -369,7 +439,6 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
                 total = checked_add(total, copy.bytes, "artifact tensor byte count overflows u64");
             }
         }
-        out.virtual_mappings_.push_back(std::move(mapping));
     }
 
     std::size_t range_count = ranges.size();
@@ -382,6 +451,9 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
         const auto slot           = static_cast<std::size_t>(placement.device);
         if (placement.device < 0 || placement.device >= device_count) {
             throw ArtifactError("materialization placement names a device outside the plan");
+        }
+        if (!out.device_arena_[slot]) {
+            throw ArtifactError("materialization placement has no device arena");
         }
         DeviceArena& arena = *out.device_arena_[slot];
         DeviceSpan storage = arena.alloc_bytes(static_cast<std::size_t>(placement.bytes),
@@ -569,9 +641,6 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     for (int index = 0; index < device_count; ++index) {
         CUDA_CHECK(cudaStreamSynchronize(devices[static_cast<std::size_t>(index)]->load_stream));
     }
-    // Leave the caller on the primary device: the copy loop above walked the device list, and the
-    // rest of the load path assumes the current device is still the one it set before calling.
-    if (device_count > 1) { CUDA_CHECK(cudaSetDevice(devices[0]->device)); }
     if (copied != total) {
         throw ArtifactError("direct materialization did not cover every tensor byte");
     }

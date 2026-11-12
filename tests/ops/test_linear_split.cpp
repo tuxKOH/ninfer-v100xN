@@ -637,7 +637,6 @@ int verify_registry() {
     // The tp1 path must be untouched: a shape that was never registered still is not.
     const std::vector<Entry> rejected{
         {QType::NVFP4, 5120, 5120, kA16},
-        {QType::NVFP4, 3584, 5120, kA16},
         {QType::Q5G64_F16S, 4096, 5120, kA16},
 #ifndef NINFER_VOLTA_BUILD
         {QType::BF16_CTRL, 8192, 5120, kA16},

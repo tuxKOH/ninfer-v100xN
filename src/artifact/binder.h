@@ -6,19 +6,21 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
 
 namespace ninfer::artifact {
 
-// Capacity agrees with core/device.h ExecutionContext; only active ranks are materialized.
+// Capacity includes execution, storage and auxiliary slots.
 inline constexpr std::size_t kMaximumDevices = 4;
 inline constexpr std::size_t kVirtualStorageDevices = 2;
 
 enum class TensorPlacement : std::uint8_t {
     Device,
     PrimaryDevice,
+    AuxiliaryDevice,
     Host,
     ValidateOnly,
 };
@@ -91,6 +93,8 @@ struct MaterializationPlan {
     std::size_t object_count = 0;
     // Devices this plan targets; device_capacity_bytes[d] is valid for d < device_count.
     int device_count = 1;
+    int execution_storage_device_count = 1;
+    std::optional<int> auxiliary_device;
     std::array<std::uint64_t, kMaximumDevices> device_capacity_bytes{};
     // Bytes assigned to ordinary DeviceArena placements.  Virtual placements contribute only to
     // device_capacity_bytes because their physical backing is allocated by the VMM mapper.
@@ -109,12 +113,18 @@ public:
     using ShardResolver = std::function<ShardPlacement(std::string_view)>;
     using DeviceMaskResolver = std::function<std::uint32_t(std::string_view)>;
 
-    explicit Binder(const Reader& reader, int device_count = 1, bool storage_only = false);
+    // device_count excludes the optional auxiliary slot, which must immediately follow it.
+    explicit Binder(const Reader& reader, int device_count = 1, bool storage_only = false,
+                    std::optional<int> auxiliary_device = std::nullopt);
 
-    // How many device arenas this binder plans for. A target that binds a shard map must check
-    // this against its own tp: a tp2 shard map fed to a one-device binder would place only device
-    // 0's half-shard and size the arena for half a model, with nothing else noticing.
+    // Total materialization slots, including the optional auxiliary slot.
     [[nodiscard]] int device_count() const noexcept { return materialization_.device_count; }
+    [[nodiscard]] int execution_storage_device_count() const noexcept {
+        return materialization_.execution_storage_device_count;
+    }
+    [[nodiscard]] std::optional<int> auxiliary_device() const noexcept {
+        return materialization_.auxiliary_device;
+    }
 
     // Optional companion packages (such as DFlash2) are allowed to live in the same artifact;
     // targets use this read-only probe to bind them only when the startup feature selects them.

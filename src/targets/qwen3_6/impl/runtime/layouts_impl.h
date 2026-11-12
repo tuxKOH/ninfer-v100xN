@@ -648,7 +648,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         }
     }
 
-    if (plan.features.vision && plan.features.vision_device == VisionDevice::Gpu) {
+    if (plan.features.vision && plan.features.vision_device == VisionDevice::Gpu &&
+        !plan.auxiliary_vision_device) {
         constexpr std::uint32_t kFrontendSegmentLimit = 768 / 2;
         const std::uint32_t merged = plan.vision_max_tokens;
         out.vision_encode          = schedule::VisionContext::workspace_capacity_bytes(
@@ -680,6 +681,10 @@ std::uint32_t validate_target_options(DeviceContext& device, const EngineOptions
     }
     if (!options.enable_vision && options.vision_device != VisionDevice::Gpu) {
         throw std::invalid_argument("CPU Vision requires enable_vision");
+    }
+    if (options.vision_gpu && (!options.enable_vision || options.vision_device != VisionDevice::Gpu ||
+                               *options.vision_gpu < 0)) {
+        throw std::invalid_argument("auxiliary Vision requires an enabled GPU Vision device");
     }
     if (options.volta_long_attention &&
         (TextConfig::query_heads != 24 || device.sm() != 70 || (options.tp != 2 && options.tp != 4) || options.pp != 1 ||
@@ -806,6 +811,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->weights_profile     = inputs.weights_profile;
     impl->capacity            = inputs.capacity;
     impl->vision_max_tokens   = inputs.vision_max_tokens;
+    impl->auxiliary_vision_device = inputs.auxiliary_vision_device;
     impl->main_page_groups    = main_page_groups;
     impl->kv_capacity         = static_cast<std::uint32_t>(checked_i32(
         static_cast<std::uint64_t>(main_page_groups) * static_cast<std::uint32_t>(kPagedKVPageSize),
@@ -948,6 +954,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .weights_profile     = weights_profile,
         .capacity            = options.max_context,
         .vision_max_tokens   = std::min(options.max_context, options.vision_max_tokens),
+        .auxiliary_vision_device = options.vision_gpu,
         .max_concurrency     = options.max_concurrency,
         .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
         .draft_window        = options.speculative.draft_tokens,

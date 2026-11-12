@@ -6,8 +6,16 @@
 #include <ninfer/targets/qwen3_6/vision_control.h>
 
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
+#include "targets/qwen3_6/impl/vision/host.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <exception>
+#include <future>
+#include <memory>
+#include <thread>
 #include <cstdint>
 #include <iostream>
 #include <string_view>
@@ -282,6 +290,151 @@ void test_prefix_identity() {
            "truncated multimodal continuation identity");
 }
 
+q36::PreparedPromptData host_cache_prompt(std::uint8_t digest) {
+    q36::PreparedPromptData prompt;
+    prompt.token_ids = {248056};
+    prompt.token_types = {static_cast<std::uint8_t>(q36::PromptModality::Image)};
+    prompt.prepare.raw_patches = 4;
+    prompt.prepare.vision_tokens = 1;
+    q36::VisionItem item{.modality = q36::PromptModality::Image,
+                         .grid = {1, 2, 2},
+                         .patch_begin = 0,
+                         .patch_count = 4,
+                         .token_spans = {{.begin = 0, .count = 1}}};
+    item.content_digest.fill(digest);
+    prompt.vision_items.push_back(std::move(item));
+    auto payload = std::make_shared<q36::PreparedMediaPayload>();
+    payload->patches = std::make_unique<std::uint16_t[]>(1);
+    payload->patch_elements = 1;
+    prompt.media_payloads.push_back(std::move(payload));
+    return prompt;
+}
+
+void test_host_cache_concurrent_misses() {
+    q36::HostVisionCache cache;
+    std::array<q36::PreparedPromptData, 2> prompts{host_cache_prompt(1), host_cache_prompt(1)};
+    std::array<std::exception_ptr, 2> errors;
+    std::promise<void> first_started, second_started, release;
+    auto first_ready = first_started.get_future();
+    auto second_ready = second_started.get_future();
+    auto released = release.get_future().share();
+    std::atomic<int> calls{0};
+    const auto run = [&](std::size_t index) {
+        try {
+            cache.prepare_with(prompts[index], {}, 2,
+                [&](std::span<const std::uint16_t>, const q36::VisionItemControl&,
+                    const ninfer::PreparationControl&) {
+                    ++calls;
+                    (index == 0 ? first_started : second_started).set_value();
+                    released.wait();
+                    return std::make_shared<const std::vector<std::uint16_t>>(2, index + 1);
+                });
+        } catch (...) { errors[index] = std::current_exception(); }
+    };
+    std::thread first(run, 0);
+    const bool first_entered = first_ready.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    std::thread second(run, 1);
+    const bool second_entered = second_ready.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    release.set_value();
+    first.join();
+    second.join();
+    expect(first_entered && second_entered && !errors[0] && !errors[1] && calls == 2,
+           "duplicate host cache misses must be allowed to encode concurrently");
+    if (errors[0] || errors[1] || prompts[0].host_vision_embeddings.empty() ||
+        prompts[1].host_vision_embeddings.empty()) { return; }
+    const auto winner = prompts[0].host_vision_embeddings[0];
+    expect(winner == prompts[1].host_vision_embeddings[0],
+           "duplicate misses must publish the same cached embedding");
+    auto hit = host_cache_prompt(1);
+    hit.media_payloads.clear();
+    cache.prepare_with(hit, {}, 2,
+        [&](std::span<const std::uint16_t>, const q36::VisionItemControl&,
+            const ninfer::PreparationControl&) {
+            ++calls;
+            return std::make_shared<const std::vector<std::uint16_t>>(2, 0);
+        });
+    expect(calls == 2 && hit.host_vision_embeddings[0] == winner,
+           "host cache hit must reuse the winning embedding without patches");
+}
+
+void test_host_cache_eviction_preserves_live_output() {
+    q36::HostVisionCache cache;
+    constexpr std::size_t hidden = 24ULL << 20;
+    int calls = 0;
+    const auto encode = [&](std::span<const std::uint16_t>, const q36::VisionItemControl&,
+                            const ninfer::PreparationControl&) {
+        ++calls;
+        return std::make_shared<const std::vector<std::uint16_t>>(hidden, calls);
+    };
+    auto first = host_cache_prompt(1);
+    auto second = host_cache_prompt(2);
+    auto third = host_cache_prompt(3);
+    cache.prepare_with(first, {}, hidden, encode);
+    cache.prepare_with(second, {}, hidden, encode);
+    cache.prepare_with(third, {}, hidden, encode);
+    auto retained = first.host_vision_embeddings[0];
+    std::weak_ptr<const std::vector<std::uint16_t>> old_output = retained;
+    expect(retained->front() == 1 && retained->back() == 1,
+           "eviction must not invalidate a request-owned embedding");
+    auto again = host_cache_prompt(1);
+    cache.prepare_with(again, {}, hidden, encode);
+    expect(calls == 4 && again.host_vision_embeddings[0] != retained &&
+               again.host_vision_embeddings[0]->front() == 4 && retained->front() == 1,
+           "FIFO eviction must cause a new encode while the old output remains live");
+    first.host_vision_embeddings.clear();
+    retained.reset();
+    expect(old_output.expired(), "evicted embedding must be released with its last request owner");
+}
+
+void test_host_cache_oversized_output() {
+    q36::HostVisionCache cache;
+    constexpr std::size_t hidden = (64ULL << 20) + 1;
+    int calls = 0;
+    const auto encode = [&](std::span<const std::uint16_t>, const q36::VisionItemControl&,
+                            const ninfer::PreparationControl&) {
+        ++calls;
+        return std::make_shared<const std::vector<std::uint16_t>>(hidden, calls);
+    };
+    auto first = host_cache_prompt(4);
+    cache.prepare_with(first, {}, hidden, encode);
+    std::weak_ptr<const std::vector<std::uint16_t>> output = first.host_vision_embeddings[0];
+    first.host_vision_embeddings.clear();
+    expect(output.expired(), "output larger than cache capacity must not be retained");
+    auto second = host_cache_prompt(4);
+    cache.prepare_with(second, {}, hidden, encode);
+    expect(calls == 2 && second.host_vision_embeddings[0]->front() == 2,
+           "output larger than cache capacity must be encoded on each request");
+}
+
+void test_host_cache_cancellation() {
+    q36::HostVisionCache cache;
+    auto prompt = host_cache_prompt(1);
+    std::atomic<bool> cancelled{false};
+    ninfer::PreparationControl control{
+        .deadline = {},
+        .cancellation = ninfer::CancellationView([&] { return cancelled.load(); }),
+    };
+    int calls = 0;
+    const auto encode = [&](std::span<const std::uint16_t>, const q36::VisionItemControl&,
+                            const ninfer::PreparationControl&) {
+        ++calls;
+        cancelled = true;
+        return std::make_shared<const std::vector<std::uint16_t>>(2, 7);
+    };
+    bool interrupted = false;
+    try {
+        cache.prepare_with(prompt, control, 2, encode);
+    } catch (const ninfer::RequestError& error) {
+        interrupted = error.kind() == ninfer::RequestErrorKind::Cancelled;
+    }
+    expect(interrupted && prompt.host_vision_embeddings.empty(),
+           "cancellation after encoding must not publish request embeddings");
+    cancelled = false;
+    cache.prepare_with(prompt, {}, 2, encode);
+    expect(calls == 2 && prompt.host_vision_embeddings[0]->front() == 7,
+           "cancelled encoding must not publish a cache entry");
+}
+
 } // namespace
 
 int main() {
@@ -290,6 +443,10 @@ int main() {
     test_round_layout();
     test_mtp_alignment();
     test_vision_control();
+    test_host_cache_concurrent_misses();
+    test_host_cache_eviction_preserves_live_output();
+    test_host_cache_oversized_output();
+    test_host_cache_cancellation();
     test_prefix_identity();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 runtime mechanism checks failed\n";

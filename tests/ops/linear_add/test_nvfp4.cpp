@@ -86,12 +86,16 @@ int verify_preserved(const GuardedDeviceBuffer& device, std::span<const std::uin
     return 1;
 }
 
-int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
+int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed, bool prepacked = false) {
     int device = 0;
     cudaDeviceProp properties{};
     cuda_check(cudaGetDevice(&device), "get CUDA device for NVFP4 linear_add");
     cuda_check(cudaGetDeviceProperties(&properties, device), "query NVFP4 linear_add device");
+#if defined(NINFER_VOLTA_BUILD) || defined(NINFER_SM8X_COMPAT)
+    const bool supports_a4 = false;
+#else
     const bool supports_a4 = properties.major >= 12;
+#endif
     const std::int32_t first_a4 = (k == 6144 || k == 3072) ? 7 : 8;
     const std::array invocations{
         Invocation{1, ops::LinearPolicy::A16Only},
@@ -99,6 +103,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         Invocation{5, ops::LinearPolicy::A16Only},
         Invocation{32, ops::LinearPolicy::A16Only},
         Invocation{33, ops::LinearPolicy::A16Only},
+        Invocation{64, ops::LinearPolicy::A16Only},
         Invocation{1024, ops::LinearPolicy::A16Only},
         Invocation{first_a4, ops::LinearPolicy::AllowA4},
         Invocation{17, ops::LinearPolicy::AllowA4},
@@ -118,12 +123,17 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
 
     GuardedDeviceBuffer device_activation(activation.size() * sizeof(std::uint16_t));
     device_activation.copy_from_host(activation.data(), device_activation.bytes());
-    GuardedDeviceBuffer device_weight(host_weight.payload.size());
-    device_weight.copy_from_host(host_weight.payload.data(), host_weight.payload.size());
-    const Weight weight = host_weight.device_weight(device_weight.data());
+    const std::vector<std::uint8_t> weight_payload = prepacked
+        ? quantized_weight::nvfp4_qpn_payload(host_weight) : host_weight.payload;
+    GuardedDeviceBuffer device_weight(weight_payload.size());
+    device_weight.copy_from_host(weight_payload.data(), weight_payload.size());
+    Weight weight = host_weight.device_weight(device_weight.data());
+    if (prepacked) { weight.layout = QuantLayout::VoltaQpnPrepacked; }
 
     int failures = 0;
     for (const Invocation invocation : invocations) {
+        if (prepacked && (invocation.policy != ops::LinearPolicy::A16Only ||
+                          (invocation.tokens != 33 && invocation.tokens != 64))) { continue; }
         if (invocation.policy == ops::LinearPolicy::AllowA4 && !supports_a4) { continue; }
         const std::size_t output_words = static_cast<std::size_t>(n) * invocation.tokens;
         GuardedDeviceBuffer output(output_words * sizeof(std::uint16_t));
@@ -139,9 +149,13 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         const bool a4           = invocation.policy == ops::LinearPolicy::AllowA4;
         const std::string label = "NVFP4 linear_add [" + std::to_string(n) + "," +
                                   std::to_string(k) + "] " + (a4 ? "A4" : "A16") +
-                                  " T=" + std::to_string(invocation.tokens);
-        if (workspace.peak_used() != capacity) {
-            std::cerr << label << ": workspace query/execution high-water mismatch\n";
+                                  " T=" + std::to_string(invocation.tokens) +
+                                  (prepacked ? " prepacked" : " canonical");
+        const std::size_t interval_capacity = ops::linear_add_workspace_capacity_bytes(
+            QType::NVFP4, n, k, invocation.policy, 1, invocation.tokens);
+        if (workspace.used() != 0 || workspace.peak_used() > capacity ||
+            interval_capacity < capacity) {
+            std::cerr << label << ": workspace capacity is insufficient\n";
             ++failures;
         }
         failures += output.verify_guards(label);
@@ -180,7 +194,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(activation.data()),
                                       activation.size() * sizeof(std::uint16_t)),
         "NVFP4 linear_add activation");
-    failures += verify_preserved(device_weight, host_weight.payload, "NVFP4 linear_add weight");
+    failures += verify_preserved(device_weight, weight_payload, "NVFP4 linear_add weight");
     return failures;
 }
 
@@ -196,6 +210,10 @@ int main() {
     failures += run_shape(5120, 17408, 821U);
     failures += run_shape(5120, 3072, 823U);
     failures += run_shape(5120, 8704, 827U);
+#ifdef NINFER_VOLTA_BUILD
+    failures += run_shape(5120, 3072, 823U, true);
+    failures += run_shape(5120, 8704, 827U, true);
+#endif
 #ifdef NINFER_VOLTA_BUILD
     failures += run_shape(5120, 1536, 829U);
     failures += run_shape(5120, 4352, 831U);

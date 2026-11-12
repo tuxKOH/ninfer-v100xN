@@ -42,7 +42,7 @@ struct VisionScheduleConfig {
 
 class VisionContext {
 public:
-    VisionContext(DeviceContext& device, const LoadedModelData& model);
+    VisionContext(DeviceContext& device, const LoadedModelData& model, bool auxiliary);
 
     [[nodiscard]] static std::size_t output_transient_bytes(std::size_t merged_tokens);
     [[nodiscard]] static std::size_t workspace_bytes(const qwen3_6::VisionItemControl& item);
@@ -95,7 +95,8 @@ class VisionPrefillSession {
 public:
     VisionPrefillSession(DeviceContext& device, const LoadedModelData& model,
                          WorkspaceArena& workspace, qwen3_6::PreparedPromptData& prompt,
-                         const VisionPrefillPlan& plan, runtime::TransientRegion transient);
+                         const VisionPrefillPlan& plan, runtime::TransientRegion transient,
+                         bool auxiliary);
 
     [[nodiscard]] VisionChunk prepare_chunk(std::uint32_t begin, std::uint32_t nominal_length);
     void release_encoded_media_payloads() noexcept;
@@ -107,6 +108,7 @@ private:
     qwen3_6::PreparedPromptData& prompt_;
     const VisionPrefillPlan& plan_;
     runtime::TransientRegion transient_;
+    bool auxiliary_;
     VisionContext context_;
     std::optional<std::uint32_t> active_item_;
     std::vector<std::uint32_t> encoded_payloads_pending_release_;

@@ -1,5 +1,7 @@
 #include "ops/linear/linear_test_common.h"
 
+#include <cuda_runtime.h>
+
 #include <array>
 #include <exception>
 #include <iostream>
@@ -84,6 +86,11 @@ int run_fp8_a8() {
     failures += run_shape("FP8_A8", ActivationCompute::A8, make_fp8_weight,
                           {5120, 8704, 863U, Comparison::Sampled, true,
                            residual17408_shard_invocations});
+    return failures;
+}
+
+int check_workspace_planner() {
+    int failures = 0;
 
     struct Problem {
         std::int32_t rows;
@@ -124,10 +131,15 @@ int run_fp8_a8() {
         const std::size_t a16 = ops::linear_workspace_capacity_bytes(
             QType::FP8_E4M3FN_ROW_BF16S, problem.rows, problem.input_rows,
             ops::LinearPolicy::A16Only, 1, 2048);
+#ifdef NINFER_VOLTA_BUILD
+        const bool a16_valid = a16 != 0;
+#else
+        const bool a16_valid = a16 == 0;
+#endif
         if ((one != 0) != problem.a8_at_one || (two != 0) != problem.a8_at_two ||
             early_interval != 0 || forty_eight <= two || hot_interval != forty_eight ||
             exact_1024 <= forty_eight || exact_1048 <= exact_1024 || spanning != exact_1048 ||
-            a16 != 0) {
+            !a16_valid) {
             std::cerr << "FP8 A8 workspace interval contract mismatch for N=" << problem.rows
                       << " K=" << problem.input_rows << '\n';
             ++failures;
@@ -139,11 +151,28 @@ int run_fp8_a8() {
 } // namespace
 
 int main() {
-    if (!ninfer::test::linear::cuda_available()) {
-        std::cout << "SKIP: no usable CUDA device\n";
-        return 77;
-    }
     try {
+        if (check_workspace_planner() != 0) { return 1; }
+        if (!ninfer::test::linear::cuda_available()) {
+            std::cout << "SKIP: no usable CUDA device\n";
+            return 77;
+        }
+#if defined(NINFER_VOLTA_BUILD) || defined(NINFER_SM8X_COMPAT)
+        std::cout << "SKIP: FP8 A8 kernels are not included in this build\n";
+        return 77;
+#else
+        int device = 0;
+        cudaDeviceProp properties{};
+        if (cudaGetDevice(&device) != cudaSuccess ||
+            cudaGetDeviceProperties(&properties, device) != cudaSuccess) {
+            std::cerr << "FP8 A8 Linear: failed to query CUDA device\n";
+            return 1;
+        }
+        if (properties.major < 8 || (properties.major == 8 && properties.minor < 9)) {
+            std::cout << "SKIP: FP8 A8 requires SM89 or newer\n";
+            return 77;
+        }
+#endif
         const int failures = run_fp8_a8();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " FP8 A8 Linear\n";
         return failures == 0 ? 0 : 1;

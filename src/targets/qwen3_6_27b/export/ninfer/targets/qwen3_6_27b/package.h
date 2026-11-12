@@ -105,14 +105,15 @@ struct Package {
     [[nodiscard]] static LoadPlan plan_load(artifact::Binder& binder, const EngineOptions& options,
                                             WeightsProfile weights_profile);
     [[nodiscard]] static std::unique_ptr<LoadedModel>
-    construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&& materialized);
+    construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&& materialized,
+                           std::shared_ptr<DeviceContext> auxiliary_context = {});
     [[nodiscard]] static Frontend make_frontend(const LoadedModel& model,
                                                 const EngineOptions& options);
     [[nodiscard]] static SequencePlanner make_sequence_planner(DeviceContext& device,
                                                                const EngineOptions& options,
                                                                WeightsProfile weights_profile);
     [[nodiscard]] static std::unique_ptr<Program>
-    create_program(const LoadedModel& model, SequencePlan&& plan, ExecutionContext& execution);
+    create_program(std::shared_ptr<const LoadedModel> model, SequencePlan&& plan, ExecutionContext& execution);
 };
 
 } // namespace targets::qwen3_6_27b

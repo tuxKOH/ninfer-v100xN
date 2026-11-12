@@ -154,6 +154,9 @@ struct EngineOptions {
     bool enable_vision                     = false;
     // CPU keeps the complete visual encoder in host RAM; only embeddings reach the GPU.
     VisionDevice vision_device             = VisionDevice::Gpu;
+    // Optional logical CUDA ordinal for a separate GPU Vision encoder.
+    // Requires enable_vision and VisionDevice::Gpu; absent uses the primary GPU.
+    std::optional<int> vision_gpu;
     // Aggregate merged visual tokens per prompt; startup Vision scratch and transient allocations
     // use min(max_context, vision_max_tokens), independent of the text context ceiling.
     std::uint32_t vision_max_tokens         = kMaximumVisionTokenBudget;

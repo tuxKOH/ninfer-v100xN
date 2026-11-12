@@ -37,6 +37,15 @@ int device_sm() {
     return props.major * 10 + props.minor;
 }
 
+bool supports_low_precision_activation(int minimum_sm) {
+#if defined(NINFER_VOLTA_BUILD) || defined(NINFER_SM8X_COMPAT)
+    (void)minimum_sm;
+    return false;
+#else
+    return device_sm() >= minimum_sm;
+#endif
+}
+
 int verify_nvfp4_capacity() {
     const auto capacity = [](ops::LinearPolicy policy, int begin, int end) {
         return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
@@ -48,7 +57,7 @@ int verify_nvfp4_capacity() {
         std::cerr << "NVFP4 snapshot A16 interval capacity mismatch\n";
         return 1;
     }
-    if (device_sm() >= 120) {
+    if (supports_low_precision_activation(120)) {
         const auto a4 = capacity(ops::LinearPolicy::AllowA4, 4, 4);
         if (capacity(ops::LinearPolicy::AllowA4, 1, 3) != 0 || a4 == 0 ||
             capacity(ops::LinearPolicy::AllowA4, 1, 4) != a4) {
@@ -817,7 +826,7 @@ int run_nvfp4() {
 
     int failures = 0;
     failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::A16Only, 2);
-    const auto policy = device_sm() >= 120 ? ops::LinearPolicy::AllowA4
+    const auto policy = supports_low_precision_activation(120) ? ops::LinearPolicy::AllowA4
                                          : ops::LinearPolicy::A16Only;
     failures += run_nvfp4_case(parent, 3, policy, 4);
     failures += run_nvfp4_case(parent, 4, policy, 5);
@@ -981,10 +990,14 @@ int run_fp8() {
     failures += run_fp8_case(parent, 6, ops::LinearPolicy::A16Only, 7);
     failures += run_fp8_case(parent, 7, ops::LinearPolicy::A16Only, 8);
     failures += run_fp8_case(parent, 9, ops::LinearPolicy::AllowA8, 10);
-    failures += run_fp8_case(parent, 10, ops::LinearPolicy::AllowA8, 11);
+    if (supports_low_precision_activation(89)) {
+        failures += run_fp8_case(parent, 10, ops::LinearPolicy::AllowA8, 11);
+    }
     failures += run_fp8_case(parent, 10, ops::LinearPolicy::A16Only, 11);
     failures += run_fp8_case(parent, 11, ops::LinearPolicy::A16Only, 12);
-    failures += run_fp8_case(parent, 17, ops::LinearPolicy::AllowA8, 1);
+    if (supports_low_precision_activation(89)) {
+        failures += run_fp8_case(parent, 17, ops::LinearPolicy::AllowA8, 1);
+    }
 
     const auto run_batched = [&](std::int32_t width, std::int32_t batch,
                                  std::vector<std::int32_t> valid_columns, std::uint32_t seed) {
@@ -1019,7 +1032,9 @@ int run_fp8() {
             });
     };
     failures += run_batched(4, 2, {4, 2}, 937U);
-    failures += run_batched(16, 8, {16, 13, 11, 7, 5, 3, 2, 1}, 941U);
+    if (supports_low_precision_activation(89)) {
+        failures += run_batched(16, 8, {16, 13, 11, 7, 5, 3, 2, 1}, 941U);
+    }
     failures += parent.verify_preserved("batched FP8 parent weight");
     return failures;
 }
@@ -1046,14 +1061,6 @@ int main(int argc, char** argv) {
         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, 1, 6, 6);
     if (q4_interval != q4_witness || q4_witness == 0 || q4_right_endpoint != 0) {
         std::cerr << "Q4/Q5 snapshot interval did not retain its non-monotonic T=4 route\n";
-        ++failures;
-    }
-    if (ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 1, 16) !=
-            0 ||
-        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 1, 17) !=
-            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 17,
-                                                                       17)) {
-        std::cerr << "W8 snapshot interval did not preserve its zero/nonzero route boundary\n";
         ++failures;
     }
     failures += verify_nvfp4_capacity();

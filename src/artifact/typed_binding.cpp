@@ -175,6 +175,10 @@ ObjectHandle bind_tensor(Binder& binder, std::string_view name, NumericFormat fo
         // Whole tensor on the primary rank. Reuses the storage-mode primitive instead of a
         // second placement entry point.
         binder.materialize_on_device(handle, 0);
+    } else if (placement == TensorPlacement::AuxiliaryDevice) {
+        const auto slot = binder.auxiliary_device();
+        if (!slot) { throw ArtifactError("auxiliary tensor placement requires an auxiliary device"); }
+        binder.materialize_on_device(handle, *slot);
     } else if (placement == TensorPlacement::Host) {
         binder.materialize_on_host(handle);
     } else {

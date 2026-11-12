@@ -92,64 +92,65 @@ VisionMergerNormPlan bind_vision_merger_norm(artifact::Binder& binder,
 VisionCommonWeights materialize_vision_common(const artifact::MaterializedArtifact& materialized,
                                               const VisionBackbonePlan& backbone,
                                               const VisionMergerInputPlan& merger_input,
-                                              const VisionMergerNormPlan& merger_norm) {
+                                              const VisionMergerNormPlan& merger_norm,
+                                              int device) {
     using artifact::NumericFormat;
 
     VisionCommonWeights out;
     out.patch_embedding = artifact::materialized_weight(
         materialized, backbone.patch_embedding, NumericFormat::Q6G64_F16S,
-        VisionBackboneConfig::hidden, VisionBackboneConfig::patch_dim);
+        VisionBackboneConfig::hidden, VisionBackboneConfig::patch_dim, device);
     out.patch_embedding_bias =
         artifact::materialized_tensor(materialized, backbone.patch_embedding_bias,
-                                      NumericFormat::BF16, {VisionBackboneConfig::hidden});
+                                      NumericFormat::BF16, {VisionBackboneConfig::hidden}, device);
     out.position_embedding = artifact::materialized_tensor(
         materialized, backbone.position_embedding, NumericFormat::BF16,
-        {VisionBackboneConfig::hidden, VisionBackboneConfig::position_embeddings});
+        {VisionBackboneConfig::hidden, VisionBackboneConfig::position_embeddings}, device);
 
     for (std::size_t layer = 0; layer < out.layers.size(); ++layer) {
         const VisionLayerPlan& source = backbone.layers[layer];
         VisionLayerWeights& target    = out.layers[layer];
         target.qkv                    = artifact::materialized_weight(
             materialized, source.qkv, NumericFormat::Q4G64_F16S, 3 * VisionBackboneConfig::hidden,
-            VisionBackboneConfig::hidden);
+            VisionBackboneConfig::hidden, device);
         target.qkv_bias = artifact::materialized_tensor(
-            materialized, source.qkv_bias, NumericFormat::BF16, {3 * VisionBackboneConfig::hidden});
+            materialized, source.qkv_bias, NumericFormat::BF16, {3 * VisionBackboneConfig::hidden}, device);
         target.output = artifact::materialized_weight(
             materialized, source.output, NumericFormat::Q5G64_F16S, VisionBackboneConfig::hidden,
-            VisionBackboneConfig::hidden);
+            VisionBackboneConfig::hidden, device);
         target.output_bias = artifact::materialized_tensor(
-            materialized, source.output_bias, NumericFormat::BF16, {VisionBackboneConfig::hidden});
+            materialized, source.output_bias, NumericFormat::BF16, {VisionBackboneConfig::hidden}, device);
         target.fc1 = artifact::materialized_weight(
             materialized, source.fc1, NumericFormat::Q4G64_F16S, VisionBackboneConfig::intermediate,
-            VisionBackboneConfig::hidden);
+            VisionBackboneConfig::hidden, device);
         target.fc1_bias =
             artifact::materialized_tensor(materialized, source.fc1_bias, NumericFormat::BF16,
-                                          {VisionBackboneConfig::intermediate});
+                                          {VisionBackboneConfig::intermediate}, device);
         target.fc2 = artifact::materialized_weight(
             materialized, source.fc2, NumericFormat::Q5G64_F16S, VisionBackboneConfig::hidden,
-            VisionBackboneConfig::intermediate);
+            VisionBackboneConfig::intermediate, device);
         target.fc2_bias = artifact::materialized_tensor(
-            materialized, source.fc2_bias, NumericFormat::BF16, {VisionBackboneConfig::hidden});
+            materialized, source.fc2_bias, NumericFormat::BF16, {VisionBackboneConfig::hidden}, device);
         target.norm1_weight = artifact::materialized_tensor(
-            materialized, source.norm1_weight, NumericFormat::BF16, {VisionBackboneConfig::hidden});
+            materialized, source.norm1_weight, NumericFormat::BF16, {VisionBackboneConfig::hidden}, device);
         target.norm1_bias = artifact::materialized_tensor(
-            materialized, source.norm1_bias, NumericFormat::BF16, {VisionBackboneConfig::hidden});
+            materialized, source.norm1_bias, NumericFormat::BF16, {VisionBackboneConfig::hidden}, device);
         target.norm2_weight = artifact::materialized_tensor(
-            materialized, source.norm2_weight, NumericFormat::BF16, {VisionBackboneConfig::hidden});
+            materialized, source.norm2_weight, NumericFormat::BF16, {VisionBackboneConfig::hidden}, device);
         target.norm2_bias = artifact::materialized_tensor(
-            materialized, source.norm2_bias, NumericFormat::BF16, {VisionBackboneConfig::hidden});
+            materialized, source.norm2_bias, NumericFormat::BF16, {VisionBackboneConfig::hidden}, device);
     }
 
     out.merger_fc1 = artifact::materialized_weight(
         materialized, merger_input.fc1, NumericFormat::W8G32_F16S,
-        VisionBackboneConfig::merger_hidden, VisionBackboneConfig::merger_hidden);
+        VisionBackboneConfig::merger_hidden, VisionBackboneConfig::merger_hidden, device);
     out.merger_fc1_bias =
         artifact::materialized_tensor(materialized, merger_input.fc1_bias, NumericFormat::BF16,
-                                      {VisionBackboneConfig::merger_hidden});
+                                      {VisionBackboneConfig::merger_hidden}, device);
     out.merger_norm_weight = artifact::materialized_tensor(
-        materialized, merger_norm.weight, NumericFormat::BF16, {VisionBackboneConfig::hidden});
+        materialized, merger_norm.weight, NumericFormat::BF16, {VisionBackboneConfig::hidden}, device);
     out.merger_norm_bias = artifact::materialized_tensor(
-        materialized, merger_norm.bias, NumericFormat::BF16, {VisionBackboneConfig::hidden});
+        materialized, merger_norm.bias, NumericFormat::BF16, {VisionBackboneConfig::hidden}, device);
     return out;
 }
 

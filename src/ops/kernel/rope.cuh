@@ -98,7 +98,7 @@ __device__ __forceinline__ void fixed_sincos(const std::int32_t* positions, int 
     }
 }
 
-template <int HeadDim, int Half>
+template <int HeadDim, int Half, bool Aligned = true>
 __device__ __forceinline__ void apply_rope_head(__nv_bfloat16* data, std::int64_t token_stride,
                                                 int head, int token, int lane, float c0, float c1,
                                                 float s0, float s1) {
@@ -106,6 +106,18 @@ __device__ __forceinline__ void apply_rope_head(__nv_bfloat16* data, std::int64_
     if (lane >= kHalfPair) { return; }
     const std::int64_t base =
         static_cast<std::int64_t>(token) * token_stride + static_cast<std::int64_t>(head) * HeadDim;
+    if constexpr (!Aligned) {
+        const int pair = lane * 2;
+        const float a0 = __bfloat162float(data[base + pair]);
+        const float a1 = __bfloat162float(data[base + pair + 1]);
+        const float b0 = __bfloat162float(data[base + pair + Half]);
+        const float b1 = __bfloat162float(data[base + pair + Half + 1]);
+        data[base + pair] = __float2bfloat16_rn(a0 * c0 - b0 * s0);
+        data[base + pair + 1] = __float2bfloat16_rn(a1 * c1 - b1 * s1);
+        data[base + pair + Half] = __float2bfloat16_rn(b0 * c0 + a0 * s0);
+        data[base + pair + Half + 1] = __float2bfloat16_rn(b1 * c1 + a1 * s1);
+        return;
+    }
     auto* data2         = reinterpret_cast<__nv_bfloat162*>(data + base);
     const float2 first  = __bfloat1622float2(data2[lane]);
     const float2 second = __bfloat1622float2(data2[lane + kHalfPair]);
@@ -182,7 +194,7 @@ __global__ void rope_yarn_text_kernel(const std::int32_t* positions, __nv_bfloat
     }
 }
 
-template <RopeKernelMode Mode, int QHeads, int KHeads>
+template <RopeKernelMode Mode, int QHeads, int KHeads, bool Aligned = true>
 __global__ void rope_fixed_kernel(const std::int32_t* positions, __nv_bfloat16* q, __nv_bfloat16* k,
                                   std::int32_t tokens, std::int64_t q_token_stride,
                                   std::int64_t k_token_stride) {
@@ -216,11 +228,11 @@ __global__ void rope_fixed_kernel(const std::int32_t* positions, __nv_bfloat16* 
     }
     for (int combined_head = warp; combined_head < QHeads + KHeads; combined_head += block_warps) {
         if (combined_head < QHeads) {
-            apply_rope_head<kHeadDim, kHalf>(q, q_token_stride, combined_head, token, lane, c0, c1,
-                                             s0, s1);
+            apply_rope_head<kHeadDim, kHalf, Aligned>(q, q_token_stride, combined_head, token, lane,
+                                                      c0, c1, s0, s1);
         } else {
-            apply_rope_head<kHeadDim, kHalf>(k, k_token_stride, combined_head - QHeads, token, lane,
-                                             c0, c1, s0, s1);
+            apply_rope_head<kHeadDim, kHalf, Aligned>(k, k_token_stride, combined_head - QHeads,
+                                                      token, lane, c0, c1, s0, s1);
         }
     }
 }

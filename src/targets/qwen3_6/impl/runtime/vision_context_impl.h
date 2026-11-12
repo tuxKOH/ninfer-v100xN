@@ -4,6 +4,7 @@
 #include "core/device.h"
 #include "core/layout.h"
 #include "targets/qwen3_6/impl/vision/host.h"
+#include "targets/qwen3_6/impl/vision/schedule.h"
 #include <ninfer/targets/qwen3_6/vision_control.h>
 #include "ninfer/ops/add_bias.h"
 #include "ninfer/ops/gelu.h"
@@ -27,114 +28,49 @@
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 namespace {
 
-std::size_t checked_mul(std::size_t a, std::size_t b, const char* label) {
-    if (b != 0 && a > std::numeric_limits<std::size_t>::max() / b) {
-        throw std::overflow_error(std::string("Vision ") + label + " overflows size_t");
-    }
-    return a * b;
+using vision_schedule::checked_mul;
+using VisionWorkspaceLayout = vision_schedule::Layout;
+constexpr std::size_t kWorkspaceAlignment = vision_schedule::alignment;
+
+VisionWorkspaceLayout build_workspace_layout(std::size_t patches, std::size_t tokens,
+                                             std::size_t segments) {
+    return vision_schedule::build_layout(patches, tokens, segments, 1,
+        [](std::int32_t p, std::int32_t s) {
+            return ops::vision_attention_workspace_capacity_bytes(p, p, s, s);
+        });
 }
 
-constexpr std::size_t kWorkspaceAlignment = 256;
-
-struct VisionWorkspaceLayout {
-    TensorRegion position_ids;
-    TensorRegion cu_seqlens;
-    TensorRegion pos_indices;
-    TensorRegion pos_weights;
-    TensorRegion x;
-    TensorRegion patch_bf16;
-    TensorRegion attended;
-    TensorRegion qkv;
-    TensorRegion attention_norm;
-    std::optional<LayoutRegion> attention_workspace;
-    TensorRegion projected;
-    TensorRegion mlp_down;
-    TensorRegion mlp_up;
-    TensorRegion mlp_norm;
-    TensorRegion normalized;
-    TensorRegion merger_hidden;
-    std::size_t bytes = 0;
+struct PrimaryVisionOps {
+    cudaStream_t stream;
+    void copy(const void* src, Tensor& dst) const {
+        if (dst.bytes()) CUDA_CHECK(cudaMemcpyAsync(dst.data, src, dst.bytes(), cudaMemcpyHostToDevice, stream));
+    }
+    void check_layer() const {}
+    void linear(const Tensor& x, const Weight& w, Tensor& y) const { ops::linear(x, w, y, stream); }
+    void add_bias(const Tensor& bias, Tensor& x) const { ops::add_bias(bias, x, stream); }
+    void layer_norm(const Tensor& x, const Tensor& w, const Tensor& b, Tensor& y) const {
+        ops::layer_norm(x, w, b, VisionScheduleConfig::norm_eps, y, stream);
+    }
+    void position_add(const Tensor& table, const Tensor& indices, const Tensor& weights, Tensor& x) const {
+        ops::vision_pos_embed_add(table, indices, weights, x, stream);
+    }
+    void rope(const Tensor& positions, Tensor& q, Tensor& k) const {
+        ops::rope(positions, VisionScheduleConfig::rotary_dim, VisionScheduleConfig::rope_theta, q, k, stream);
+    }
+    void attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& segments,
+                   DeviceSpan scratch, Tensor& out) const {
+        WorkspaceArena arena(scratch);
+        ops::vision_attention(q, k, v, segments, arena, out, stream);
+    }
+    void residual_add(const Tensor& x, Tensor& y) const { ops::residual_add(x, y, stream); }
+    void gelu_tanh(Tensor& x) const { ops::gelu(x, ops::GeluMode::Tanh, stream); }
+    void gelu_exact(Tensor& x) const { ops::gelu(x, ops::GeluMode::Exact, stream); }
 };
-
-VisionWorkspaceLayout build_workspace_layout(std::size_t patches64, std::size_t tokens64,
-                                             std::size_t segment_count) {
-    if (patches64 == 0 || tokens64 == 0 ||
-        patches64 !=
-            checked_mul(tokens64, VisionScheduleConfig::merge_unit, "patch/token relation")) {
-        throw std::invalid_argument("Vision workspace requires P=4V>0");
-    }
-    if (patches64 > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()) ||
-        tokens64 > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()) ||
-        segment_count == 0 ||
-        segment_count >= static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
-        throw std::overflow_error("Vision request dimensions exceed int32");
-    }
-    const auto patches = static_cast<std::int32_t>(patches64);
-    const auto tokens  = static_cast<std::int32_t>(tokens64);
-
-    LayoutBuilder builder;
-    VisionWorkspaceLayout out;
-    const auto add = [&](DType dtype, std::initializer_list<std::int32_t> shape,
-                         const char* label) {
-        return builder.add_tensor(dtype, shape, kWorkspaceAlignment, label);
-    };
-    out.position_ids = add(DType::I32, {patches, 2}, "vision position ids");
-    out.cu_seqlens =
-        add(DType::I32, {static_cast<std::int32_t>(segment_count + 1)}, "vision segment bounds");
-    out.pos_indices = add(DType::I32, {4, patches}, "vision position indices");
-    out.pos_weights = add(DType::FP32, {4, patches}, "vision position weights");
-    out.x           = add(DType::BF16, {VisionScheduleConfig::hidden, patches}, "vision residual");
-    out.patch_bf16 =
-        add(DType::BF16, {VisionScheduleConfig::patch_dim, patches}, "vision BF16 patches");
-    {
-        auto attention_scope = builder.scope();
-        out.attended = add(DType::BF16, {VisionScheduleConfig::hidden, patches}, "vision attended");
-        {
-            auto qkv_scope = builder.scope();
-            out.qkv = add(DType::BF16, {3 * VisionScheduleConfig::hidden, patches}, "vision QKV");
-            {
-                auto norm_scope    = builder.scope();
-                out.attention_norm = add(DType::BF16, {VisionScheduleConfig::hidden, patches},
-                                         "vision attention norm");
-            }
-            const std::size_t attention_bytes = ops::vision_attention_workspace_capacity_bytes(
-                patches, patches, static_cast<std::int32_t>(segment_count),
-                static_cast<std::int32_t>(segment_count));
-            if (attention_bytes != 0) {
-                out.attention_workspace =
-                    builder.add(attention_bytes, kWorkspaceAlignment, "vision attention workspace");
-            }
-        }
-        out.projected =
-            add(DType::BF16, {VisionScheduleConfig::hidden, patches}, "vision projected");
-    }
-    {
-        auto mlp_scope = builder.scope();
-        out.mlp_up =
-            add(DType::BF16, {VisionScheduleConfig::intermediate, patches}, "vision MLP up");
-        {
-            auto norm_scope = builder.scope();
-            out.mlp_norm =
-                add(DType::BF16, {VisionScheduleConfig::hidden, patches}, "vision MLP norm");
-        }
-        out.mlp_down = add(DType::BF16, {VisionScheduleConfig::hidden, patches}, "vision MLP down");
-    }
-    out.normalized =
-        add(DType::BF16, {VisionScheduleConfig::hidden, patches}, "vision merger norm");
-    out.merger_hidden =
-        add(DType::BF16, {VisionScheduleConfig::merger_hidden, tokens}, "vision merger hidden");
-    out.bytes = builder.finish(1, "vision workspace");
-    return out;
-}
-
-void copy_host(const void* src, Tensor& dst, cudaStream_t stream) {
-    if (dst.bytes() == 0) { return; }
-    CUDA_CHECK(cudaMemcpyAsync(dst.data, src, dst.bytes(), cudaMemcpyHostToDevice, stream));
-}
 
 } // namespace
 
-VisionContext::VisionContext(DeviceContext& ctx, const LoadedModelData& weights) : ctx_(ctx) {
+VisionContext::VisionContext(DeviceContext& ctx, const LoadedModelData& weights, bool auxiliary) : ctx_(ctx) {
+    if (auxiliary) { return; }
     if (!weights.vision) {
         throw std::invalid_argument("Vision execution was requested without materialized weights");
     }
@@ -223,108 +159,35 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output,
     if (workspace.capacity() < layout.bytes) {
         throw std::invalid_argument("Vision workspace capacity is too small for request");
     }
-    const auto patches  = static_cast<std::int32_t>(patches64);
-    const auto tokens   = static_cast<std::int32_t>(tokens64);
-    cudaStream_t stream = ctx_.stream;
     workspace.reset();
     const DeviceSpan backing = workspace.alloc_bytes(layout.bytes, kWorkspaceAlignment);
-
-    Tensor position_ids = layout.position_ids.bind(backing);
-    Tensor cu_seqlens   = layout.cu_seqlens.bind(backing);
-    Tensor pos_indices  = layout.pos_indices.bind(backing);
-    Tensor pos_weights  = layout.pos_weights.bind(backing);
-    copy_host(control.position_ids.data(), position_ids, stream);
-    copy_host(control.cu_seqlens.data(), cu_seqlens, stream);
-    copy_host(control.position_table_indices.data(), pos_indices, stream);
-    copy_host(control.position_table_weights.data(), pos_weights, stream);
-
-    Tensor x          = layout.x.bind(backing);
-    Tensor patch_bf16 = layout.patch_bf16.bind(backing);
-    copy_host(item.patches.data(), patch_bf16, stream);
-    ops::linear(patch_bf16, *patch_embed_, x, stream);
-    ops::add_bias(*patch_embed_bias_, x, stream);
-    // The artifact records the source table shape [rows,hidden], while Tensor's
-    // contiguous matrix convention is [inner,columns]. The payload is already
-    // row-major, so this is a zero-copy [hidden,rows] view, not a transpose.
-    Tensor position_table = position_embed_->reshape(
-        {VisionScheduleConfig::hidden, VisionScheduleConfig::position_embeddings});
-    ops::vision_pos_embed_add(position_table, pos_indices, pos_weights, x, stream);
-    for (std::size_t layer = 0; layer < blocks_.size(); ++layer) {
-        const BlockW& block = blocks_[layer];
-        {
-            Tensor attended = layout.attended.bind(backing);
-            {
-                Tensor qkv = layout.qkv.bind(backing);
-                {
-                    Tensor h = layout.attention_norm.bind(backing);
-                    ops::layer_norm(x, *block.norm1_weight, *block.norm1_bias,
-                                    VisionScheduleConfig::norm_eps, h, stream);
-                    ops::linear(h, *block.qkv, qkv, stream);
-                }
-                ops::add_bias(*block.qkv_bias, qkv, stream);
-                const std::int32_t plane      = VisionScheduleConfig::hidden;
-                const std::size_t plane_bytes = static_cast<std::size_t>(plane) * 2;
-                Tensor q(qkv.data, DType::BF16,
-                         {VisionScheduleConfig::head_dim, VisionScheduleConfig::heads, patches});
-                Tensor k(static_cast<unsigned char*>(qkv.data) + plane_bytes, DType::BF16,
-                         {VisionScheduleConfig::head_dim, VisionScheduleConfig::heads, patches});
-                Tensor v(static_cast<unsigned char*>(qkv.data) + 2 * plane_bytes, DType::BF16,
-                         {VisionScheduleConfig::head_dim, VisionScheduleConfig::heads, patches});
-                q.nb[2] = qkv.nb[1];
-                k.nb[2] = qkv.nb[1];
-                v.nb[2] = qkv.nb[1];
-                ops::rope(position_ids, VisionScheduleConfig::rotary_dim,
-                          VisionScheduleConfig::rope_theta, q, k, stream);
-                Tensor attended_heads = attended.view(
-                    {VisionScheduleConfig::head_dim, VisionScheduleConfig::heads, patches});
-                const DeviceSpan attention_backing = layout.attention_workspace
-                                                         ? layout.attention_workspace->bind(backing)
-                                                         : backing;
-                WorkspaceArena attention_workspace(attention_backing);
-                ops::vision_attention(q, k, v, cu_seqlens, attention_workspace, attended_heads,
-                                      stream);
-            }
-            Tensor projected = layout.projected.bind(backing);
-            ops::linear(attended, *block.projection, projected, stream);
-            ops::add_bias(*block.projection_bias, projected, stream);
-            ops::residual_add(projected, x, stream);
-        }
-        {
-            Tensor down = layout.mlp_down.bind(backing);
-            Tensor up   = layout.mlp_up.bind(backing);
-            {
-                Tensor h = layout.mlp_norm.bind(backing);
-                ops::layer_norm(x, *block.norm2_weight, *block.norm2_bias,
-                                VisionScheduleConfig::norm_eps, h, stream);
-                ops::linear(h, *block.fc1, up, stream);
-            }
-            ops::add_bias(*block.fc1_bias, up, stream);
-            ops::gelu(up, ops::GeluMode::Tanh, stream);
-            ops::linear(up, *block.fc2, down, stream);
-            ops::add_bias(*block.fc2_bias, down, stream);
-            ops::residual_add(down, x, stream);
-        }
+    vision_schedule::Weights weights{};
+    weights.patch = patch_embed_;
+    weights.patch_bias = patch_embed_bias_;
+    weights.position = position_embed_;
+    for (std::size_t i = 0; i < blocks_.size(); ++i) {
+        const auto& b = blocks_[i];
+        weights.blocks[i] = {b.norm1_weight, b.norm1_bias, b.qkv, b.qkv_bias,
+                             b.projection, b.projection_bias, b.norm2_weight, b.norm2_bias,
+                             b.fc1, b.fc1_bias, b.fc2, b.fc2_bias};
     }
-
-    Tensor normalized = layout.normalized.bind(backing);
-    ops::layer_norm(x, *merger_.norm_weight, *merger_.norm_bias, VisionScheduleConfig::norm_eps,
-                    normalized, stream);
-    Tensor merged = normalized.view({VisionScheduleConfig::merger_hidden, tokens});
-    Tensor hidden = layout.merger_hidden.bind(backing);
-    ops::linear(merged, *merger_.fc1, hidden, stream);
-    ops::add_bias(*merger_.fc1_bias, hidden, stream);
-    ops::gelu(hidden, ops::GeluMode::Exact, stream);
-    ops::linear(hidden, *merger_.fc2, output, stream);
-    ops::add_bias(*merger_.fc2_bias, output, stream);
+    weights.merger_norm_weight = merger_.norm_weight;
+    weights.merger_norm_bias = merger_.norm_bias;
+    weights.merger_fc1 = merger_.fc1;
+    weights.merger_fc1_bias = merger_.fc1_bias;
+    weights.merger_fc2 = merger_.fc2;
+    weights.merger_fc2_bias = merger_.fc2_bias;
+    PrimaryVisionOps operations{ctx_.stream};
+    vision_schedule::execute(layout, backing, item.patches, control, weights, output, operations);
 }
 
 VisionPrefillSession::VisionPrefillSession(DeviceContext& device, const LoadedModelData& model,
                                            WorkspaceArena& workspace,
                                            qwen3_6::PreparedPromptData& prompt,
                                            const VisionPrefillPlan& plan,
-                                           runtime::TransientRegion transient)
+                                           runtime::TransientRegion transient, bool auxiliary)
     : device_(device), workspace_(workspace), prompt_(prompt), plan_(plan), transient_(transient),
-      context_(device, model) {
+      auxiliary_(auxiliary), context_(device, model, auxiliary) {
     if (plan_.control == nullptr || plan_.control->items.empty() || plan_.uses.empty()) {
         throw std::invalid_argument("Vision prefill plan has no suffix item spans");
     }
@@ -396,14 +259,14 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
         if (!payload || payload->patch_elements != patch_elements) {
             throw std::invalid_argument("Vision item patch payload has an invalid shape");
         }
-        if (context_.is_cpu()) {
+        if (auxiliary_ || context_.is_cpu() || !prompt_.host_vision_embeddings.empty()) {
             const auto start = std::chrono::steady_clock::now();
             if (active->item_index >= prompt_.host_vision_embeddings.size()) {
-                throw std::logic_error("CPU Vision request was not staged before GPU admission");
+                throw std::logic_error("Vision request was not staged before GPU admission");
             }
             const auto& encoded = prompt_.host_vision_embeddings[active->item_index];
-            if (!encoded || encoded->size() * sizeof(std::uint16_t) != output.bytes()) {
-                throw std::logic_error("CPU Vision embedding extent mismatch");
+            if (!encoded || encoded->size() != output_bytes / sizeof(std::uint16_t)) {
+                throw std::logic_error("Vision embedding extent mismatch");
             }
             CUDA_CHECK(cudaMemcpyAsync(output.data, encoded->data(), output.bytes(),
                                        cudaMemcpyHostToDevice, device_.stream));

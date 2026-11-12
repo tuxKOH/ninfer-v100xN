@@ -73,6 +73,24 @@ int main() {
                       "CPU Vision device did not parse");
     failures += check(defaults.vision_device == ninfer::VisionDevice::Gpu, "Vision device default is not GPU");
     failures += check(!defaults.enable_vision, "Vision is not disabled by default");
+    failures += check(!defaults.vision_gpu, "server Vision GPU must be absent by default");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--vision", "--vision-gpu", "0"}).vision_gpu == 0,
+                      "server Vision GPU zero did not parse");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--vision-gpu", "2", "--vision"}).vision_gpu == 2,
+                      "server Vision GPU did not parse");
+    for (const auto& flags : {std::vector<std::string>{"--vision-gpu", "2"},
+                              std::vector<std::string>{"--vision", "--vision-device", "cpu", "--vision-gpu", "2"},
+                              std::vector<std::string>{"--vision", "--vision-gpu", "-1"},
+                              std::vector<std::string>{"--vision", "--vision-gpu", "1x"},
+                              std::vector<std::string>{"--vision", "--vision-gpu", "2147483648"},
+                              std::vector<std::string>{"--vision", "--vision-gpu"}}) {
+        auto arguments = std::vector<std::string>{"ninfer-serve", "model.ninfer"};
+        arguments.insert(arguments.end(), flags.begin(), flags.end());
+        bool rejected = false;
+        try { (void)parse(std::move(arguments)); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "server accepted an invalid Vision GPU selection");
+    }
     failures += check(defaults.vision_max_tokens == ninfer::kMaximumVisionTokenBudget,
                       "Vision token budget default changed");
     failures += check(defaults.request_log_jsonl.empty(),

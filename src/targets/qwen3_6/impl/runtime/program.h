@@ -17,6 +17,9 @@
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
 #include "targets/qwen3_6/impl/vision/host.h"
+#ifdef NINFER_AUX_VISION_ARCH
+#include "targets/qwen3_6/impl/vision/sm86/backend.h"
+#endif
 
 #include <cstdint>
 #include <array>
@@ -100,6 +103,12 @@ namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 
 using RequestPlanImpl     = qwen3_6::detail::RequestPlanImpl<Variant>;
 using RequestBasePlanImpl = qwen3_6::detail::RequestBasePlanImpl<Variant>;
+
+struct VisionHostBudget {
+    std::mutex mutex;
+    std::size_t used = 0;
+    std::size_t capacity = 0;
+};
 
 enum class PendingKind : std::uint8_t {
     None,
@@ -303,7 +312,8 @@ struct PeerRuntime {
 class ProgramImplCore {
 public:
     ProgramImplCore(const LoadedModelData& model, std::span<const LoadedModelData* const> peer_models,
-                    const SequencePlanImpl& plan, ExecutionContext& execution);
+                    const SequencePlanImpl& plan, ExecutionContext& execution,
+                    const qwen3_6::AuxiliaryVision* auxiliary);
     ~ProgramImplCore() noexcept;
 
     [[nodiscard]] RequestBasePlan
@@ -342,6 +352,12 @@ public:
 
     const LoadedModelData& model;
     mutable qwen3_6::HostVisionCache host_vision_cache;
+    std::shared_ptr<VisionHostBudget> vision_host_budget;
+#ifdef NINFER_AUX_VISION_ARCH
+    std::unique_ptr<qwen3_6::vision_sm86::Backend> auxiliary_vision;
+#endif
+    const bool auxiliary_vision_enabled;
+    const std::uint32_t vision_max_tokens;
     ExecutionContext& execution;
     DeviceContext& device;
     const int device_count;

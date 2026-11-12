@@ -250,8 +250,11 @@ PeerRuntime::PeerRuntime(DeviceContext& peer_device, const LoadedModelData& peer
 
 ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
                                  std::span<const LoadedModelData* const> peer_models, const SequencePlanImpl& plan,
-                                 ExecutionContext& execution_in)
-    : model(model_in), execution(execution_in), device(execution_in.primary()), device_count(execution_in.device_count),
+                                 ExecutionContext& execution_in,
+                                 const qwen3_6::AuxiliaryVision* auxiliary)
+    : model(model_in), auxiliary_vision_enabled(auxiliary != nullptr),
+      vision_max_tokens(plan.vision_max_tokens),
+      execution(execution_in), device(execution_in.primary()), device_count(execution_in.device_count),
       pp(plan.pp), pipeline_chunks(plan.pipeline_chunks),
       pipeline_upload(plan.pp == 2
                           ? std::make_optional<PinnedHostBuffer>(2ULL * plan.prefill_chunk * plan.pipeline_chunks * sizeof(TokenId))
@@ -289,12 +292,31 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
     if (model.weights_arena == nullptr) {
         throw std::invalid_argument("Qwen3.6 model view has no owning weight arena");
     }
+    if (plan.auxiliary_vision_device.has_value() != (auxiliary != nullptr) ||
+        (auxiliary && (!auxiliary->weights || !auxiliary->owner ||
+                       auxiliary->device != *plan.auxiliary_vision_device))) {
+        throw std::invalid_argument("auxiliary Vision does not match the sequence plan");
+    }
     if (model.features != plan.features || model.mtp.has_value() != plan.features.mtp() ||
         model.dflash.has_value() != plan.features.dflash() ||
         model.optimized_proposal.has_value() != plan.features.optimized_proposal() ||
-        model.vision.has_value() != plan.features.vision) {
+        model.vision.has_value() != (plan.features.vision && !auxiliary)) {
         throw std::invalid_argument(
             "Qwen3.6 loaded weights do not match the frozen startup features");
+    }
+    if (auxiliary) {
+#ifdef NINFER_AUX_VISION_ARCH
+        constexpr std::uint32_t segment_limit = 768 / 2;
+        auxiliary_vision = std::make_unique<qwen3_6::vision_sm86::Backend>(
+            auxiliary->device, *auxiliary->weights, auxiliary->owner, VisionConfig::output_hidden,
+            plan.vision_max_tokens, std::min(plan.vision_max_tokens, segment_limit));
+        vision_host_budget = std::make_shared<VisionHostBudget>();
+        vision_host_budget->capacity = (128ULL << 20) +
+            static_cast<std::size_t>(plan.max_concurrency) * plan.vision_max_tokens *
+                VisionConfig::output_hidden * sizeof(std::uint16_t);
+#else
+        throw std::invalid_argument("auxiliary GPU Vision is not enabled in this build");
+#endif
     }
     if (model.mtp.has_value() && model.dflash.has_value()) {
         throw std::invalid_argument("MTP and DFlash model views are mutually exclusive");
@@ -921,7 +943,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         auto& staged = *request.prefill;
         if (staged.vision_plan) {
             staged.vision = std::make_unique<schedule::VisionPrefillSession>(
-                device, model, work, staged.prompt, *staged.vision_plan, staged.transient);
+                device, model, work, staged.prompt, *staged.vision_plan, staged.transient,
+                auxiliary_vision_enabled);
         }
         staged.elapsed_seconds = std::chrono::duration<double>(Clock::now() - started).count();
         request.lifecycle      = Lifecycle::Prefilling;

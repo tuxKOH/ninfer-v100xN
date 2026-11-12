@@ -88,13 +88,90 @@ supports up to fifteen drafts and Qwen3.8-27B artifacts with the optional DFlash
 up to seven. DFlash cannot be combined with `--vision`. A later request cannot enable a capability
 omitted at startup.
 
+### Separate GPU for Vision
+
+The experimental mixed build runs the SM70 text backend and a separately compiled Vision backend
+in the same process. Set `NINFER_AUX_VISION_ARCH` to `86` for SM86 or `89` for SM89. The
+default is empty, which disables auxiliary Vision. The option requires
+`CMAKE_CUDA_ARCHITECTURES=70` and a CUDA 12.x toolchain that supports both selected architectures.
+For example:
+
+```bash
+cmake -S . -B build-sm86 -DCMAKE_CUDA_ARCHITECTURES=70 -DNINFER_AUX_VISION_ARCH=86
+cmake --build build-sm86
+```
+
+When `BUILD_TESTING=ON`, the option also enables auxiliary Vision operator tests. Select their
+visible devices with `CUDA_VISIBLE_DEVICES`, or set `NINFER_TEST_CUDA_VISIBLE_DEVICES` at CMake
+configuration time to inject that value into CTest. The tests need a device matching the selected
+auxiliary architecture and skip if one is not visible. SM86 operator tests and a short mixed-device
+serving smoke test have run on an RTX A2000. SM89 is a compile target, not a tested serving claim.
+
+Pass `--vision --vision-device gpu --vision-gpu N` to place the Vision encoder and its weights
+on a separate device matching the compiled auxiliary architecture. `--vision-device gpu` is the default, but `--vision-gpu` requires
+`--vision` and cannot be combined with `--vision-device cpu`. Without `--vision-gpu`, GPU Vision
+uses the primary text GPU. `N` is a non-negative CUDA **logical ordinal after**
+`CUDA_VISIBLE_DEVICES` filtering and reordering, not an `nvidia-smi` index or UUID. The selected
+device must differ from every text execution device and any expert storage device. A build without
+the option, an unavailable device, or a device that does not match the selected architecture cannot
+use this route. For stable mapping, obtain device UUIDs with `nvidia-smi -L`, then list them in the desired order:
+
+```bash
+CUDA_VISIBLE_DEVICES=GPU-<text-uuid>,GPU-<vision-uuid> \
+  ./build-sm86/apps/ninfer-serve models/qwen3_6_27b.ninfer \
+  --device 0 --vision --vision-device gpu --vision-gpu 1
+```
+
+Replace both UUID placeholders with the full UUIDs reported for the devices. In this example,
+the text device is logical 0 and the Vision device is logical 1 regardless of their physical
+indices. For TP2, list both SM70 text devices first, select them with `--tp 2 --devices 0,1`,
+and select the matching auxiliary device with `--vision-gpu 2`.
+
+This route is limited to the Qwen3.6/3.8 27B target and artifacts with execution-qualified Vision
+weights. The GGUF-derived Q4_K_M and native FP8 profiles do not support Vision; QUASAR Vision
+requires TP2. TP4, PP2, DFlash, YaRN and Volta fast decode do not support Vision. The selected
+device needs space for Vision weights, workspace and output. The text devices still need space for
+text weights, KV and runtime allocations, including visual embedding handling. Encoded embeddings
+are staged in host memory and uploaded to the primary text GPU; auxiliary Vision does not require
+peer access to the text GPUs. Host staging has a bounded budget and a request can be rejected if
+that budget is exhausted.
+
+`--vision-max-tokens N` limits the total merged visual tokens per prompt, from 1 to 32768
+(default 32768). Vision reservations use the smaller of this limit and `--max-context`; reducing
+the limit reduces reserved Vision memory but also reduces the visual input a prompt can admit.
+Startup checks auxiliary workspace and output capacity after accounting for planned weights.
+Available memory and the text context capacity depend on the selected devices and other allocations.
+For QUASAR, a maximum-area still image uses 16384 merged visual tokens. Allow at least that
+many Vision tokens and additional text context for the prompt and response. Attention work grows
+with the square of the patch count, so large images can require a higher `--pending-timeout-ms`
+than the 30-second default.
+No performance, maximum-context or numerical quality equivalence is implied by this configuration.
+
+In a single media retest with two V100 text GPUs, TP2
+QUASAR v3, MTP4, INT8 KV and an A2000 Vision GPU, a 1280-pixel image request took 11.62 s
+to first token and 11.71 s total; server-reported Vision time was 10.51 s. This is one
+end-to-end observation, not a controlled kernel benchmark.
+
+With the same GPU roles and a 262144-token context and KV capacity, a 4096 x 4096 QUASAR image
+used 65536 raw patches and 16384 merged tokens. The model correctly identified five coloured
+shapes. Vision encoding took 163 seconds in the cold request and 168 seconds on a second request
+with cached preprocessing; both used a 3600000 ms preparation deadline. These observations do not
+establish model quality across images or maximum-length text combined with a maximum-area image.
+
+A separate long-context run used the same GPU roles and
+model profile with a 262144-token context and KV capacity, a 1024-token Vision budget and a
+170 W limit on each V100. One cold image request occupied 257785 prompt tokens and produced
+30 output tokens in 436.82 s wall time. This does not demonstrate exact 262144-token occupancy
+or establish model quality.
+
 `--tp 2` splits one model across two GPUs and requires an explicit `--devices A,B` naming one
 distinct device per rank. The 27B package supports `--spec mtp` and optional Qwen3.8 DFlash2.
 Experimental `--vision` is available at TP2 for artifacts with execution-qualified Vision weights;
-QUASAR NVFP4 admits TP2 None/MTP; GGUF-derived Q4_K_M rejects it. Vision weights and encoding reside only on the primary
-rank; composed embeddings are copied to the peer before split text prefill, and both ranks use
-the same three-axis positions and per-request RoPE delta. Vision requests participate in the
-same compact concurrent decode batches as text requests. Vision requires additional startup
+QUASAR NVFP4 admits TP2 None/MTP; GGUF-derived Q4_K_M rejects it. With primary-GPU Vision,
+weights and encoding reside on the primary rank; with CPU or auxiliary-GPU Vision, encoding runs
+on the selected device instead. Composed embeddings are copied to the peer before split text
+prefill, and both ranks use the same three-axis positions and per-request RoPE delta.
+Vision requests participate in the same compact concurrent decode batches as text requests. Vision requires additional startup
 memory; lower the text-only context profile rather than simply appending `--vision` to a
 near-capacity command. On the two 16 GB V100s, the qualified NVFP4 v3 DFlash2 profile uses
 `--max-context 98304 --prefill-chunk 1024 --kv-dtype int8 --spec dflash --draft-tokens 7`, without

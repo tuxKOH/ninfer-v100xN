@@ -287,6 +287,8 @@ struct BindingPlan {
     int pp = 1;
     qwen3_6::FrontendResourcePlan frontend;
     qwen3_6::StartupFeatures features;
+    std::optional<int> auxiliary_vision_slot;
+    std::optional<int> auxiliary_vision_device;
     artifact::NumericFormat draft_format = artifact::NumericFormat::Q4G64_F16S;
     artifact::NumericFormat mtp_format = artifact::NumericFormat::W8G32_F16S;
     artifact::NumericFormat mtp_stem_format = artifact::NumericFormat::W8G32_F16S;
@@ -317,7 +319,8 @@ struct ArtifactLoadPlan {
 // arena size), and at tp > 1 a shard resolver derived from `shard_mapping_for` is installed on the
 // binder so each device's arena receives only its own rows/columns.
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
-                               qwen3_6::StartupFeatures features, int tp = 1, int pp = 1);
+                               qwen3_6::StartupFeatures features, int tp = 1, int pp = 1,
+                               std::optional<int> auxiliary_vision_device = std::nullopt);
 
 struct DensePostMixerPayload {
     Weight gate_up;
@@ -383,6 +386,12 @@ using FullAttentionWeights = RuntimeModelView::FullLayer;
 using GdnWeights           = RuntimeModelView::GdnLayer;
 using MtpWeights           = RuntimeModelView::MtpLayer;
 
+struct AuxiliaryVisionView {
+    int slot;
+    int physical_device;
+    qwen3_6::VisionWeights weights;
+};
+
 class LoadedModelData {
 public:
     LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized,
@@ -410,6 +419,7 @@ public:
     int pp = 1;
     RuntimeModelView runtime;
     std::array<std::optional<RuntimeModelView>, 3> runtime_peers;
+    std::optional<AuxiliaryVisionView> auxiliary_vision;
 
 private:
     void build_device_view(const BindingPlan& plan, int device, RuntimeModelView& runtime);
@@ -418,11 +428,13 @@ private:
 class LoadedModel::Impl {
 public:
     Impl(WeightsProfile weights_profile_in, BindingPlan plan,
-         artifact::MaterializedArtifact materialized, int tensor_parallel)
-        : weights_profile(weights_profile_in),
+         artifact::MaterializedArtifact materialized, int tensor_parallel,
+         std::shared_ptr<DeviceContext> auxiliary_context_in)
+        : weights_profile(weights_profile_in), auxiliary_context(std::move(auxiliary_context_in)),
           data(std::move(plan), std::move(materialized), tensor_parallel) {}
 
     WeightsProfile weights_profile;
+    std::shared_ptr<DeviceContext> auxiliary_context;
     LoadedModelData data;
 };
 
