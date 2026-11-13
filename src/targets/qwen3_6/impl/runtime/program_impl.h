@@ -112,12 +112,12 @@ schedule::DFlashEnvelopes dflash_envelopes(std::uint32_t min_frontier, std::uint
 
 DecodeGraphProfile& select_graph_profile(DecodeGraphFamily& family, std::uint32_t batch_size,
                                          std::uint32_t frontier, const char* label,
-                                         bool greedy_target = false) {
+                                         bool greedy_target = false, bool constrained = false) {
     const auto it = std::find_if(
         family.profiles.begin(), family.profiles.end(), [&](const DecodeGraphProfile& profile) {
             return profile.batch_size == batch_size && profile.min_execution_frontier <= frontier &&
                    frontier <= profile.max_execution_frontier &&
-                   profile.greedy_target == greedy_target;
+                   profile.greedy_target == greedy_target && profile.constrained == constrained;
         });
     if (it == family.profiles.end()) {
         throw std::logic_error(std::string(label) + " CUDA Graph coverage is incomplete");
@@ -273,6 +273,11 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
                             qwen3_6::detail::yarn_rope_mscale(plan_yarn_params(plan)))
                       : 1.0),
       round_host(sizeof(TokenId)),
+      token_constraint_host(
+          static_cast<std::size_t>(kTokenConstraintRows) *
+          (sizeof(std::int32_t) +
+           sizeof(std::uint32_t) * static_cast<std::size_t>(
+                                       runtime::token_bitmask_words(TextConfig::token_domain)))),
       ordinary_host(
           plan.speculative_backend == SpeculativeBackend::None
               ? std::make_optional<PinnedHostBuffer>(sizeof(qwen3_6::OrdinaryDecodeIngress) +
@@ -401,6 +406,20 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
     set_device_i32(io.backend_kv_table_row, 0);
 
     host_tokens = static_cast<TokenId*>(round_host.data());
+    // Page-locked host memory is mapped at the same address on every device under UVA, so each
+    // rank reads the constraint image in place without per-round copies.
+    void* constraint_device = nullptr;
+    CUDA_CHECK(cudaHostGetDevicePointer(&constraint_device, token_constraint_host.data(), 0));
+    if (constraint_device != token_constraint_host.data()) {
+        throw std::runtime_error("structured-output constraints require unified host addressing");
+    }
+    std::memset(token_constraint_host.data(), 0, token_constraint_host.size());
+    token_constraints = schedule::TokenConstraintView{
+        .constrained = static_cast<const std::int32_t*>(token_constraint_host.data()),
+        .bitmask     = reinterpret_cast<const std::uint32_t*>(
+            static_cast<const std::int32_t*>(token_constraint_host.data()) + kTokenConstraintRows),
+        .words       = runtime::token_bitmask_words(TextConfig::token_domain),
+    };
     if (ordinary_host) {
         ordinary_host_ingress = static_cast<qwen3_6::OrdinaryDecodeIngress*>(ordinary_host->data());
         ordinary_host_egress  = reinterpret_cast<qwen3_6::OrdinaryDecodeEgress*>(
@@ -852,6 +871,11 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             materialize_sequence_kv(sequence, base, backend_kv_valid(sequence));
         } else { materialize_sequence_kv(sequence, prompt_tokens, backend_materialized); }
         install_sampling(sequence, request, request_plan.sampling);
+        request.grammar.reset();
+        if (request_plan.grammar) {
+            request.grammar.emplace(request_plan.grammar, prompt.starts_in_reasoning);
+        }
+        (void)plan_token_constraints(request, kTokenConstraintPrefillRow, {});
         sequence.rope_delta = prompt.rope_delta;
         set_device_i32(io.rope_delta, sequence.rope_delta);
         for (auto& peer : peers) {
@@ -1121,6 +1145,7 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
                     ? mtp_host_egress->licensed_tokens.data() + row * width
                     : dflash_host_egress->licensed_tokens.data() + row * width;
             sequence.ledger.insert(sequence.ledger.end(), token_base, token_base + committed);
+            if (request.grammar) { request.grammar->commit({token_base, committed}); }
             sequence.prefix_identity.append_generated(committed, sequence.rope_delta);
             sequence.execution_frontier = pending.base_E + committed;
             sequence.ledger_frontier    = pending.base_S + committed;
@@ -1457,6 +1482,7 @@ void ProgramImplCore::restore_archived_prefix(SequenceState& sequence, const Arc
 void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
     request.prefill.reset();
     request.exact_hit.reset();
+    request.grammar.reset();
     sequence.kv.reset();
     request.lifecycle           = Lifecycle::Empty;
     sequence.execution_frontier = 0;
@@ -2099,7 +2125,7 @@ void ProgramImplCore::prepare_graphs() {
                                        prefill_chunk,
                                        proposal_head,
                                        rope_frequency,
-                                       peer_views(), pipeline_view(), pipeline_upload ? static_cast<TokenId*>(pipeline_upload->data()) : nullptr, volta_long_attention};
+                                       peer_views(), pipeline_view(), pipeline_upload ? static_cast<TokenId*>(pipeline_upload->data()) : nullptr, volta_long_attention, token_constraints};
     };
 
     if (speculative_backend == SpeculativeBackend::None) {
@@ -2139,20 +2165,27 @@ void ProgramImplCore::prepare_graphs() {
             }
         }
 
-        ordinary_graphs.profiles.reserve(ordinary_profiles.size() * ordinary_batch_limit);
-        for (std::uint32_t batch_size = 1; batch_size <= ordinary_batch_limit; ++batch_size) {
-            for (const GraphExecutionProfile planned : ordinary_profiles) {
-                ordinary_graphs.profiles.emplace_back();
-                DecodeGraphProfile& profile    = ordinary_graphs.profiles.back();
-                profile.batch_size             = batch_size;
-                profile.min_execution_frontier = planned.min;
-                profile.max_execution_frontier = planned.max;
-                profile.topology_class =
-                    planned.topology_class * ordinary_batch_limit + (batch_size - 1U);
-                const ops::GqaExecutionEnvelope envelope{planned.min + 1, planned.max + 1};
-                schedule::capture_ordinary_decode_batch(ordinary_state,
-                                                        static_cast<std::int32_t>(batch_size),
-                                                        envelope, profile.definition);
+        ordinary_graphs.profiles.reserve(ordinary_profiles.size() * ordinary_batch_limit * 2U);
+        for (bool constrained : {false, true}) {
+            ordinary_state.execution.token_constraints =
+                constrained ? token_constraints : schedule::TokenConstraintView{};
+            for (std::uint32_t batch_size = 1; batch_size <= ordinary_batch_limit; ++batch_size) {
+                for (const GraphExecutionProfile planned : ordinary_profiles) {
+                    ordinary_graphs.profiles.emplace_back();
+                    DecodeGraphProfile& profile    = ordinary_graphs.profiles.back();
+                    profile.batch_size             = batch_size;
+                    profile.min_execution_frontier = planned.min;
+                    profile.max_execution_frontier = planned.max;
+                    profile.constrained            = constrained;
+                    profile.topology_class =
+                        (planned.topology_class * 2U + (constrained ? 1U : 0U)) *
+                            ordinary_batch_limit +
+                        (batch_size - 1U);
+                    const ops::GqaExecutionEnvelope envelope{planned.min + 1, planned.max + 1};
+                    schedule::capture_ordinary_decode_batch(ordinary_state,
+                                                            static_cast<std::int32_t>(batch_size),
+                                                            envelope, profile.definition);
+                }
             }
         }
     }
@@ -2181,24 +2214,31 @@ void ProgramImplCore::prepare_graphs() {
             }
         }
 
-        mtp_graphs.profiles.reserve(planned_profiles.size() * max_concurrency * 2U);
-        for (bool greedy_target : {false, true}) {
-            mtp_state.greedy_target = greedy_target;
-            for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
-                for (const GraphExecutionProfile planned : planned_profiles) {
-                    mtp_graphs.profiles.emplace_back();
-                    DecodeGraphProfile& profile    = mtp_graphs.profiles.back();
-                    profile.batch_size             = batch_size;
-                    profile.min_execution_frontier = planned.min;
-                    profile.max_execution_frontier = planned.max;
-                    profile.greedy_target          = greedy_target;
-                    profile.topology_class =
-                        (planned.topology_class * 2U + (greedy_target ? 1U : 0U)) *
-                            max_concurrency +
-                        (batch_size - 1U);
-                    schedule::capture_mtp_decode_batch(
-                        mtp_state, static_cast<std::int32_t>(batch_size), draft_window,
-                        mtp_gqa_envelopes(planned.max, draft_window, capacity), profile.definition);
+        mtp_graphs.profiles.reserve(planned_profiles.size() * max_concurrency * 4U);
+        for (bool constrained : {false, true}) {
+            mtp_state.execution.token_constraints =
+                constrained ? token_constraints : schedule::TokenConstraintView{};
+            for (bool greedy_target : {false, true}) {
+                mtp_state.greedy_target = greedy_target;
+                for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
+                    for (const GraphExecutionProfile planned : planned_profiles) {
+                        mtp_graphs.profiles.emplace_back();
+                        DecodeGraphProfile& profile    = mtp_graphs.profiles.back();
+                        profile.batch_size             = batch_size;
+                        profile.min_execution_frontier = planned.min;
+                        profile.max_execution_frontier = planned.max;
+                        profile.greedy_target          = greedy_target;
+                        profile.constrained            = constrained;
+                        profile.topology_class =
+                            ((planned.topology_class * 2U + (greedy_target ? 1U : 0U)) * 2U +
+                             (constrained ? 1U : 0U)) *
+                                max_concurrency +
+                            (batch_size - 1U);
+                        schedule::capture_mtp_decode_batch(
+                            mtp_state, static_cast<std::int32_t>(batch_size), draft_window,
+                            mtp_gqa_envelopes(planned.max, draft_window, capacity),
+                            profile.definition);
+                    }
                 }
             }
         }
@@ -2484,6 +2524,31 @@ void ProgramImplCore::check_peer_mtp_egress(std::size_t rows) {
     }
 }
 
+schedule::TokenConstraintView
+ProgramImplCore::prefill_token_constraints(const RequestControl& request) const noexcept {
+    return request.grammar ? token_constraints.from_row(kTokenConstraintPrefillRow)
+                           : schedule::TokenConstraintView{};
+}
+
+std::uint32_t ProgramImplCore::plan_token_constraints(RequestControl& request, std::int32_t row,
+                                                     std::span<const TokenId> drafts) {
+    const auto columns = static_cast<std::int32_t>(drafts.size()) + 1;
+    if (row < 0 || row + columns > kTokenConstraintRows) {
+        throw std::logic_error("structured-output constraint rows are out of range");
+    }
+    auto* flags = static_cast<std::int32_t*>(token_constraint_host.data()) + row;
+    if (!request.grammar) {
+        std::fill_n(flags, columns, 0);
+        return static_cast<std::uint32_t>(drafts.size());
+    }
+    const auto words = static_cast<std::size_t>(token_constraints.words);
+    auto* rows = reinterpret_cast<std::uint32_t*>(static_cast<std::int32_t*>(
+                     token_constraint_host.data()) + kTokenConstraintRows) +
+                 static_cast<std::size_t>(row) * words;
+    return request.grammar->plan(drafts, {rows, static_cast<std::size_t>(columns) * words},
+                                 {flags, static_cast<std::size_t>(columns)});
+}
+
 void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& request,
                                        const ops::SamplingConfig& config) {
     Tensor counts = token_counts_lane(token_counts, sequence.lane);
@@ -2661,7 +2726,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         schedule::PrefillContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, rope_frequency, peer_views(), pipeline_view(), pipeline_upload ? static_cast<TokenId*>(pipeline_upload->data()) : nullptr, volta_long_attention},
+             proposal_head, rope_frequency, peer_views(), pipeline_view(), pipeline_upload ? static_cast<TokenId*>(pipeline_upload->data()) : nullptr, volta_long_attention, prefill_token_constraints(request)},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
             mtp_kv_views_peer(sequence),
@@ -2957,12 +3022,15 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
 
     const auto start = Clock::now();
     try {
+        const bool constrained = std::any_of(lanes.begin(), lanes.end(), [&](std::uint32_t lane) {
+            return requests[lane].grammar.has_value();
+        });
         DecodeGraphExecutable* executable = nullptr;
         ops::GqaExecutionEnvelope envelope{maximum_frontier + 1, maximum_frontier + 1};
         if (use_cuda_graph) {
             DecodeGraphProfile& profile =
                 select_graph_profile(ordinary_graphs, static_cast<std::uint32_t>(lanes.size()),
-                                     maximum_frontier, "ordinary batch");
+                                     maximum_frontier, "ordinary batch", false, constrained);
             executable = &install_graph_profile(ordinary_graphs, profile, "ordinary batch");
             envelope   = {profile.min_execution_frontier + 1, profile.max_execution_frontier + 1};
         }
@@ -2971,6 +3039,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             SequenceState& sequence            = sequences[lanes[row]];
             const RequestControl& request      = requests[lanes[row]];
             const std::uint32_t frontier       = sequence.execution_frontier;
+            (void)plan_token_constraints(requests[lanes[row]], static_cast<std::int32_t>(row), {});
             ordinary_host_ingress->tokens[row] = sequence.ledger.back();
             ordinary_host_ingress->cache_positions[row] =
                 checked_i32(frontier, "ordinary batch position");
@@ -2986,7 +3055,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         schedule::OrdinaryBatchContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, rope_frequency, peer_views(), pipeline_view(), pipeline_upload ? static_cast<TokenId*>(pipeline_upload->data()) : nullptr, volta_long_attention},
+             proposal_head, rope_frequency, peer_views(), pipeline_view(), pipeline_upload ? static_cast<TokenId*>(pipeline_upload->data()) : nullptr, volta_long_attention, constrained ? token_constraints : schedule::TokenConstraintView{}},
             decoder->text_kv,
             *io.ordinary,
             *ordinary_host_ingress,
@@ -3063,7 +3132,7 @@ void ProgramImplCore::finish_exact_hit(SequenceState& sequence, RequestControl& 
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
              proposal_head, rope_frequency, peer_views(), pipeline_view(),
              pipeline_upload ? static_cast<TokenId*>(pipeline_upload->data()) : nullptr,
-             volta_long_attention},
+             volta_long_attention, prefill_token_constraints(request)},
             text_kv_view(sequence), mtp_kv_view(sequence), mtp_kv_views_peer(sequence),
             decoder->text_kv, decoder->mtp_cache(), nullptr, frontier,
             static_cast<const ops::SamplingConfig*>(
@@ -3136,13 +3205,16 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             lanes.begin(), lanes.end(), [&](std::uint32_t lane) {
                 return !(requests[lane].sampling_host.temperature > 0.0F);
             });
+        const bool constrained = std::any_of(lanes.begin(), lanes.end(), [&](std::uint32_t lane) {
+            return requests[lane].grammar.has_value();
+        });
         DecodeGraphExecutable* executable = nullptr;
         schedule::MtpGqaEnvelopes envelopes =
             mtp_gqa_envelopes(maximum_frontier, draft_window, capacity);
         if (use_cuda_graph) {
             DecodeGraphProfile& profile =
                 select_graph_profile(mtp_graphs, static_cast<std::uint32_t>(lanes.size()),
-                                     maximum_frontier, "MTP batch", greedy_target);
+                                     maximum_frontier, "MTP batch", greedy_target, constrained);
             executable = &install_graph_profile(mtp_graphs, profile, "MTP batch");
             envelopes  = mtp_gqa_envelopes(profile.max_execution_frontier, draft_window, capacity);
         }
@@ -3154,9 +3226,16 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                     ? budgets[row].generated_tokens_remaining - 1
                                                     : 0;
-            const std::uint32_t extent =
-                std::min({sequence.mtp_draft_count, draft_window, max_by_budget,
-                          capacity - sequence.execution_frontier - 1});
+            // Drafts after the first one the grammar rejects can never commit; drop them.
+            const std::uint32_t extent = plan_token_constraints(
+                requests[lanes[row]], static_cast<std::int32_t>(row * width),
+                std::span<const TokenId>(sequence.mtp_drafts.data(),
+                                         std::min({sequence.mtp_draft_count, draft_window,
+                                                   max_by_budget,
+                                                   capacity - sequence.execution_frontier - 1})));
+            std::fill_n(static_cast<std::int32_t*>(token_constraint_host.data()) + row * width +
+                            extent + 1,
+                        width - extent - 1, 0);
             mtp_host_ingress->anchors[row]        = sequence.ledger.back();
             mtp_host_ingress->base_frontiers[row] = checked_i32(frontier, "MTP batch frontier");
             mtp_host_ingress->remaining_budgets[row] =
@@ -3186,7 +3265,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                                   replay_records ? &*replay_records : nullptr, io,
                                                   prefill_hidden, prefill_chunk, proposal_head,
                                                   rope_frequency,
-                                                  peer_views(), pipeline_view(), pipeline_upload ? static_cast<TokenId*>(pipeline_upload->data()) : nullptr, volta_long_attention},
+                                                  peer_views(), pipeline_view(), pipeline_upload ? static_cast<TokenId*>(pipeline_upload->data()) : nullptr, volta_long_attention, constrained ? token_constraints : schedule::TokenConstraintView{}},
                                                  decoder->text_kv,
                                                  *decoder->mtp_cache(),
                                                  *io.mtp_decode,
@@ -3481,6 +3560,7 @@ void ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence,
         sequence.prefix_identity.size() != sequence.ledger_frontier) {
         throw std::logic_error("resolved round did not establish a valid frontier");
     }
+    if (request.grammar) { request.grammar->commit({&sequence.ledger.back(), 1}); }
     trim_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
     if (terminal) {
         // A complete owned RAM checkpoint remains a valid committed GDN frontier.

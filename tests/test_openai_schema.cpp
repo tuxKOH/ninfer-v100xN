@@ -359,9 +359,47 @@ int test_reject_unsupported() {
 
     Json rf               = base;
     rf["response_format"] = Json{{"type", "json_object"}};
+    const auto json_object = parse_chat_completion_request(rf, default_limits()).structured_output;
+    failures += check(json_object && json_object->kind == ninfer::StructuredOutputKind::JsonObject,
+                      "json_object response_format parsed");
+
+    const Json schema = {{"type", "object"},
+                         {"properties", Json{{"answer", Json{{"type", "integer"}}}}},
+                         {"required", Json::array({"answer"})}};
+    rf["response_format"] = Json{
+        {"type", "json_schema"},
+        {"json_schema", Json{{"name", "result"}, {"schema", schema}, {"strict", true}}}};
+    const auto json_schema = parse_chat_completion_request(rf, default_limits()).structured_output;
+    failures += check(json_schema && json_schema->kind == ninfer::StructuredOutputKind::JsonSchema &&
+                          Json::parse(json_schema->json_schema) == schema,
+                      "json_schema response_format carries its schema");
+
+    // nlohmann::json sorts keys; generation order must follow the request body instead.
+    const std::string ordered_body =
+        R"({"response_format":{"type":"json_schema","json_schema":{"name":"r","schema":)"
+        R"({"type":"object","properties":{"thought":{"type":"string"},"answer":{"type":"string"}}}}}})";
+    auto ordered = parse_chat_completion_request(
+                       [&] {
+                           Json request = base;
+                           request["response_format"] =
+                               Json::parse(ordered_body).at("response_format");
+                           return request;
+                       }(),
+                       default_limits())
+                       .structured_output;
+    restore_schema_order(ordered, ordered_body, {"response_format", "json_schema", "schema"});
+    failures += check(ordered && ordered->json_schema.find("thought") <
+                                     ordered->json_schema.find("answer"),
+                      "json_schema keeps the request's property order");
+
+    rf["response_format"] = Json{{"type", "json_schema"}, {"json_schema", Json{{"name", "x"}}}};
     failures +=
         check(throws_api([&] { (void)parse_chat_completion_request(rf, default_limits()); }),
-              "json response_format rejected");
+              "json_schema without a schema rejected");
+    rf["response_format"] = Json{{"type", "grammar"}};
+    failures += check(api_code([&] { (void)parse_chat_completion_request(rf, default_limits()); }) ==
+                          "response_format_not_supported",
+                      "unknown response_format type rejected");
 
     Json rf_text               = base;
     rf_text["response_format"] = Json{{"type", "text"}};

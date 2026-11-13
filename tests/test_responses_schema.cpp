@@ -347,9 +347,19 @@ int test_explicit_rejections() {
 
     Json structured    = base;
     structured["text"] = Json{{"format", Json{{"type", "json_schema"}}}};
-    failures += check(api_code([&] { (void)parse_responses_request(structured, limits()); }) ==
-                          "structured_outputs_not_supported",
-                      "structured output rejected");
+    failures += check(throws_api([&] { (void)parse_responses_request(structured, limits()); }),
+                      "json_schema text.format without a schema rejected");
+    const Json format = {{"type", "json_schema"},
+                         {"name", "result"},
+                         {"schema", Json{{"type", "object"}}},
+                         {"strict", true}};
+    structured["text"]        = Json{{"format", format}};
+    const auto parsed         = parse_responses_request(structured, limits());
+    failures += check(parsed.generation.structured_output &&
+                          parsed.generation.structured_output->kind ==
+                              ninfer::StructuredOutputKind::JsonSchema &&
+                          parsed.text_format == format,
+                      "json_schema text.format parsed and echoed");
 
     Json background          = base;
     background["background"] = true;

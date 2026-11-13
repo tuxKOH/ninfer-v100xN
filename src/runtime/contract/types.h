@@ -4,9 +4,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <span>
 
 namespace ninfer::runtime {
+
+class CompiledTokenGrammar;
 
 using ::ninfer::FinishReason;
 using ::ninfer::KvCapacityMode;
@@ -23,6 +26,8 @@ struct ResolvedExecutionOptions {
     ResolvedSamplingParameters sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
+    // Present when content tokens are restricted to a structured-output grammar.
+    std::shared_ptr<const CompiledTokenGrammar> grammar;
 };
 
 struct ResolvedRequestOptions {

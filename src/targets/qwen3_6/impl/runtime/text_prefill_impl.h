@@ -4,6 +4,7 @@
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/scalar.h"
+#include "ninfer/ops/token_bitmask.h"
 
 #include <cuda_runtime.h>
 
@@ -75,6 +76,7 @@ PrefillChunkResult prefill_text_chunk(
                         state.rewrite_checkpoint_state_slot, state.mtp_proposal_extent);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_retrieval_query_capture(state.capture_retrieval_query);
+    card.set_token_constraints(state.execution.token_constraints);
     card.set_prefill_rewrite_checkpoint_frontier(
         rewrite_checkpoint_capture_frontier
             ? static_cast<std::int64_t>(*rewrite_checkpoint_capture_frontier)
@@ -110,6 +112,7 @@ prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt
     configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
                         state.rewrite_checkpoint_state_slot, state.mtp_proposal_extent);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
+    card.set_token_constraints(state.execution.token_constraints);
     card.set_prefill_rewrite_checkpoint_frontier(
         rewrite_checkpoint_capture_frontier
             ? static_cast<std::int64_t>(*rewrite_checkpoint_capture_frontier)
@@ -196,6 +199,11 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
     CUDA_CHECK(cudaMemcpyAsync(state.execution.io.pos.data, &absolute_position,
                                sizeof(absolute_position), cudaMemcpyHostToDevice,
                                state.execution.device.stream));
+    if (const TokenConstraintView& constraints = state.execution.token_constraints) {
+        ops::apply_token_bitmask(logits, TextConfig::token_domain, 0, constraints.constrained,
+                                 constraints.bitmask, constraints.words,
+                                 state.execution.device.stream);
+    }
     ops::sample(logits, state.execution.io.token, TextConfig::token_domain, state.sampling,
                 state.execution.io.pos, purpose, state.execution.work,
                 state.execution.device.stream);

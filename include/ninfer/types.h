@@ -227,10 +227,23 @@ struct StopPolicy {
     bool publish_stop_token     = false;
 };
 
+// Grammar-constrained content. Every generated content token is restricted to continuations of
+// the selected JSON language; reasoning tokens are unconstrained until the reasoning channel closes.
+enum class StructuredOutputKind : std::uint8_t {
+    JsonObject, // any JSON object
+    JsonSchema, // an instance of json_schema; properties absent from the schema are rejected
+};
+
+struct StructuredOutput {
+    StructuredOutputKind kind = StructuredOutputKind::JsonObject;
+    std::string json_schema;
+};
+
 struct ExecutionOptions {
     SamplingOverrides sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
+    std::optional<StructuredOutput> structured_output;
 };
 
 struct OutputOptions {
@@ -342,6 +355,7 @@ enum class RequestErrorKind : std::uint8_t {
     QueueTimeout,
     Cancelled,
     Unavailable,
+    InvalidStructuredOutput,
 };
 
 class RequestError final : public std::invalid_argument {

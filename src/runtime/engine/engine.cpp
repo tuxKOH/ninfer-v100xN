@@ -365,9 +365,27 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     if (prompt.impl_ == nullptr) { throw std::invalid_argument("PreparedPrompt is empty"); }
 
+    const std::optional<StructuredOutput> structured_output =
+        std::move(options.execution.structured_output);
     runtime::ResolvedRequestOptions resolved_options = resolve_request_options(
         impl_->sampling_defaults, prompt.impl_->sampling_mode, std::move(options));
     const ResolvedSamplingParameters resolved_sampling = resolved_options.execution.sampling;
+    if (structured_output) {
+        // DFlash proposes and verifies inside one device round, so no host grammar can license
+        // its draft columns.
+        if (impl_->options.speculative.backend == SpeculativeBackend::DFlash) {
+            throw RequestError(RequestErrorKind::InvalidStructuredOutput,
+                               "structured output requires the None or MTP speculative backend");
+        }
+        resolved_options.execution.grammar = std::visit(
+            [&](const auto& target_ptr) {
+                if (target_ptr == nullptr) {
+                    throw std::logic_error("Engine target is not active");
+                }
+                return target_ptr->loaded->frontend.compile_structured_output(*structured_output);
+            },
+            impl_->active);
+    }
 
     const PromptSummary prompt_summary = prompt.impl_->summary;
     if (prompt_summary.prompt_tokens > impl_->options.max_context) {

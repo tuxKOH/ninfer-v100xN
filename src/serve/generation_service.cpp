@@ -76,6 +76,11 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception) {
         error.type   = "server_error";
         error.code   = "service_unavailable";
         break;
+    case ninfer::RequestErrorKind::InvalidStructuredOutput:
+        error.param  = "response_format";
+        error.status = 400;
+        error.code   = "invalid_response_format";
+        break;
     }
     return error;
 }
@@ -260,6 +265,10 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.load_progress            = std::move(load_progress);
     engine_              = std::make_unique<ninfer::Engine>(std::move(engine_options));
     prompt_capabilities_ = engine_->prompt_capabilities();
+    if (options_.reasoning_effort &&
+        !prompt_capabilities_.reasoning_effort.supports(*options_.reasoning_effort)) {
+        throw std::invalid_argument("--reasoning-effort is not exposed by the loaded chat template");
+    }
     request_capacity_    = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
     engine_options_ = engine_->options();

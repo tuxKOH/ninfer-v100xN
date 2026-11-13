@@ -9,6 +9,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
+#include <initializer_list>
 #include <optional>
 #include <string>
 
@@ -24,6 +25,18 @@ GenerationRequest parse_chat_completion_request(const nlohmann::json& body,
                                                 const RequestLimits& limits);
 
 std::optional<bool> parse_openai_preserve_thinking(const nlohmann::json& body);
+
+// Parses one OpenAI structured-output format object, returning nullopt for {type:"text"}.
+// Chat Completions nests the schema definition under `json_schema`; Responses places name,
+// schema, strict and description on the format object itself. Every schema is enforced.
+std::optional<ninfer::StructuredOutput>
+parse_structured_output_format(const nlohmann::json& format, const std::string& param,
+                               bool nested_definition);
+
+// nlohmann::json sorts object members, but a JSON Schema's property order is the order in which
+// the grammar generates them. Restores a parsed JSON Schema to the raw request body's order.
+void restore_schema_order(std::optional<ninfer::StructuredOutput>& output, const std::string& body,
+                          std::initializer_list<const char*> schema_path);
 
 // Non-streaming chat completion response body (JSON string). When `reasoning` is
 // non-empty it is attached as `message.reasoning_content` (the DeepSeek/vLLM-style

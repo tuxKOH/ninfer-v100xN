@@ -10,6 +10,10 @@
 #include <span>
 #include <vector>
 
+namespace ninfer::runtime {
+class CompiledTokenGrammar;
+} // namespace ninfer::runtime
+
 namespace ninfer::targets::qwen3_6 {
 
 inline constexpr std::size_t kTokenDomain = 248077;
@@ -132,6 +136,9 @@ public:
                                                     const StopPolicy& caller_stop,
                                                     const OutputOptions& output = {}) const;
     [[nodiscard]] const StopPolicy& default_stop_policy() const noexcept;
+    // Compiles a content grammar over this tokenizer. Throws RequestError for an unusable schema.
+    [[nodiscard]] std::shared_ptr<const runtime::CompiledTokenGrammar>
+    compile_structured_output(const StructuredOutput& output) const;
 
 private:
     class Impl;

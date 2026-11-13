@@ -195,6 +195,8 @@ struct GenerationRequest {
     std::optional<bool> preserve_thinking;
     bool preserve_thinking_semantic_change = false;
     SamplingParams sampling;
+    // Grammar-constrained content requested through response_format / text.format.
+    std::optional<ninfer::StructuredOutput> structured_output;
 
     [[nodiscard]] bool uses_tools() const noexcept {
         return !tools.empty() && tool_choice.mode != ToolChoiceMode::None;
