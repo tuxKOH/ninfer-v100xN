@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "core/layout.h"
+#include "ops/linear_swiglu/swiglu_fp32.h"
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"
 
 #include "cutlass/bfloat16.h"
@@ -13,6 +14,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -112,6 +114,19 @@ using GemmFor = cutlass::gemm::device::Gemm<ElementInputA, LayoutInputA, Element
                                          EpilogueOp<ElementOutput>, SwizzleThreadBlock, kNumStages>;
 using Gemm = GemmFor<cutlass::bfloat16_t>;
 
+// Bound the FP16 weight image for the unsharded 27B matrices. A band
+// contains complete 128-row scale tiles and contracts the entire K axis.
+int band_rows(int n, int k) {
+    const bool full = (k == 5120 && (n == 14336 || n == 16384 || n == 34816)) ||
+                      (n == 5120 && (k == 6144 || k == 17408));
+    if (!full) { return n; }
+    constexpr int bytes = 48 * 1024 * 1024;
+    return std::min(n, bytes / (k * 2 * 128) * 128);
+}
+
+// Four equal gate/up bands cover the 27B SwiGLU intermediate.
+constexpr int kSwiGluBand = 4352;
+
 template <class Allocator>
 struct CutlassWorkspace {
     Tensor w_fp16;
@@ -124,7 +139,7 @@ CutlassWorkspace<Allocator> allocate_cutlass_workspace(Allocator& allocator, std
                                                        std::int32_t k, std::int32_t cols,
                                                        std::size_t gemm_workspace_bytes) {
     CutlassWorkspace<Allocator> out;
-    out.w_fp16 = allocator.alloc(DType::FP16, {k, n});
+    out.w_fp16 = allocator.alloc(DType::FP16, {k, band_rows(n, k)});
     out.x_fp16 = allocator.alloc(DType::FP16, {k, cols});
     if (gemm_workspace_bytes > 0) { out.gemm_workspace = allocator.alloc_bytes(gemm_workspace_bytes); }
     return out;
@@ -141,7 +156,7 @@ std::size_t workspace_bytes_impl(std::int32_t n, std::int32_t k, std::int32_t co
     return layout.peak_bytes(1);
 }
 
-template <class ElementOutput, int TileN>
+template <class ElementOutput, int TileN, bool SwiGlu = false>
 void launch_impl(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
                  cudaStream_t stream) {
     using Gemm = GemmFor<ElementOutput, TileN>;
@@ -161,46 +176,63 @@ void launch_impl(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& 
     auto* w_fp16 = static_cast<cutlass::half_t*>(scratch.w_fp16.data);
     auto* x_fp16 = static_cast<cutlass::half_t*>(scratch.x_fp16.data);
 
-    const dim3 block(256);
-    if (w.layout == QuantLayout::VoltaQpnPrepacked) {
-        const dim3 grid(static_cast<unsigned>((static_cast<std::int64_t>(n) * (k / 16) + 255) / 256));
-        dequant_nvfp4_qpn_to_fp16<<<grid, block, 0, stream>>>(
-            static_cast<const std::uint8_t*>(w.qdata),
-            static_cast<const std::uint8_t*>(w.scales), n, k, 1.0F / w.weight_scale_divisor,
-            w_fp16);
-    } else {
-        const dim3 grid(static_cast<unsigned>(div_up_i(k / 2, 256)), static_cast<unsigned>(n), 1u);
-        dequant_nvfp4_row_to_fp16<<<grid, block, 0, stream>>>(
-            static_cast<const std::uint8_t*>(w.qdata),
-            static_cast<const std::uint8_t*>(w.scales), n, k, 1.0F / w.weight_scale_divisor,
-            w_fp16);
-    }
-    CUDA_CHECK(cudaGetLastError());
-
     const std::int64_t x_count = static_cast<std::int64_t>(cols) * k;
     const int x_blocks         = static_cast<int>((x_count + 255) / 256);
     bf16_to_fp16_kernel<<<x_blocks, 256, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
                                                       x_fp16, x_count);
     CUDA_CHECK(cudaGetLastError());
 
-    Gemm gemm_op;
-    typename Gemm::Arguments arguments{
-        problem_size, {x_fp16, k}, {w_fp16, k}, {static_cast<ElementOutput*>(out.data), n},
-        {static_cast<ElementOutput*>(out.data), n},
-        {ElementComputeEpilogue(1), ElementComputeEpilogue(0)}, 1};
-    cutlass::Status status = gemm_op.can_implement(arguments);
-    if (status != cutlass::Status::kSuccess) {
-        throw std::runtime_error("nvfp4_cutlass_sm70: CUTLASS can_implement failed");
+    const int band = band_rows(n, k);
+    const auto project = [&](int first, int rows, ElementOutput* destination, int stride) {
+        const auto offset = static_cast<std::int64_t>(first) * k;
+        const auto* codes = static_cast<const std::uint8_t*>(w.qdata) + offset / 2;
+        const auto* scales = static_cast<const std::uint8_t*>(w.scales) + offset / 16;
+        const dim3 block(256);
+        if (w.layout == QuantLayout::VoltaQpnPrepacked) {
+            const dim3 grid(static_cast<unsigned>((static_cast<std::int64_t>(rows) * (k / 16) + 255) / 256));
+            dequant_nvfp4_qpn_to_fp16<<<grid, block, 0, stream>>>(
+                codes, scales, rows, k, 1.0F / w.weight_scale_divisor, w_fp16);
+        } else {
+            const dim3 grid(static_cast<unsigned>(div_up_i(k / 2, 256)), static_cast<unsigned>(rows), 1u);
+            dequant_nvfp4_row_to_fp16<<<grid, block, 0, stream>>>(
+                codes, scales, rows, k, 1.0F / w.weight_scale_divisor, w_fp16);
+        }
+        CUDA_CHECK(cudaGetLastError());
+
+        Gemm gemm_op;
+        typename Gemm::Arguments arguments{
+            {cols, rows, k}, {x_fp16, k}, {w_fp16, k}, {destination, stride},
+            {destination, stride},
+            {ElementComputeEpilogue(1), ElementComputeEpilogue(0)}, 1};
+        cutlass::Status status = gemm_op.can_implement(arguments);
+        if (status != cutlass::Status::kSuccess) {
+            throw std::runtime_error("nvfp4_cutlass_sm70: CUTLASS can_implement failed");
+        }
+        status = gemm_op.initialize(arguments, scratch.gemm_workspace.data, stream);
+        if (status != cutlass::Status::kSuccess) {
+            throw std::runtime_error("nvfp4_cutlass_sm70: CUTLASS initialize failed");
+        }
+        status = gemm_op(stream);
+        if (status != cutlass::Status::kSuccess) {
+            throw std::runtime_error("nvfp4_cutlass_sm70: CUTLASS gemm() failed");
+        }
+        CUDA_CHECK(cudaGetLastError());
+    };
+    if constexpr (SwiGlu) {
+        const int intermediate = n / 2;
+        Tensor pair = ws.alloc(DType::FP32, {2 * kSwiGluBand, cols});
+        auto* values = static_cast<float*>(pair.data);
+        for (int first = 0; first < intermediate; first += kSwiGluBand) {
+            project(first, kSwiGluBand, values, 2 * kSwiGluBand);
+            project(intermediate + first, kSwiGluBand, values + kSwiGluBand, 2 * kSwiGluBand);
+            auto result = out.slice(0, first, kSwiGluBand);
+            swiglu_fp32_launch(pair, nullptr, result, stream);
+        }
+    } else {
+        for (int first = 0; first < n; first += band) {
+            project(first, std::min(band, n - first), static_cast<ElementOutput*>(out.data) + first, n);
+        }
     }
-    status = gemm_op.initialize(arguments, scratch.gemm_workspace.data, stream);
-    if (status != cutlass::Status::kSuccess) {
-        throw std::runtime_error("nvfp4_cutlass_sm70: CUTLASS initialize failed");
-    }
-    status = gemm_op(stream);
-    if (status != cutlass::Status::kSuccess) {
-        throw std::runtime_error("nvfp4_cutlass_sm70: CUTLASS gemm() failed");
-    }
-    CUDA_CHECK(cudaGetLastError());
 }
 
 template <class ElementOutput>
@@ -221,6 +253,16 @@ void launch(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
 std::size_t nvfp4_cutlass_sm70_workspace_bytes(std::int32_t n, std::int32_t k,
                                                std::int32_t cols) {
     return workspace_bytes_impl(n, k, cols);
+}
+
+std::size_t nvfp4_cutlass_sm70_full_swiglu_workspace_bytes(int cols) {
+    return workspace_bytes_impl(34816, 5120, cols) +
+           static_cast<std::size_t>(2 * kSwiGluBand) * cols * sizeof(float);
+}
+
+void nvfp4_cutlass_sm70_full_swiglu_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                           WorkspaceArena& ws, cudaStream_t stream) {
+    launch_impl<float, 128, true>(x, w, out, ws, stream);
 }
 
 void nvfp4_cutlass_sm70_launch(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,

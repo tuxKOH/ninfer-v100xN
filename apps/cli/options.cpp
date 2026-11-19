@@ -138,7 +138,7 @@ std::string usage_text(const char* argv0) {
            "--vision enables image/video input; --vision-device gpu (default) or cpu selects the encoder.\n"
            "--prefix-cache-tokens N: historical host KV budget, default 384000; 0 disables history.\n"
            "--volta-long-attention selects experimental complete-history SM70 TP2/TP4 INT8 attention (1..8 requests); floating-point output may differ.\n"
-           "--volta-fast-decode selects experimental QUASAR TP2/TP4 Text NVFP4 FP32 epilogues and packed MTP W8; output may differ.\n"
+           "--volta-fast-decode selects experimental QUASAR TP1/TP2/TP4 Text NVFP4 FP32 epilogues and packed MTP W8; output may differ. With --lm-head-draft, TP1 uses the first 65536 artifact proposal rows.\n"
            "--ram-kv-window enables experimental approximate Q/K mean-vector RAM-KV retrieval (SM70, 27B Text/MTP, TP1/TP2/PP2).\n"
            "It changes long-history attention. Default archive budget: 32000000000 bytes; not a process RSS cap.\n"
            "--vision-max-tokens N bounds merged visual tokens per prompt (1..32768, default 32768),\n"

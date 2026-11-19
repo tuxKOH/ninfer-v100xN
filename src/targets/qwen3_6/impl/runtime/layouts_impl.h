@@ -104,6 +104,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     }
     const std::int32_t linear_state_slots =
         LinearStateSlots::state_slot_count(plan.max_concurrency) + (plan.ram_kv.gpu_tokens != 0 ? 1 : 0);
+    // In single-GPU RAM-KV the rewrite and final-query preview images are only copied.
+    const int host_checkpoints = tp == 1 && plan.pp == 1 && plan.ram_kv.gpu_tokens != 0 ? 2 : 0;
     const auto effective_prefill_chunk =
         static_cast<std::int32_t>(std::min(plan.prefill_chunk, plan.capacity));
     const std::uint32_t logical_pages  = page_count(plan.capacity);
@@ -133,6 +135,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .text_physical_page_groups = physical_pages,
                      .mtp_physical_page_groups  = mtp_physical_pages,
                      .ram_kv                    = plan.ram_kv.gpu_tokens != 0,
+                     .host_retrieval_keys       = tp == 1 && plan.pp == 1 && plan.ram_kv.gpu_tokens != 0,
                      .linear_attention =
                          {
                              .layers         = static_cast<std::uint32_t>(TextConfig::gdn_layers() / plan.pp),
@@ -141,9 +144,10 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                              .value_heads    = TextConfig::gdn_value_heads / tp,
                              .value_head_dim = TextConfig::gdn_value_head_dim,
                              .key_head_dim   = TextConfig::gdn_key_head_dim,
-                             .slot_count     = linear_state_slots,
+                             .slot_count     = linear_state_slots - host_checkpoints,
                              .conv_dtype     = DType::BF16,
                          },
+                     .host_checkpoint_slots = host_checkpoints,
                  });
     if (plan.speculative_backend != SpeculativeBackend::None) {
         // Replay records follow the device's layer/head geometry. Record capacity and

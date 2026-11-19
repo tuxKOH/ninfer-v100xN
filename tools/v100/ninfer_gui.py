@@ -313,7 +313,7 @@ class NInferGui(QWidget):
                                "本配置无确定速度/GPQA数据；RAM archive 预算不等于进程 RSS 限制。\n"
                                "KV 容量启用时自动等于 GPU window。与视觉、DFlash、TP4、长注意力互斥。")
         self.volta_fast_decode.setToolTip(
-            "对应 --volta-fast-decode；QUASAR / SM70 / TP2/TP4 / 纯文本 None/MTP，DFlash 仅 TP2。\n"
+            "对应 --volta-fast-decode；QUASAR / SM70 / TP1/TP2/TP4 / 纯文本 None/MTP，DFlash 仅 TP2。\n"
             "NVFP4 FP32 末尾缩放、MTP W8 重排与归约；可能改变 logits、草稿接受和输出。\n"
             "DFlash7：85K 122.65→128.11 tok/s（+4.45%）；长注意力组合 168.15（+37.10%）。\n"
             "DFlash 仅改目标 NVFP4，保留 W8/BF16 drafter；HumanEval 64 次有 2 次输出变化，质量未测。\n"
@@ -885,9 +885,9 @@ class NInferGui(QWidget):
                 self.ram_kv.isChecked() or (spec == "dflash" and tp != 2)):
             return ("实验性长上下文注意力要求 TP2/TP4、INT8 KV、并发 1–8、视觉和 DFlash 仅支持 TP2；"
                     "请调整配置或取消勾选该开关。硬件和模型还须为 SM70 27B。")
-        if self.volta_fast_decode.isChecked() and (tp not in (2, 4) or self.vision.isChecked() or
+        if self.volta_fast_decode.isChecked() and (self.vision.isChecked() or
                                                     (spec == "dflash" and tp != 2)):
-            return "实验性快速数值路径要求 QUASAR / SM70 / TP2/TP4 / 纯文本；DFlash 仅 TP2"
+            return "实验性快速数值路径要求 QUASAR / SM70 / TP1/TP2/TP4 / 纯文本；DFlash 仅 TP2"
         if self.vision.isChecked() and (tp != 2 or spec == "dflash"):
             return "视觉要求 TP2，后端为 none 或 mtp；不能与 DFlash 一起使用"
         if self.vision.isChecked() and artifact.name in {"qwen3_8_27b_q4_k_m.ninfer", "qwen3_8_27b_fp8.ninfer"}:

@@ -14,7 +14,7 @@ template <bool RowScaled>
 __global__ void swiglu_fp32_kernel(const float* __restrict__ projected,
                                    const __nv_bfloat16* __restrict__ scales,
                                    __nv_bfloat16* __restrict__ output,
-                                   std::int64_t intermediate, std::int32_t tokens) {
+                                   std::int64_t intermediate, std::int32_t tokens, std::int64_t output_stride) {
     const std::int64_t index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= intermediate * tokens) { return; }
     const std::int64_t token = index / intermediate;
@@ -26,7 +26,7 @@ __global__ void swiglu_fp32_kernel(const float* __restrict__ projected,
         gate *= __bfloat162float(scales[row]);
         up *= __bfloat162float(scales[row + intermediate]);
     }
-    output[index] = __float2bfloat16_rn(silu(gate) * up);
+    output[token * output_stride + row] = __float2bfloat16_rn(silu(gate) * up);
 }
 
 } // namespace
@@ -41,11 +41,11 @@ void swiglu_fp32_launch(const Tensor& projected, const void* row_scales, Tensor&
         swiglu_fp32_kernel<true><<<blocks, kThreads, 0, stream>>>(
             static_cast<const float*>(projected.data),
             static_cast<const __nv_bfloat16*>(row_scales),
-            static_cast<__nv_bfloat16*>(out.data), intermediate, out.ne[1]);
+            static_cast<__nv_bfloat16*>(out.data), intermediate, out.ne[1], out.nb[1] / sizeof(__nv_bfloat16));
     } else {
         swiglu_fp32_kernel<false><<<blocks, kThreads, 0, stream>>>(
             static_cast<const float*>(projected.data), nullptr,
-            static_cast<__nv_bfloat16*>(out.data), intermediate, out.ne[1]);
+            static_cast<__nv_bfloat16*>(out.data), intermediate, out.ne[1], out.nb[1] / sizeof(__nv_bfloat16));
     }
     CUDA_CHECK(cudaGetLastError());
 }

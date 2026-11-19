@@ -198,7 +198,7 @@ are a measured choice, not the 35B-A3B semantic limit.
 | `--kv-dtype bf16\|int8` | KV-cache storage | `bf16` |
 | `--prefix-cache-tokens N` | historical host KV budget in unique page-rounded Main Text tokens; `0` disables historical branches, preserving current GPU-prefix reuse | `384000` |
 | `--volta-long-attention` | experimental complete-history attention arithmetic; SM70 27B TP2/TP4, PP1, 1–8 active requests, INT8 KV; Vision and DFlash on TP2 only; excludes RAM-KV; floating-point association and output IDs may change | off |
-| `--volta-fast-decode` | experimental QUASAR SM70 TP2/TP4 Text/None/MTP or TP2 Text/DFlash numeric profile: packed NVFP4 FP32 epilogue and MTP W8 reductions; DFlash retains native W8 drafter; may change logits, acceptance and output; excludes Vision/PP2 | off |
+| `--volta-fast-decode` | experimental QUASAR SM70 TP1/TP2/TP4 Text/None/MTP or TP2 Text/DFlash numeric profile: packed NVFP4 FP32 epilogue and MTP W8 reductions; DFlash retains native W8 drafter; may change logits, acceptance and output; excludes Vision/PP2 | off |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..7` on 27B, `1..15` on 35B-A3B | unset |
 | `--lm-head-draft` | optimized proposal head | off |

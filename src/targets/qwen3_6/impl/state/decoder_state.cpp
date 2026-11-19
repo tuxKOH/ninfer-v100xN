@@ -15,7 +15,7 @@ std::uint32_t page_count(std::uint32_t capacity) {
 PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std::uint32_t capacity,
                               std::int32_t kv_heads, std::int32_t head_dim, DType dtype,
                               std::int32_t quant_group, std::int32_t table_rows,
-                              std::uint32_t physical_page_groups, bool ram_kv) {
+                              std::uint32_t physical_page_groups, bool ram_kv, bool host_retrieval_keys) {
     if (layers == 0 ||
         layers > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
         kv_heads <= 0 || head_dim <= 0 || table_rows <= 0) {
@@ -56,7 +56,11 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
         .quant_group = quant_group,
     };
     if (ram_kv) {
-        layout.retrieval_keys = builder.add_tensor(DType::FP32,
+        // Key summaries are written per KV page and scanned only on a retrieval
+        // refresh. The hot attention KV and query statistics remain device-local.
+        LayoutBuilder host;
+        layout.host_retrieval_keys = host_retrieval_keys;
+        layout.retrieval_keys = (host_retrieval_keys ? host : builder).add_tensor(DType::FP32,
             {head_dim, kv_heads, static_cast<int>(logical_pages), static_cast<int>(layers)}, 256, "retrieval K");
         layout.retrieval_query = builder.add_tensor(DType::FP32,
             {head_dim, kv_heads, static_cast<int>(layers)}, 256, "retrieval Q");
@@ -76,13 +80,14 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
     DecoderStateLayout layout;
     layout.text_kv = plan_cache(builder, spec.full_attention_layers, spec.capacity, spec.kv_heads,
                                 spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
-                                spec.kv_table_rows, spec.text_physical_page_groups, spec.ram_kv);
+                                spec.kv_table_rows, spec.text_physical_page_groups, spec.ram_kv, spec.host_retrieval_keys);
     if (spec.enable_mtp) {
         layout.mtp_kv = plan_cache(builder, spec.mtp_layers, spec.capacity, spec.kv_heads,
                                    spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
-                                   spec.kv_table_rows, spec.mtp_physical_page_groups, spec.ram_kv);
+                                   spec.kv_table_rows, spec.mtp_physical_page_groups, spec.ram_kv, spec.host_retrieval_keys);
     }
     layout.linear_attention = plan_linear_attention_state_pool(builder, spec.linear_attention);
+    layout.linear_attention.host_checkpoint_slots = spec.host_checkpoint_slots;
     return layout;
 }
 
@@ -91,7 +96,14 @@ PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout)
       kv_heads_(layout.kv_heads), head_dim_(layout.head_dim), dtype_(layout.dtype),
       quant_group_(layout.quant_group) {
     if (layout.pool.spec.ram_enabled) {
-        retrieval_keys = layout.retrieval_keys.bind(backing);
+        if (layout.host_retrieval_keys) {
+            host_keys_ = std::make_unique<PinnedHostBuffer>(layout.retrieval_keys.region.bytes);
+            void* mapped = nullptr;
+            CUDA_CHECK(cudaHostGetDevicePointer(&mapped, host_keys_->data(), 0));
+            retrieval_keys = layout.retrieval_keys.bind({mapped, host_keys_->size()});
+        } else {
+            retrieval_keys = layout.retrieval_keys.bind(backing);
+        }
         retrieval_query = layout.retrieval_query.bind(backing);
         retrieval_fallback = layout.retrieval_fallback.bind(backing);
         retrieval_counts = layout.retrieval_counts.bind(backing);

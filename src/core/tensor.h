@@ -75,6 +75,8 @@ struct Weight {
     float input_scale_divisor  = 0.0F;
     // Private SM70 NVFP4 execution profile; stored codes/scales/divisors stay unchanged.
     bool volta_fp32_scale = false;
+    // TP1 MTP and TP2 DFlash share W8 shapes but use different reduction orders.
+    bool w8_dflash_projection = false;
 };
 
 } // namespace ninfer

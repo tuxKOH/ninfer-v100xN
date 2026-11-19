@@ -198,6 +198,28 @@ int main() {
     slotted.export_slot(1, roundtrip, ctx.stream);
     if (image != roundtrip) { failures += fail("host state image did not round-trip exactly"); }
 
+    // Active state stays on device while two independent host checkpoints survive a rewrite.
+    auto host_plan = plan_state(2, 10, 3, 4, 5, 6);
+    host_plan.layout.host_checkpoint_slots = 2;
+    ninfer::DeviceArena host_arena(host_plan.bytes);
+    ninfer::LinearAttentionStatePool host_pool({host_arena.base(), host_arena.capacity()},
+                                               host_plan.layout);
+    std::vector<std::byte> first(host_pool.slot_bytes());
+    for (std::size_t i = 0; i < first.size(); ++i) { first[i] = std::byte(i % 251); }
+    host_pool.import_slot(0, first, ctx.stream);
+    host_pool.copy_slot(0, 1, ctx.stream);
+    host_pool.zero_slot(0, ctx.stream);
+    host_pool.copy_slot(0, 2, ctx.stream);
+    host_pool.copy_slot(1, 0, ctx.stream);
+    std::vector<std::byte> restored(first.size());
+    host_pool.export_slot(0, restored, ctx.stream);
+    if (restored != first) { failures += fail("rewrite checkpoint bytes changed"); }
+    host_pool.copy_slot(2, 0, ctx.stream);
+    host_pool.export_slot(0, restored, ctx.stream);
+    if (restored != std::vector<std::byte>(first.size())) {
+        failures += fail("preview checkpoint aliases rewrite checkpoint");
+    }
+
     auto fp32_conv_plan = plan_state(1, 7, 2, 2, 3, 4, 2, ninfer::DType::FP32);
     ninfer::DeviceArena fp32_conv_arena(fp32_conv_plan.bytes);
     ninfer::LinearAttentionStatePool fp32_conv({fp32_conv_arena.base(), fp32_conv_arena.capacity()},

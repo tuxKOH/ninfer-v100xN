@@ -249,6 +249,13 @@ void Variant::mtp_attention_projection(const Tensor& hidden,
 
 void Variant::mtp_kv_projection(const Tensor& hidden, const MtpAttentionProjectionWeights& weights,
                                 Tensor& key, Tensor& value, WorkspaceArena&, cudaStream_t stream) {
+    if (weights.key.layout == QuantLayout::VoltaQpnPrepacked) {
+        // The unsharded W8 pair kernel consumes row-split weights. These
+        // aligned views use the same packed projection as the complete head.
+        ops::linear(hidden, weights.key, key, stream);
+        ops::linear(hidden, weights.value, value, stream);
+        return;
+    }
     ops::linear_pair(hidden, weights.key, weights.value, key, value, stream);
 }
 

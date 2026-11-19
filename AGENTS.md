@@ -116,7 +116,7 @@ measurements of this target. The supported identities are
 `qwen3.8-27b/nvfp4`, `qwen3.8-27b/fp8`, `qwen3.8-27b/gguf-q4-k-m`, and
 `qwen3.6-35b-a3b/groupwise-int`.
 The explicitly requested QUASAR trial adds `qwen3.8-27b/quasar-nvfp4`, currently restricted to
-SM70 TP2 Text/None/MTP/DFlash, TP2 image/video Vision with None/MTP, experimental TP4
+SM70 TP1 Text/None/MTP, TP2 Text/None/MTP/DFlash, TP2 image/video Vision with None/MTP, experimental TP4
 Text/None/MTP, and experimental PP2 Text/None/MTP. Vision excludes DFlash, PP2 and the fast-decode numerical profile. Vision admits the default-off
 long-attention profile on TP2 with complete INT8 group-64 KV. It registers the published QUASAR v3 container identity, preserves its
 256 NVFP4 parents and FP32 activation divisors, and keeps its W8 vocabulary/MTP and BF16 GDN
@@ -192,7 +192,7 @@ qualification for this release uses the QUASAR v3 TP2/MTP4 artifact; no new GPQA
 Release 0.1.2 contains these Vision changes and an optional qualified Linux SM70 prebuilt;
 QUASAR TP4 qualification is recorded separately and ships in release 0.2.0.
 
-The optional `volta_fast_decode` profile is default-off and admits QUASAR SM70 TP2/TP4
+The optional `volta_fast_decode` profile is default-off and admits QUASAR SM70 TP1/TP2/TP4
 Text/None/MTP and TP2 Text/DFlash. DFlash keeps its native W8/BF16 drafter; its target verifier
 separately admits the optional seven/eight-query complete-history long-attention profile.
 Fast decode selects packed NVFP4 parents with FP32 scale-after-K-reduction and

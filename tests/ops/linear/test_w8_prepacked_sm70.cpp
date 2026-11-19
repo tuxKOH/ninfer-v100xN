@@ -17,11 +17,13 @@ namespace qw = ninfer::test::quantized_weight;
 #ifdef NINFER_VOLTA_BUILD
 namespace {
 
-int check_shape(int n, int k, std::span<const int> widths, bool exact_baseline = true) {
+int check_shape(int n, int k, std::span<const int> widths, bool exact_baseline = true,
+                bool dflash = false) {
     qw::PatternedWeightOptions options;
     options.decorrelate_coordinates = true;
     fixture::DevicePackedWeight weight(qw::make_patterned_weight(QType::W8G32_F16S, n, k, 149U, options));
     Weight view = weight.view();
+    view.w8_dflash_projection = dflash;
     cudaStream_t stream;
     cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
     // The fixture upload uses the legacy default stream; establish a device-wide
@@ -137,8 +139,9 @@ int main() {
         failures += check_shape(62080, 5120, tp2_widths);
         failures += check_shape(248320, 5120, other_widths);
         const std::array mtp_widths{1, 2, 3, 5, 8, 9, 33};
-        for (const auto [n, k] : std::array<std::pair<int, int>, 10>{
-                 {{5120, 5120}, {7168, 5120}, {17408, 5120}, {5120, 3072}, {5120, 8704},
+        for (const auto [n, k] : std::array<std::pair<int, int>, 15>{
+                 {{14336, 5120}, {34816, 5120}, {5120, 10240}, {5120, 6144}, {5120, 17408},
+                  {5120, 5120}, {7168, 5120}, {17408, 5120}, {5120, 3072}, {5120, 8704},
                   {3584, 5120}, {8704, 5120}, {5120, 1536}, {5120, 2560}, {5120, 4352}}}) {
             failures += check_shape(n, k, mtp_widths, false);
         }
@@ -148,7 +151,7 @@ int main() {
         const std::array dflash_widths{1, 2, 3, 7, 8, 9, 33};
         for (const auto [n, k] : std::array<std::pair<int, int>, 5>{
                  {{4096, 5120}, {34816, 5120}, {5120, 4096}, {5120, 17408}, {5120, 25600}}}) {
-            failures += check_shape(n, k, dflash_widths);
+            failures += check_shape(n, k, dflash_widths, true, true);
         }
         return failures ? 1 : 0;
     } catch (const std::exception& error) {

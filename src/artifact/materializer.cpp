@@ -304,12 +304,20 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
         if (std::holds_alternative<ResourceDescriptor>(reader.objects().at(placement.object.index))) {
             ++out.stats_.resource_count;
         } else { ++out.stats_.tensor_count; }
-        auto& resource            = out.objects_.at(placement.object.index).resource;
+        auto& storage = out.objects_.at(placement.object.index);
         const PayloadSpan payload = reader.payload(reader.objects().at(placement.object.index));
-        resource.assign(payload.data.begin(), payload.data.end());
-        out.stats_.retained_host_bytes += resource.size();
+        if (placement.device_readable) {
+            storage.mapped_host = std::make_unique<PinnedHostBuffer>(payload.data.size());
+            std::copy(payload.data.begin(), payload.data.end(),
+                      static_cast<std::byte*>(storage.mapped_host->data()));
+            CUDA_CHECK(cudaHostGetDevicePointer(&storage.device[0], storage.mapped_host->data(), 0));
+            storage.device_bytes[0] = payload.data.size();
+        } else {
+            storage.resource.assign(payload.data.begin(), payload.data.end());
+        }
+        out.stats_.retained_host_bytes += payload.data.size();
         out.stats_.file_bytes =
-            checked_add(out.stats_.file_bytes, resource.size(), "artifact read bytes overflow u64");
+            checked_add(out.stats_.file_bytes, payload.data.size(), "artifact read bytes overflow u64");
     }
 
     std::vector<CopyRange> ranges;

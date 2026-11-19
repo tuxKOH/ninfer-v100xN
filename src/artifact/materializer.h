@@ -68,6 +68,7 @@ private:
         std::array<void*, kMaximumDevices> device{};
         std::array<std::uint64_t, kMaximumDevices> device_bytes{};
         std::vector<std::byte> resource;
+        std::unique_ptr<PinnedHostBuffer> mapped_host;
     };
 
     std::array<std::unique_ptr<DeviceArena>, kMaximumDevices> device_arena_;

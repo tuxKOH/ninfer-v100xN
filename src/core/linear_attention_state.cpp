@@ -125,6 +125,7 @@ LinearAttentionStatePool::LinearAttentionStatePool(DeviceSpan backing,
     const Tensor recurrent_shape(
         nullptr, DType::FP32,
         {spec.key_head_dim, spec.value_head_dim, spec.value_heads, spec.slot_count});
+    host_checkpoints.resize(layout.host_checkpoint_slots);
     conv.reserve(layout.conv.size());
     recurrent.reserve(layout.recurrent.size());
     for (std::size_t layer = 0; layer < layout.conv.size(); ++layer) {
@@ -179,7 +180,7 @@ void LinearAttentionStatePool::import_slot(std::int32_t slot, std::span<const st
     CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
-std::int32_t LinearAttentionStatePool::slot_count() const noexcept { return spec.slot_count; }
+std::int32_t LinearAttentionStatePool::slot_count() const noexcept { return spec.slot_count + static_cast<int>(host_checkpoints.size()); }
 
 std::int64_t LinearAttentionStatePool::conv_slot_stride_elements() const noexcept {
     return static_cast<std::int64_t>(spec.conv_channels) *
@@ -229,6 +230,30 @@ void LinearAttentionStatePool::copy_slot(std::int32_t src, std::int32_t dst, cud
     validate_layer_slot(*this, 0, src, "LinearAttentionStatePool copy_slot source");
     validate_layer_slot(*this, 0, dst, "LinearAttentionStatePool copy_slot destination");
     if (src == dst) { return; }
+    if (src >= spec.slot_count || dst >= spec.slot_count) {
+        const bool save = dst >= spec.slot_count;
+        const int resident = save ? src : dst;
+        if (resident >= spec.slot_count) {
+            throw std::invalid_argument("a host checkpoint copy requires one resident slot");
+        }
+        auto& image = host_checkpoints.at((save ? dst : src) - spec.slot_count);
+        if (save && !image) { image = std::make_unique<PinnedHostBuffer>(slot_bytes()); }
+        if (!image) { throw std::logic_error("restoring an empty linear attention checkpoint"); }
+        auto* position = static_cast<std::byte*>(image->data());
+        for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
+            for (const Tensor tensor : {conv_slot(layer, resident), recurrent_slot(layer, resident)}) {
+                if (save) {
+                    CUDA_CHECK(cudaMemcpyAsync(position, tensor.data, tensor.bytes(),
+                                               cudaMemcpyDeviceToHost, stream));
+                } else {
+                    CUDA_CHECK(cudaMemcpyAsync(tensor.data, position, tensor.bytes(),
+                                               cudaMemcpyHostToDevice, stream));
+                }
+                position += tensor.bytes();
+            }
+        }
+        return;
+    }
     for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
         const Tensor source      = conv_slot(layer, src);
         const Tensor destination = conv_slot(layer, dst);

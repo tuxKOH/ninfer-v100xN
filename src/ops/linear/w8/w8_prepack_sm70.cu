@@ -8,6 +8,7 @@
 #include "ops/linear/w8/w8_launch.h"
 #include "ops/linear/w8/w8_dispatch.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 #include <type_traits>
@@ -242,27 +243,34 @@ void w8_prepack_qpn_sm70(Weight& weight, cudaStream_t stream) {
         !((weight.k == 5120 && (weight.n == 248320 || weight.n == 124160 ||
              weight.n == 62080 || weight.n == 5120 || weight.n == 3584 ||
              weight.n == 7168 || weight.n == 8704 || weight.n == 17408 ||
-             weight.n == 4096 || weight.n == 34816)) ||
+             weight.n == 4096 || weight.n == 14336 || weight.n == 34816)) ||
           (weight.n == 5120 && (weight.k == 1536 || weight.k == 2560 || weight.k == 4352 ||
                                 weight.k == 3072 || weight.k == 8704 || weight.k == 4096 ||
-                                weight.k == 17408 || weight.k == 25600))) ||
+                                weight.k == 6144 || weight.k == 10240 || weight.k == 17408 || weight.k == 25600))) ||
         weight.padded_shape[0] != weight.n || weight.padded_shape[1] != weight.k) {
         throw std::invalid_argument("W8 QPN prepack requires a registered row-split vocabulary, MTP or DFlash projection");
     }
-    const auto code_bytes = static_cast<std::size_t>(weight.n) * weight.k;
-    const auto scale_bytes = code_bytes / 32 * sizeof(std::uint16_t);
-    DeviceBuffer scratch(code_bytes + scale_bytes);
+    // A QPN tile permutes 32 complete rows. Repack independent row bands in place
+    // so startup never needs a second full vocabulary head.
+    const int band_rows = std::min(weight.n, 4096);
+    const auto band_bytes = static_cast<std::size_t>(band_rows) * weight.k;
+    DeviceBuffer scratch(band_bytes + band_bytes / 32 * sizeof(std::uint16_t));
     auto* packed_codes = static_cast<std::uint8_t*>(scratch.p);
-    auto* packed_scales = reinterpret_cast<std::uint16_t*>(packed_codes + code_bytes);
-    const auto tuples = code_bytes / 8;
-    prepack_w8_qpn_kernel<<<static_cast<unsigned>((tuples + 255) / 256), 256, 0, stream>>>(
-        static_cast<const std::uint8_t*>(weight.qdata), static_cast<const std::uint16_t*>(weight.scales),
-        packed_codes, packed_scales, weight.n, weight.k);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaMemcpyAsync(const_cast<void*>(weight.qdata), packed_codes, code_bytes,
-                               cudaMemcpyDeviceToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(const_cast<void*>(weight.scales), packed_scales, scale_bytes,
-                               cudaMemcpyDeviceToDevice, stream));
+    auto* packed_scales = reinterpret_cast<std::uint16_t*>(packed_codes + band_bytes);
+    auto* codes = static_cast<std::uint8_t*>(const_cast<void*>(weight.qdata));
+    auto* scales = static_cast<std::uint16_t*>(const_cast<void*>(weight.scales));
+    for (int row = 0; row < weight.n; row += band_rows) {
+        const int rows = std::min(band_rows, weight.n - row);
+        const auto offset = static_cast<std::size_t>(row) * weight.k;
+        const auto bytes = static_cast<std::size_t>(rows) * weight.k;
+        prepack_w8_qpn_kernel<<<static_cast<unsigned>((bytes / 8 + 255) / 256), 256, 0, stream>>>(
+            codes + offset, scales + offset / 32, packed_codes, packed_scales, rows, weight.k);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaMemcpyAsync(codes + offset, packed_codes, bytes, cudaMemcpyDeviceToDevice,
+                                   stream));
+        CUDA_CHECK(cudaMemcpyAsync(scales + offset / 32, packed_scales, bytes / 32 * sizeof(*scales),
+                                   cudaMemcpyDeviceToDevice, stream));
+    }
     CUDA_CHECK(cudaStreamSynchronize(stream));
     weight.layout = QuantLayout::VoltaQpnPrepacked;
 }
@@ -275,13 +283,8 @@ void launch_w8_prepacked_sm70(const Tensor& x, const Weight& weight, Tensor& out
     const auto* scales = static_cast<const std::uint16_t*>(weight.scales);
     const auto* input = static_cast<const __nv_bfloat16*>(x.data);
     auto* output = static_cast<__nv_bfloat16*>(out.data);
-    // DFlash's native W8 projections previously used the four-part row-major
-    // QPN contraction. Keep that exact K association after permuting addresses;
-    // the MTP-specific 8/16-way profiles have a different reduction tree.
-    const bool dflash = (weight.k == 5120 && (weight.n == 4096 || weight.n == 34816)) ||
-        (weight.n == 5120 && (weight.k == 4096 || weight.k == 17408 || weight.k == 25600));
-    const bool mtp = weight.n <= 17408 && !dflash;
-    if (workspace != nullptr && w8_prepacked_workspace_bytes(weight.n, weight.k, t, t) != 0) {
+    const bool mtp = weight.n <= 34816 && !weight.w8_dflash_projection;
+    if (!mtp && workspace != nullptr && w8_prepacked_workspace_bytes(weight.n, weight.k, t, t) != 0) {
         auto scope = workspace->scope();
         Tensor image = workspace->alloc(DType::FP16, {weight.k, t});
         auto* fp16 = static_cast<half*>(image.data);

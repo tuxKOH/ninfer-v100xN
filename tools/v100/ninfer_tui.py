@@ -242,8 +242,8 @@ class Settings:
         if self.long_attention and (self.tp not in (2, 4) or (self.backend == 'dflash' and self.tp != 2) or
                                     self.kv_dtype != 'int8' or self.ram_kv):
             raise ValueError('Experimental long attention requires TP2/TP4 INT8 KV concurrency 1..8, Vision/DFlash TP2 only, no RAM-KV')
-        if self.fast_decode and (self.tp not in (2, 4) or (self.backend == 'dflash' and self.tp != 2) or self.vision):
-            raise ValueError('Experimental fast decode requires QUASAR SM70 TP2/TP4 Text, DFlash TP2 only')
+        if self.fast_decode and ((self.backend == 'dflash' and self.tp != 2) or self.vision):
+            raise ValueError('Experimental fast decode requires QUASAR SM70 TP1/TP2/TP4 Text, DFlash TP2 only')
         if self.vision and (self.tp != 2 or self.backend == 'dflash'):
             raise ValueError('Vision requires TP2 None/MTP; fast decode remains Text-only')
         if self.vision and local_path(self.artifact).name in ('qwen3_8_27b_q4_k_m.ninfer', 'qwen3_8_27b_fp8.ninfer'):

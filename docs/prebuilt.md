@@ -1,7 +1,7 @@
 # Linux V100 prebuilt package
 
-The v0.2.1 release includes a Linux x86_64 / `sm_70` / CUDA 12.8 binary package.
-It supports the qualified V100 TP2 routes and QUASAR TP4 Text/MTP with 1–8 active requests, including both optional
+The v0.2.2 release includes a Linux x86_64 / `sm_70` / CUDA 12.8 binary package.
+It includes single-card QUASAR text inference, the qualified V100 TP2 routes and QUASAR TP4 Text/MTP with 1–8 active requests, including both optional
 experimental profiles. Model weights, the NVIDIA driver, Python and Qt are not included.
 See [TP4 measurements and limits](tp4.md); TP4 Vision/DFlash remain unsupported.
 Concurrent requests share the configured KV capacity; 180000 tokens admit only two
@@ -45,11 +45,32 @@ GPU; only BF16 visual embeddings are uploaded. CPU and GPU visual arithmetic are
 bit-identical. Long attention also changes floating-point association, so both can change
 logits or generated output. No new GPQA score or losslessness claim is made.
 
-To reproduce the v0.2.1 package after building with the private dependency prefix:
+## Single V100 16 GB
+
+Run the v3 text model on one available V100 with host RAM for the embedding table, GDN checkpoints
+and historical KV pages. The measured 85K profile leaves about 95 MiB of free VRAM after startup
+on a dedicated card. Select the physical GPU through `CUDA_VISIBLE_DEVICES`.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 ./bin/ninfer /path/to/qwen3_8_27b_nvfp4.ninfer \
+  --tp 1 --max-context 86016 --prefill-chunk 1280 --kv-dtype int8 \
+  --ram-kv-window 9472 --kv-capacity 9472 --prefix-cache-tokens 0 \
+  --spec mtp --draft-tokens 4 --lm-head-draft --volta-fast-decode \
+  --greedy --no-thinking --prompt "Write a Python palindrome test." --max-new 128
+```
+
+For the API, use `./bin/ninfer-serve` and replace `--prompt` and `--max-new` with
+`--host 127.0.0.1 --port 8080`. The GPU window uses approximate historical KV retrieval.
+Fast decode changes floating-point arithmetic and limits the MTP proposal head to 65,536
+artifact rows. Target verification uses all 248,320 vocabulary rows. Generated IDs can change.
+The two CUDA Graph runs produced the same 513 IDs as eager on the measured 85K input.
+GPQA and long-context retrieval quality remain unmeasured for this profile.
+
+To reproduce the v0.2.2 package after building with the private dependency prefix:
 
 ```bash
 .venv/bin/python3 tools/release/package_linux.py --build build-v100-tp4 \
-  --output dist --version 0.2.1 --dependency-prefix build/_deps/install
+  --output dist --version 0.2.2 --dependency-prefix build/_deps/install
 ```
 
 The packager checks transitive library resolution, glibc symbols, dependency license files and

@@ -59,10 +59,11 @@ void nvfp4_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight,
 
     auto launch_output = [&]<bool Fp16Image>() {
         if (weight.layout == QuantLayout::VoltaQpnPrepacked &&
-            (kIntermediate == 8704 || kIntermediate == 4352) &&
+            (kIntermediate == 8704 || kIntermediate == 4352 ||
+             (kIntermediate == 17408 && weight.volta_fp32_scale)) &&
             k == 5120 && t >= 4 && t <= 6) {
             auto launch = [&]<bool Fp32Scale>() {
-                if (kIntermediate == 4352) {
+                if (kIntermediate != 8704) {
                     nvfp4_volta_qpn_prepacked_kernel<1, 8, 2, Nvfp4PairedSwiGluOutput<Fp16Image>, half,
                                                     true, true, false, Fp32Scale, 4>
                         <<<kIntermediate / 32, 512, 0, stream>>>(

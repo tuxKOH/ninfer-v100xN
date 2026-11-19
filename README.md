@@ -31,6 +31,14 @@ The authors report GPQA-D 90.91% versus BF16 91.41%, and AIME'26 100% for both.
 These are external source-checkpoint results, not our V100 conversion scores or proof of
 losslessness. [Sources, independent comparison and limitations](docs/model-quality.md).
 
+## v0.2.2 · QUASAR on one 16 GB V100
+
+One V100-SXM2 16 GB now runs QUASAR NVFP4 text with MTP4. On the same 85,000-token code input,
+cold prefill rose from **374.5 to 939.0 tok/s** and committed decode from **87.4 to 113.9 tok/s**.
+The baseline was an earlier single-card development build. The 9,472-token GPU window retrieves
+older KV from host RAM. Retrieval and experimental arithmetic can change output. Quality has
+not been evaluated for this profile. [Single-card launch command](docs/prebuilt.md#single-v100-16-gb)
+
 ## v0.2.1: TP2 / TP4 concurrency and serving fixes
 
 QUASAR NVFP4 / MTP4 now uses packed batch projections, direct packet publication and fused

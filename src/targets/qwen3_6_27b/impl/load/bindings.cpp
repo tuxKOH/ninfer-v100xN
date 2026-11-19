@@ -509,6 +509,8 @@ void validate_draft_ids(const artifact::Binder& binder, artifact::ObjectHandle h
 
 // Real fused artifact object shapes fixed outside TextConfig (bind_artifact above).
 constexpr std::uint64_t kDraftHeadRows = 131072;
+// The artifact orders its Q4 shortlist by token frequency.
+constexpr int kSingleFastDraftRows = 65536;
 
 bool ends_with(std::string_view object, std::string_view suffix) {
     return object.size() >= suffix.size() &&
@@ -948,15 +950,16 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
                     (weights_profile != WeightsProfile::Qwen38Nvfp4 && !quasar))) {
         throw std::invalid_argument("PP2 currently supports Qwen3.8 NVFP4/QUASAR Text/None/MTP only");
     }
-    if (quasar && (tp != 2 && tp != 4 && pp != 2)) {
-        throw std::invalid_argument("QUASAR requires TP2, text-only TP4 or text-only PP2 (DFlash is TP2 only)");
+    const bool single_quasar = quasar && tp == 1 && pp == 1;
+    if (single_quasar && (features.vision || features.dflash())) {
+        throw std::invalid_argument("single-GPU QUASAR supports Text with None or MTP");
     }
     if (tp == 4 && features.vision) {
         throw std::invalid_argument("qwen3_6_27b: TP4 does not support Vision");
     }
-    if (features.volta_fast_decode && (!quasar || (tp != 2 && tp != 4) || pp != 1 ||
+    if (features.volta_fast_decode && (!quasar || (tp != 1 && tp != 2 && tp != 4) || pp != 1 ||
                                        features.vision || (features.dflash() && tp != 2))) {
-        throw std::invalid_argument("volta_fast_decode requires QUASAR SM70 TP2/TP4 Text/None/MTP, or TP2 Text/DFlash");
+        throw std::invalid_argument("volta_fast_decode requires QUASAR SM70 TP1/TP2/TP4 Text/None/MTP, or TP2 Text/DFlash");
     }
     if (native_fp8 && (tp != 4 || features.vision || features.dflash())) {
         throw std::invalid_argument("qwen3.8-27b/fp8 supports TP4 Text/MTP only");
@@ -977,7 +980,16 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
                                     " device(s) but bind_artifact was asked for tp " +
                                     std::to_string(tp));
     }
-    if (tp > 1) {
+    if (single_quasar && features.volta_fast_decode && features.optimized_proposal()) {
+        binder.set_shard_resolver([](std::string_view name) {
+            artifact::ShardPlacement placement;
+            if (name == "text/draft_head" || name == "text/draft_head_token_ids") {
+                placement.axis = artifact::ShardAxis::Rows;
+                placement.device_ranges[0].push_back({0, kSingleFastDraftRows});
+            }
+            return placement;
+        });
+    } else if (tp > 1) {
         const TextConfig config{};
         binder.set_shard_resolver([config, tp, weights_profile](std::string_view name) {
             return shard_placement(name, tp, config, weights_profile);
@@ -1020,8 +1032,14 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     }
 
     const NumericFormat vocabulary_format = endpoint_format(weights_profile);
-    out.token_embedding =
-        bind_weight(binder, "text/token_embedding", vocabulary_format, {248320, 5120});
+    // Both target and MTP gather only the requested W8 vocabulary rows.
+    out.token_embedding = {
+        .object = artifact::bind_tensor(binder, "text/token_embedding", vocabulary_format,
+                                        {248320, 5120}, single_quasar
+                                            ? artifact::TensorPlacement::MappedHost
+                                            : artifact::TensorPlacement::Device),
+        .format = vocabulary_format,
+    };
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
@@ -1280,13 +1298,15 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
 #endif
     if (plan.features.optimized_proposal()) {
         auto& proposal = runtime.optimized_proposal.emplace();
+        const int draft_rows = tp == 1 && plan.features.volta_fast_decode
+            ? kSingleFastDraftRows : static_cast<int>(kDraftHeadRows) / tp;
         proposal.head =
             artifact::materialized_weight(backing, plan.draft_head, plan.draft_format,
-                                          131072 / tp, 5120, device);
+                                          draft_rows, 5120, device);
         // Replicated: the winning index comes from a GLOBAL argmax over the allgathered proposal
         // logits and can name a row in either half.
         proposal.token_ids = artifact::materialized_tensor(backing, plan.draft_head_token_ids,
-                                                           NumericFormat::I32, {131072}, device);
+                                                           NumericFormat::I32, {draft_rows * tp}, device);
     }
 
     if (plan.features.mtp()) {
@@ -1358,6 +1378,7 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
             backing, plan.dflash.feature_projection, plan.dflash.projection_format, 5120, 25600, device);
 #ifdef NINFER_VOLTA_BUILD
         if (draft.feature_projection.qtype == QType::W8G32_F16S) {
+            draft.feature_projection.w8_dflash_projection = true;
             ::ninfer::ops::detail::w8_prepack_qpn_sm70(draft.feature_projection);
         }
 #endif
@@ -1390,9 +1411,13 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
                 // Q is disjoint from the K/V row views in the same artifact parent.
                 // Retain their original layout for context append and permute only
                 // the large projections used by the eight-column proposal block.
+                target.query.w8_dflash_projection = true;
                 ::ninfer::ops::detail::w8_prepack_qpn_sm70(target.query);
+                target.attention_output.w8_dflash_projection = true;
                 ::ninfer::ops::detail::w8_prepack_qpn_sm70(target.attention_output);
+                target.gate_up.w8_dflash_projection = true;
                 ::ninfer::ops::detail::w8_prepack_qpn_sm70(target.gate_up);
+                target.down.w8_dflash_projection = true;
                 ::ninfer::ops::detail::w8_prepack_qpn_sm70(target.down);
             }
 #endif

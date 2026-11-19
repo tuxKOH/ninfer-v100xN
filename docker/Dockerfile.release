@@ -3,7 +3,7 @@
 FROM ubuntu:24.04 AS base
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG VERSION=0.2.1
+ARG VERSION=0.2.2
 RUN apt-get update && apt-get install --yes --no-install-recommends \
         ca-certificates curl python3 python3-venv tini ncurses-term \
     && rm -rf /var/lib/apt/lists/* \
@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install --yes --no-install-recommends \
 
 # The build context is the extracted Linux SM70 release package.
 FROM base AS release
-ARG VERSION=0.2.1
+ARG VERSION=0.2.2
 WORKDIR /opt/ninfer
 COPY . .
 RUN ln -s /opt/ninfer/bin/ninfer /usr/local/bin/ninfer \

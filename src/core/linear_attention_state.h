@@ -6,6 +6,7 @@
 #include <cuda_runtime_api.h>
 
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -26,6 +27,7 @@ struct LinearAttentionStatePoolLayout {
     LinearAttentionStatePoolSpec spec;
     std::vector<LayoutRegion> conv;
     std::vector<LayoutRegion> recurrent;
+    int host_checkpoint_slots = 0;
 };
 
 struct LinearAttentionStateAllLayersView {
@@ -50,6 +52,8 @@ struct LinearAttentionStatePool {
     std::vector<Tensor> conv;
     std::vector<Tensor> recurrent;
     LinearAttentionStatePoolSpec spec;
+
+    std::vector<std::unique_ptr<PinnedHostBuffer>> host_checkpoints;
 
     LinearAttentionStatePool() = default;
     LinearAttentionStatePool(DeviceSpan backing, const LinearAttentionStatePoolLayout& layout);

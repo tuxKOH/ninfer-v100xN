@@ -25,6 +25,13 @@ Graph/eager 状态检查已通过。Split-D 和实验数值路径可能改变输
 91.41%；AIME'26 两者均为 100%。这些是外部源模型成绩，不是本机转换后的质量分数，
 也不代表数学无损。[公开来源、独立对比和限制](docs/model-quality.md)。
 
+## v0.2.2 · 单张 16 GB V100 运行 QUASAR
+
+单张 V100-SXM2 16 GB 支持 QUASAR NVFP4 纯文本 MTP4。同一份 85,000-token 代码输入上，
+冷 prefill 从单卡开发初版的 **374.5 提高到 939.0 tok/s**，首字后的已提交 decode 从 **87.4 提高到 113.9 tok/s**。
+GPU 保留 9,472-token 窗口，从主存检索历史 KV。近似检索和实验数值路径会改变输出，长上下文质量尚未评测。
+[单卡启动参数](docs/prebuilt.md#single-v100-16-gb)
+
 ## v0.2.1：双卡 / 四卡并发与服务修复
 
 QUASAR NVFP4 / MTP4 在 TP2、TP4 使用 packed 批量投影、直接 packet 发布与 sum/norm 融合。

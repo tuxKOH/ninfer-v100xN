@@ -336,12 +336,16 @@ void Binder::retain_on_host(ObjectHandle handle) {
     materialize_on_host(handle);
 }
 
-void Binder::materialize_on_host(ObjectHandle handle) {
+void Binder::materialize_on_host(ObjectHandle handle, bool device_readable) {
+    if (device_readable && (device_count() != 1 ||
+                            !std::holds_alternative<TensorDescriptor>(descriptor(handle)))) {
+        throw ArtifactError("mapped host placement requires a tensor and one GPU");
+    }
     if (planned_[handle.index]) {
         throw ArtifactError("artifact object has more than one materialization placement: " +
                             std::visit([](const auto& object) { return std::string(object.name); }, descriptor(handle)));
     }
-    materialization_.host_objects.push_back(HostMaterialization{handle});
+    materialization_.host_objects.push_back(HostMaterialization{handle, device_readable});
     planned_[handle.index] = true;
 }
 

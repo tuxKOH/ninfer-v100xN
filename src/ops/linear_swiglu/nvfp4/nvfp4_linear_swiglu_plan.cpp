@@ -130,6 +130,9 @@ std::size_t qpn_split_workspace_bytes(std::int32_t tokens) {
 
 template <class Geometry>
 std::size_t cutlass_route_workspace_bytes(std::int32_t tokens) {
+    if constexpr (std::is_same_v<Geometry, Nvfp4MlpGateUpGeometry>) {
+        return nvfp4_cutlass_sm70_full_swiglu_workspace_bytes(tokens);
+    }
     const std::size_t projected = static_cast<std::size_t>(
         Geometry::kOutputRows) * tokens * sizeof(float);
     return projected + nvfp4_cutlass_sm70_workspace_bytes(
@@ -292,6 +295,10 @@ void dispatch_impl(const Tensor& x, const Weight& weight, Tensor& out, LinearPol
             throw std::invalid_argument("nvfp4 linear_swiglu CUTLASS requires caller workspace");
         }
         auto scope = workspace->scope();
+        if constexpr (std::is_same_v<Geometry, Nvfp4MlpGateUpGeometry>) {
+            nvfp4_cutlass_sm70_full_swiglu_launch(x, weight, out, *workspace, stream);
+            return;
+        }
         // Keep both dot products in FP32 until the fused nonlinearity and final BF16 store.
         Tensor projected = workspace->alloc(DType::FP32, {Geometry::kOutputRows, x.ne[1]}, 256);
         nvfp4_cutlass_sm70_fp32_launch(x, weight, projected, *workspace, stream);

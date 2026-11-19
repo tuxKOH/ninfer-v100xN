@@ -1,5 +1,28 @@
 # QUASAR NVFP4 performance
 
+## v0.2.2 single V100 16 GB
+
+QUASAR NVFP4 v3, TP1/MTP4, one cold greedy request with the same 85,000 code-token IDs,
+513 output tokens, INT8 group-64 KV, prefix reuse disabled. Prefill uses input count divided
+by prefill time. Decode uses the 512 tokens after the first divided by their wall time.
+
+| Single-card profile | Cold prefill (s) | Prefill (tok/s) | Decode (tok/s) |
+|---|---:|---:|---:|
+| Earlier development build | 226.98 | 374.48 | 87.41 |
+| Optimized, CUDA Graph run 1 | 90.38 | 940.47 | 113.94 |
+| Optimized, CUDA Graph run 2 | 90.67 | 937.51 | 113.90 |
+| Optimized, eager | 90.63 | 937.83 | 114.00 |
+
+The 9,472-token GPU window and 1,280-token prefill chunks use host-backed KV retrieval.
+All three optimized runs emitted identical IDs and accepted 373 of 551 proposals in 138 rounds.
+The earlier profile used an 8,320-token GPU window and 128-token chunks. Its output first
+differed at token 18. Quality and long-context recall under these settings are unmeasured.
+[Single-card command](prebuilt.md#single-v100-16-gb)
+
+TP2 DFlash additionally supports the optional long-attention and fast-decode profiles. On its
+85K raw-prefix fixture DFlash7 measured 122.65 tok/s by default and 168.15 tok/s with both enabled.
+Both options can affect output.
+
 Local hardware: 2 × Tesla V100-SXM2 16 GB, SXM2-to-PCIe adapters, PCIe 3.0 ×16 P2P without NVLink, CUDA 12.8 / SM70. Decode rates count committed tokens, excluding rejected drafts. Context capacity and occupied input length are reported separately. Loading and CUDA Graph priming are outside request timing.
 
 [llama.cpp / LM Studio controls](llama-comparison.md) · [Other V100 profiles](performance-v100.md) · [TP4/NVLink](tp4.md) · [RAM-KV/PP2](experiments.md) · [Inherited upstream campaigns](performance-upstream.md)

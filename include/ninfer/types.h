@@ -142,8 +142,9 @@ struct EngineOptions {
     // Complete-history SM70 TP2/TP4 long attention with coarser KV partitions and FP32 PV.
     // Numerically qualified, not output-bit-equivalent to the default profile.
     bool volta_long_attention          = false;
-    // QUASAR SM70 TP2/TP4 Text/None/MTP and TP2 DFlash: packed NVFP4 FP32 epilogues
-    // and MTP W8 reductions. DFlash keeps its native W8 drafter arithmetic.
+    // QUASAR SM70 TP1/TP2/TP4 Text/None/MTP: NVFP4 FP32 epilogues and packed MTP W8.
+    // On TP1 the optimized proposal head uses the first 65536 artifact shortlist rows.
+    // TP2 DFlash keeps its native W8 drafter arithmetic.
     // Changes arithmetic; independent of the optional complete-history attention profile.
     bool volta_fast_decode             = false;
     RamKvOptions ram_kv;

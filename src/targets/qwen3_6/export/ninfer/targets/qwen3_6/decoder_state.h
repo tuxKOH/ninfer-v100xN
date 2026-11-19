@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 
 namespace ninfer::targets::qwen3_6 {
@@ -25,7 +26,9 @@ struct DecoderStateSpec {
     std::uint32_t text_physical_page_groups = 0;
     std::uint32_t mtp_physical_page_groups  = 0;
     bool ram_kv = false;
+    bool host_retrieval_keys = false;
     LinearAttentionStatePoolSpec linear_attention;
+    int host_checkpoint_slots = 0;
 };
 
 struct PagedKVCacheLayout {
@@ -36,6 +39,7 @@ struct PagedKVCacheLayout {
     std::int32_t head_dim     = 0;
     DType dtype               = DType::BF16;
     std::int32_t quant_group  = 0;
+    bool host_retrieval_keys = false;
     TensorRegion retrieval_keys;
     TensorRegion retrieval_query;
     TensorRegion retrieval_fallback;
@@ -98,6 +102,7 @@ private:
     friend class PagedKVCacheView;
     [[nodiscard]] PagedKVLayerView layer_view(std::uint32_t layer, Tensor block_table) const;
 
+    std::unique_ptr<PinnedHostBuffer> host_keys_;
     PagedKVPool pool_;
     std::uint32_t layers_      = 0;
     std::uint32_t max_context_ = 0;

@@ -175,8 +175,8 @@ ObjectHandle bind_tensor(Binder& binder, std::string_view name, NumericFormat fo
         // Whole tensor on the primary rank. Reuses the storage-mode primitive instead of a
         // second placement entry point.
         binder.materialize_on_device(handle, 0);
-    } else if (placement == TensorPlacement::Host) {
-        binder.materialize_on_host(handle);
+    } else if (placement == TensorPlacement::Host || placement == TensorPlacement::MappedHost) {
+        binder.materialize_on_host(handle, placement == TensorPlacement::MappedHost);
     } else {
         binder.validate_only(handle);
     }
