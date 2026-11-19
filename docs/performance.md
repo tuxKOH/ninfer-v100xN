@@ -12,9 +12,10 @@ by prefill time. Decode uses the 512 tokens after the first divided by their wal
 | Optimized, CUDA Graph run 1 | 90.38 | 940.47 | 113.94 |
 | Optimized, CUDA Graph run 2 | 90.67 | 937.51 | 113.90 |
 | Optimized, eager | 90.63 | 937.83 | 114.00 |
+| v0.2.2 clean release build, CUDA Graph | 89.34 | 951.46 | 113.82 |
 
 The 9,472-token GPU window and 1,280-token prefill chunks use host-backed KV retrieval.
-All three optimized runs emitted identical IDs and accepted 373 of 551 proposals in 138 rounds.
+All four optimized runs emitted identical IDs and accepted 373 of 551 proposals in 138 rounds.
 The earlier profile used an 8,320-token GPU window and 128-token chunks. Its output first
 differed at token 18. Quality and long-context recall under these settings are unmeasured.
 [Single-card command](prebuilt.md#single-v100-16-gb)
