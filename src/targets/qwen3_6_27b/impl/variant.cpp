@@ -186,17 +186,30 @@ std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t cap
 
 std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t capacity,
                                                                   std::uint32_t draft_window,
-                                                                  std::uint32_t) {
+                                                                  std::uint32_t,
+                                                                  bool long_attention) {
     if (capacity == 0 || draft_window == 0) { return {}; }
     std::vector<std::uint32_t> ends;
-    for (const std::uint32_t visible_end : {128U, 512U, 2048U, 4096U, 8192U, 16384U, 32768U}) {
+    for (const std::uint32_t visible_end : {128U, 512U, 2048U, 4096U, 8192U, 16384U,
+                                           16390U, 32768U, 65536U}) {
         if (visible_end > draft_window + 1U) {
             ends.push_back(visible_end - draft_window - 1U);
         }
     }
     std::sort(ends.begin(), ends.end());
     ends.erase(std::unique(ends.begin(), ends.end()), ends.end());
-    return graph_profiles_through(capacity - 1U, ends);
+    auto profiles = graph_profiles_through(capacity - 1U, ends);
+    if (long_attention && draft_window >= 6) {
+        // The seven/eight-query long verifier replaces two attention/reduce
+        // pairs with one. GraphExecUpdate cannot cross that node-count change;
+        // keep both executable ownership and its memory allowance explicit.
+        for (auto& profile : profiles) {
+            const auto visible = std::min<std::uint64_t>(
+                capacity, static_cast<std::uint64_t>(profile.max) + draft_window + 1ULL);
+            profile.topology_class = visible > 16390U ? 1U : 0U;
+        }
+    }
+    return profiles;
 }
 
 void Variant::attention_projection(const Tensor& hidden,

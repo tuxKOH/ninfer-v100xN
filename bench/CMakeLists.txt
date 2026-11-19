@@ -80,6 +80,16 @@ target_include_directories(ninfer_v100_task_bench PRIVATE
   ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/third_party)
 target_link_libraries(ninfer_v100_task_bench PRIVATE ninfer_engine)
 
+add_executable(ninfer_v100_dflash_humaneval_bench ${PROJECT_SOURCE_DIR}/tools/v100/bench_dflash_humaneval.cpp)
+target_include_directories(ninfer_v100_dflash_humaneval_bench PRIVATE
+  ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/third_party)
+target_link_libraries(ninfer_v100_dflash_humaneval_bench PRIVATE ninfer_engine CUDA::cudart)
+
+add_executable(ninfer_v100_release_matrix_bench ${PROJECT_SOURCE_DIR}/tools/v100/bench_release_matrix.cpp)
+target_include_directories(ninfer_v100_release_matrix_bench PRIVATE
+  ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/third_party)
+target_link_libraries(ninfer_v100_release_matrix_bench PRIVATE ninfer_engine CUDA::cudart)
+
 add_executable(ninfer_v100_ttft_bench ${PROJECT_SOURCE_DIR}/tools/v100/bench_ttft.cpp)
 target_include_directories(ninfer_v100_ttft_bench PRIVATE
   ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/third_party)

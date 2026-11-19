@@ -142,6 +142,14 @@ int main() {
                   {3584, 5120}, {8704, 5120}, {5120, 1536}, {5120, 2560}, {5120, 4352}}}) {
             failures += check_shape(n, k, mtp_widths, false);
         }
+        // DFlash's row permutation must preserve the pre-existing four-part
+        // reduction as well as its original payload bits, including append T1/2
+        // and the wide prefill fallback beyond the eight-column proposal block.
+        const std::array dflash_widths{1, 2, 3, 7, 8, 9, 33};
+        for (const auto [n, k] : std::array<std::pair<int, int>, 5>{
+                 {{4096, 5120}, {34816, 5120}, {5120, 4096}, {5120, 17408}, {5120, 25600}}}) {
+            failures += check_shape(n, k, dflash_widths);
+        }
         return failures ? 1 : 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

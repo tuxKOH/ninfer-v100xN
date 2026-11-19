@@ -164,7 +164,8 @@ __host__ __device__ inline constexpr int gqa_volta_long_i8_splits(int window, in
                                                                 bool enabled = false) {
 #ifdef NINFER_VOLTA_BUILD
     if constexpr (Geometry::QHeads == 12 || Geometry::QHeads == 6) {
-        if (enabled && window > 65536 && (tokens == 1 || tokens == 5 || tokens == 6)) {
+        if (enabled && window > 65536 && (tokens == 1 || tokens == 5 || tokens == 6 ||
+                                         (Geometry::QHeads == 12 && (tokens == 7 || tokens == 8)))) {
             // TP4 has one local KV head, so shorter partitions supply enough CTAs.
             constexpr int keys_per_split = Geometry::QHeads == 6
                 ? kGqaVoltaLongKeysPerSplit / 2 : kGqaVoltaLongKeysPerSplit;

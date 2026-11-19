@@ -183,6 +183,14 @@ void verify(const char* path) {
             {.volta_fast_decode = true, .speculative = ninfer::SpeculativeBackend::Mtp}, 2);
         require(plan.bindings.features.volta_fast_decode, "experimental profile was not selected");
     }
+    {
+        Binder binder(reader, 2);
+        const auto plan = bind_artifact(binder, WeightsProfile::Qwen38QuasarNvfp4,
+            {.volta_fast_decode = true, .speculative = ninfer::SpeculativeBackend::DFlash}, 2);
+        require(plan.bindings.features.volta_fast_decode &&
+                    plan.bindings.dflash.projection_format == NumericFormat::W8G32_F16S,
+                "DFlash fast target profile changed the native W8 drafter");
+    }
     for (int mode = 0; mode < 3; ++mode) {
         Binder binder(reader, 2);
         bool rejected = false;

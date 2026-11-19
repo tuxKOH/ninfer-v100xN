@@ -1043,11 +1043,12 @@ int main(int argc, char** argv) {
         (argc == 2 && std::string(argv[1]) == "--long-context-only");
     const bool default_single_only = argc == 2 && std::string(argv[1]) == "--default-single-only";
     const bool long_verify5_only = argc == 2 && std::string(argv[1]) == "--long-verify5-only";
+    const bool long_wide_only = argc == 2 && std::string(argv[1]) == "--long-wide-only";
     if (argc != 1 && !prefill_only && !long_context_only && !default_single_only &&
-        !long_verify5_only && !batch_decode_only) {
+        !long_verify5_only && !long_wide_only && !batch_decode_only) {
         std::cerr << "usage: " << argv[0]
                   << " [--prefill-only|--long-context-only|--long-context-from 1|4|5|6"
-                     "|--default-single-only|--long-verify5-only|--batch-decode-only]\n";
+                     "|--default-single-only|--long-verify5-only|--long-wide-only|--batch-decode-only]\n";
         return 2;
     }
     if (cuda_unavailable()) {
@@ -1078,6 +1079,30 @@ int main(int argc, char** argv) {
         }
         std::cout << (failures == 0 ? "PASS" : "FAIL")
                   << " head-local INT8 concurrent decode (FP64 and changed-query Graph/eager)\n";
+        return failures == 0 ? 0 : 1;
+    }
+
+    if (long_wide_only) {
+        if constexpr (kRanks != 2) { return 77; }
+        int failures = 0;
+        for (const int width : {7, 8}) {
+            failures += run_case(DType::I8,
+                {"gqa_attention", width, 85000 - width, 98304, MappingPattern::Fragmented,
+                 static_cast<std::uint32_t>(1900 + width), false},
+                false, true, ReferenceRoute::OracleOnly);
+            failures += run_long_split_graph_boundary(1, width);
+            failures += run_case(DType::I8,
+                {"gqa_attention", width, 16391 - width, 16391, MappingPattern::Fragmented,
+                 static_cast<std::uint32_t>(1920 + width), false, 3}, false, true);
+            failures += run_case(DType::I8,
+                {"gqa_attention", width, 16391 - width, 98304, MappingPattern::Offset,
+                 static_cast<std::uint32_t>(1940 + width), false, 0}, false, true);
+            failures += run_batch_case(DType::I8,
+                {width, {2048, 16384, 32767}, {width, 3, 0}, {2, 0, 1},
+                 MappingPattern::Fragmented, static_cast<std::uint32_t>(1960 + width), true, true});
+        }
+        std::cout << (failures == 0 ? "PASS" : "FAIL")
+                  << " TP2 INT8 seven/eight-query long verifier (FP64, Graph, masks, cache)\n";
         return failures == 0 ? 0 : 1;
     }
 

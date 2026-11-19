@@ -239,11 +239,11 @@ class Settings:
             raise ValueError('27B DFlash requires TP1/TP2 and a draft window of 1..7')
         if not 0 <= self.prefix_cache_tokens <= 100000000:
             raise ValueError('Historical prefix cache budget must be 0..100000000 tokens (host RAM)')
-        if self.long_attention and (self.tp not in (2, 4) or self.backend == 'dflash' or
+        if self.long_attention and (self.tp not in (2, 4) or (self.backend == 'dflash' and self.tp != 2) or
                                     self.kv_dtype != 'int8' or self.ram_kv):
-            raise ValueError('Experimental long attention requires TP2/TP4 INT8 KV concurrency 1..8 Text/Vision None/MTP (Vision TP2 only), no RAM-KV')
-        if self.fast_decode and (self.tp not in (2, 4) or self.backend == 'dflash' or self.vision):
-            raise ValueError('Experimental fast decode requires QUASAR SM70 TP2/TP4 Text None/MTP')
+            raise ValueError('Experimental long attention requires TP2/TP4 INT8 KV concurrency 1..8, Vision/DFlash TP2 only, no RAM-KV')
+        if self.fast_decode and (self.tp not in (2, 4) or (self.backend == 'dflash' and self.tp != 2) or self.vision):
+            raise ValueError('Experimental fast decode requires QUASAR SM70 TP2/TP4 Text, DFlash TP2 only')
         if self.vision and (self.tp != 2 or self.backend == 'dflash'):
             raise ValueError('Vision requires TP2 None/MTP; fast decode remains Text-only')
         if self.vision and local_path(self.artifact).name in ('qwen3_8_27b_q4_k_m.ninfer', 'qwen3_8_27b_fp8.ninfer'):
@@ -561,7 +561,11 @@ class Launcher:
             'EXPERIMENTAL INFERENCE - startup switches, default OFF',
             'Fast math (Text only): NVFP4 FP32 scale-after-reduction and packed MTP W8 reductions.',
             'Long attention (Text/images/video): complete history; different softmax/PV reduction order.',
-            'Long attention: TP2 / complete INT8 KV / None or MTP; GPU or CPU vision encoder.',
+            'Long attention: TP2 Text None/MTP/DFlash; Vision None/MTP; complete INT8 KV.',
+            'DFlash fast math changes target NVFP4 only; native W8/BF16 drafter is retained.',
+            'DFlash7 TP2 / 85K raw-prefix: normal 122.65, long 167.49, fast 128.11, both 168.15 tok/s.',
+            'DFlash both: +37.10%; HumanEval32 x2: 301.21->302.38 tok/s, not pass@1.',
+            'DFlash both changes 2/64 short outputs and all 85K outputs; quality/GPQA unmeasured.',
             'Combined Text-only 85K / 180K capacity / TP2 / INT8 KV / MTP4: ~198.1 committed tok/s.',
             'Remote TP4 / 220 W / 1200 MHz, same 85K/MTP4 fixture: 267.34 / 267.64 wall tok/s.',
             'TP4: +14.57% over 231.30; prefill ~2339 tok/s. Split-D can change output.',

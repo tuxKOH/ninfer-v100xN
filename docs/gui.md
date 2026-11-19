@@ -155,10 +155,14 @@ GUI 是 API 启动器；图片/视频由客户端通过既有 OpenAI/Anthropic �
 
 单独分组提供两个默认关闭、会保存选择的启动开关：
 
-- “NVFP4 / MTP 快速数值路径”：`--volta-fast-decode`，QUASAR / SM70 / TP2/TP4 / 纯文本 None/MTP；
+- “NVFP4 快速数值路径（MTP / DFlash）”：`--volta-fast-decode`，QUASAR / SM70 / TP2/TP4 / 纯文本 None/MTP，DFlash 仅 TP2；
   NVFP4 全局缩放移到 FP32 K 归约后，并启用 MTP W8 特定分区/归约。
-- “完整历史长注意力（文本 / 图片 / 视频）”：`--volta-long-attention`，SM70 27B / TP2/TP4（视觉仅 TP2）/ INT8 KV / 实验性并发1–8 / 文本或视觉 None/MTP；
+- “完整历史长注意力（文本 / 图片 / 视频）”：`--volta-long-attention`，SM70 27B / TP2/TP4 / INT8 KV / 实验性并发1–8，视觉和 DFlash 仅 TP2；
   保留每个历史 KV，但改变 softmax、PV 和归约顺序。
+
+TP2 DFlash 可单独或同时开启这两项。长注意力作用于目标模型验证，快速数值路径保留
+原生 W8/BF16 drafter；数值变化仍可能改变接受率和输出。DFlash 的实测增幅见
+[性能记录](performance.md)，不能套用下方 MTP 的历史收益；未做新的质量测评。
 
 本机 TP2 纯文本组合在 85K 实际输入、180K 容量、MTP4、greedy、Graph 下测得 **198.105 / 198.097 committed tok/s**。
 最后 W8 步骤比前一组合约 **+0.84%**；不是两个开关各自的独立提升幅度。

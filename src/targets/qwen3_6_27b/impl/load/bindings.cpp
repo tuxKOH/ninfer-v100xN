@@ -955,8 +955,8 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         throw std::invalid_argument("qwen3_6_27b: TP4 does not support Vision");
     }
     if (features.volta_fast_decode && (!quasar || (tp != 2 && tp != 4) || pp != 1 ||
-                                       features.vision || features.dflash())) {
-        throw std::invalid_argument("volta_fast_decode requires QUASAR SM70 TP2/TP4 Text/None/MTP");
+                                       features.vision || (features.dflash() && tp != 2))) {
+        throw std::invalid_argument("volta_fast_decode requires QUASAR SM70 TP2/TP4 Text/None/MTP, or TP2 Text/DFlash");
     }
     if (native_fp8 && (tp != 4 || features.vision || features.dflash())) {
         throw std::invalid_argument("qwen3.8-27b/fp8 supports TP4 Text/MTP only");
@@ -1356,6 +1356,11 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
         auto& draft = runtime.dflash.emplace();
         draft.feature_projection = artifact::materialized_weight(
             backing, plan.dflash.feature_projection, plan.dflash.projection_format, 5120, 25600, device);
+#ifdef NINFER_VOLTA_BUILD
+        if (draft.feature_projection.qtype == QType::W8G32_F16S) {
+            ::ninfer::ops::detail::w8_prepack_qpn_sm70(draft.feature_projection);
+        }
+#endif
         draft.context_norm = artifact::materialized_tensor(backing, plan.dflash.context_norm,
                                                             NumericFormat::BF16, {5120}, device);
         for (std::size_t layer = 0; layer < draft.layers.size(); ++layer) {
@@ -1380,6 +1385,17 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
                                                             plan.dflash.projection_format, 34816, 5120, device);
             target.down = artifact::materialized_weight(backing, source.down,
                                                         plan.dflash.projection_format, 5120, 17408, device);
+#ifdef NINFER_VOLTA_BUILD
+            if (target.query.qtype == QType::W8G32_F16S) {
+                // Q is disjoint from the K/V row views in the same artifact parent.
+                // Retain their original layout for context append and permute only
+                // the large projections used by the eight-column proposal block.
+                ::ninfer::ops::detail::w8_prepack_qpn_sm70(target.query);
+                ::ninfer::ops::detail::w8_prepack_qpn_sm70(target.attention_output);
+                ::ninfer::ops::detail::w8_prepack_qpn_sm70(target.gate_up);
+                ::ninfer::ops::detail::w8_prepack_qpn_sm70(target.down);
+            }
+#endif
             target.attention_conv_base_kernel = artifact::materialized_tensor(
                 backing, source.attention_conv_base_kernel, NumericFormat::BF16, {5120, 2, 2}, device);
             target.attention_conv_kernel_projection = artifact::materialized_weight(

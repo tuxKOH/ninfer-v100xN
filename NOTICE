@@ -80,6 +80,18 @@ The QPN layout and MMA mapping originate in dnv2003/v100-skinny (MIT), as
 credited by that source. Its retained notice is in
 third_party/licenses/v100-skinny.txt.
 
+The SM70 W8 DFlash2 projection work uses 1Cat's bit-preserving small-M packing
+design in docs/design/sm70_dflash_smallm.md and
+csrc/sm70_turbomind/ops/dflash2_fp16_m8_sm70.cu as references. It extends NInfer's
+existing QPN W8 implementation, preserving original codes/scales and the
+four-part reduction. The HumanEval throughput prompt and dataset selection
+follow benchmarks/run_sm70_release_matrix.py; generated code is not executed.
+The 8K/C8 and 64K/C4 matrix follows that release's workload classes and the
+full-width decode-window/edge-trimming design in
+benchmarks/benchmark_sm70_qwen38_concurrency.py. It uses NInfer's public Engine
+counters and separately labels the 70%-acceptance arithmetic as an estimate;
+the upstream report does not publish complete prompt-ID fixtures.
+
 The TP4 concurrent attention launch policy uses 1Cat's batch/context routing in
 csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu as a design reference.
 The short-context batched path retains original INT8 group-64 KV and BF16 output,

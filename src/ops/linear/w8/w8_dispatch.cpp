@@ -308,7 +308,9 @@ W8Launch select_w8_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
 std::size_t w8_prepacked_workspace_bytes(std::int32_t n, std::int32_t k,
                                         std::int32_t first, std::int32_t last) noexcept {
 #ifdef NINFER_VOLTA_BUILD
-    if (n == 62080 && k == 5120 && first <= 8 && last >= 3) {
+    const bool dflash = (k == 5120 && (n == 4096 || n == 34816)) ||
+        (n == 5120 && (k == 4096 || k == 17408 || k == 25600));
+    if ((dflash || (n == 62080 && k == 5120)) && first <= 8 && last >= 3) {
         return static_cast<std::size_t>(k) * std::min(last, 8) * 2;
     }
 #endif

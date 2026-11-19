@@ -51,7 +51,7 @@ int exercise(bool attention, int tp) {
     cudaStream_t stream;
     cuda_check(cudaStreamCreate(&stream), "projection test stream");
     int failures = 0;
-    for (const int tokens : {1, 3, 4, 5, 6, 8, 9, 10, 16, 17, 20, 32, 33, 40, 41, 64,
+    for (const int tokens : {1, 3, 4, 5, 6, 7, 8, 9, 10, 16, 17, 20, 32, 33, 40, 41, 64,
                              127, 128, 129}) {
         auto x_host = make_bf16_activation(5120, tokens, 449U + tokens);
         auto device_x = to_device_bf16(x_host);
@@ -167,7 +167,7 @@ int exercise_down_projection() {
     cudaStream_t stream;
     cuda_check(cudaStreamCreate(&stream), "down projection test stream");
     int failures = 0;
-    for (const int tokens : {4, 5, 6}) {
+    for (const int tokens : {4, 5, 6, 7, 8}) {
         const auto host = make_bf16_activation(8704, tokens, 467U + tokens);
         auto device_input = to_device_bf16(host);
         Tensor input(device_input.p, DType::BF16, {8704, tokens});
@@ -212,7 +212,7 @@ int exercise_swiglu() {
     cudaStream_t stream;
     cuda_check(cudaStreamCreate(&stream), "SwiGLU test stream");
     int failures = 0;
-    for (const int tokens : {4, 5, 6}) {
+    for (const int tokens : {4, 5, 6, 7, 8}) {
         const auto host = make_bf16_activation(k, tokens, 487U + tokens);
         auto device_input = to_device_bf16(host);
         Tensor input(device_input.p, DType::BF16, {k, tokens});

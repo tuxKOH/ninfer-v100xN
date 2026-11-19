@@ -222,7 +222,7 @@ class LaunchContract(unittest.TestCase):
             self.settings.validate()
 
     def test_unsupported_long_attention_and_tp4_dflash(self):
-        for tp, backend, long_attention in [(4, 'dflash', False), (2, 'dflash', True),
+        for tp, backend, long_attention in [(4, 'dflash', False),
                                             (1, 'mtp', True)]:
             self.settings.tp = tp
             self.settings.devices = ','.join(map(str, range(tp)))
@@ -230,6 +230,14 @@ class LaunchContract(unittest.TestCase):
             self.settings.long_attention = long_attention
             with self.subTest(tp=tp, backend=backend), self.assertRaises(ValueError):
                 self.settings.validate()
+
+    def test_dflash_tp2_experimental_profiles(self):
+        self.settings.apply_profile('quasar-dflash7')
+        self.settings.artifact = str(self.artifact)
+        self.settings.long_attention = self.settings.fast_decode = True
+        self.settings.validate()
+        self.assertIn('--volta-long-attention', self.settings.command())
+        self.assertIn('--volta-fast-decode', self.settings.command())
 
     def test_owned_child_stop_and_logs(self):
         external = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])

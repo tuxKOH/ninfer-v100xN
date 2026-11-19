@@ -133,7 +133,7 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
         Tensor projected = context_roots.projected;
         ops::linear(features.view({Config::feature_rows, columns}),
                     state.execution.model.dflash->feature_projection, projected,
-                    state.execution.device.stream);
+                    ops::LinearPolicy::A16Only, state.execution.work, state.execution.device.stream);
         Tensor context = context_roots.normalized;
         ops::rmsnorm(projected, state.execution.model.dflash->context_norm, Config::rms_epsilon,
                      false, context, state.execution.device.stream);
@@ -231,7 +231,8 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                 Tensor query_flat = query_raw.view({Config::query_size, columns});
                 Tensor key_flat   = key_raw.view({Config::kv_size, columns});
                 Tensor value_flat = value.view({Config::kv_size, columns});
-                ops::linear(roots.conv_input, weight.query, query_flat, state.execution.device.stream);
+                ops::linear(roots.conv_input, weight.query, query_flat, ops::LinearPolicy::A16Only,
+                            state.execution.work, state.execution.device.stream);
                 ops::linear(roots.conv_input, weight.key, key_flat, state.execution.device.stream);
                 ops::linear(roots.conv_input, weight.value, value_flat, state.execution.device.stream);
                 Tensor query = roots.query.view({Config::head_dim, Config::query_heads, columns});
@@ -265,7 +266,7 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                 }
                 ops::linear(roots.attention.view({Config::query_size, columns}),
                             weight.attention_output, roots.attention_projected,
-                            state.execution.device.stream);
+                            ops::LinearPolicy::A16Only, state.execution.work, state.execution.device.stream);
                 ops::dflash2_conv(roots.attention_projected, roots.conv_dynamic,
                                   weight.attention_conv_base_kernel, 1, roots.attention_convolved,
                                   state.execution.device.stream);
@@ -282,12 +283,13 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                                   roots.input, state.execution.device.stream);
                 Tensor gate_up = state.execution.work.alloc(
                     DType::BF16, {2 * Config::intermediate, columns});
-                ops::linear(roots.input, weight.gate_up, gate_up, state.execution.device.stream);
+                ops::linear(roots.input, weight.gate_up, gate_up, ops::LinearPolicy::A16Only,
+                            state.execution.work, state.execution.device.stream);
                 ops::silu_mul(gate_up.slice(0, 0, Config::intermediate),
                               gate_up.slice(0, Config::intermediate, Config::intermediate),
                               roots.intermediate, state.execution.device.stream);
                 ops::linear(roots.intermediate, weight.down, roots.projected,
-                            state.execution.device.stream);
+                            ops::LinearPolicy::A16Only, state.execution.work, state.execution.device.stream);
                 ops::dflash2_conv(roots.projected, roots.dynamic, weight.mlp_conv_base_kernel, 1,
                                   roots.convolved, state.execution.device.stream);
                 ops::residual_add(roots.convolved, residual, state.execution.device.stream);
@@ -328,10 +330,14 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
             Tensor selector_gate = state.execution.work.alloc(DType::BF16, {256, selector_columns});
             ops::linear(proposal_hidden, state.execution.model.dflash->selector_hidden_projection,
                         selector_gate, state.execution.device.stream);
+            Tensor selector_logits = logits.view({TextConfig::output_rows,
+                                                  static_cast<std::int32_t>(k), batch_size});
+            Tensor selector_topk = topk.view({16, static_cast<std::int32_t>(k), batch_size});
+            Tensor gate_batch = selector_gate.view({256, static_cast<std::int32_t>(k), batch_size});
             ops::dflash2_select(
-                logits, selector_gate, state.execution.model.dflash->selector_predecessor_codebook,
+                selector_logits, gate_batch, state.execution.model.dflash->selector_predecessor_codebook,
                 state.execution.model.dflash->selector_successor_codebook, anchors, partial,
-                topk, drafts, state.execution.device.stream);
+                selector_topk, drafts, state.execution.device.stream);
         } else {
             Tensor peer_hidden = state.execution.peers[0].work->alloc(DType::BF16,
                                                                      {Config::hidden, selector_columns});
@@ -371,8 +377,11 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
             Tensor selector_gate = state.execution.work.alloc(DType::BF16, {256, selector_columns});
             ops::linear(proposal_hidden, state.execution.model.dflash->selector_hidden_projection,
                         selector_gate, state.execution.device.stream);
+            // Projections flatten K*B columns. The lattice walk must retain each request's
+            // independent K-step chain and anchor rather than treating the whole batch as one.
+            Tensor gate_batch = selector_gate.view({256, static_cast<std::int32_t>(k), batch_size});
             ops::dflash2_select_sharded(
-                gathered_keys, selector_gate,
+                gathered_keys, gate_batch,
                 state.execution.model.dflash->selector_predecessor_codebook,
                 state.execution.model.dflash->selector_successor_codebook, anchors, global_keys,
                 drafts, state.execution.device.stream);
@@ -468,6 +477,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                          state.execution.io, state.execution.prefill_hidden,
                          state.execution.prefill_chunk, 0, {}, &state.text_cache, nullptr,
                          std::span(tp_ranks).first(state.execution.peers.size()));
+        card.set_volta_long_attention(state.execution.volta_long_attention);
         DFlashFeatureSink sink =
             batch_feature_sink_impl<Variant>(state, lanes, valid_columns, width, batch_size);
         auto verify_view = [batch_size](qwen3_6::DFlashDecodeState& f,

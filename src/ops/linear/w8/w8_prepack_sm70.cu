@@ -241,11 +241,13 @@ void w8_prepack_qpn_sm70(Weight& weight, cudaStream_t stream) {
         weight.scale_dtype != DType::FP16 || weight.group != 32 || weight.n <= 0 ||
         !((weight.k == 5120 && (weight.n == 248320 || weight.n == 124160 ||
              weight.n == 62080 || weight.n == 5120 || weight.n == 3584 ||
-             weight.n == 7168 || weight.n == 8704 || weight.n == 17408)) ||
+             weight.n == 7168 || weight.n == 8704 || weight.n == 17408 ||
+             weight.n == 4096 || weight.n == 34816)) ||
           (weight.n == 5120 && (weight.k == 1536 || weight.k == 2560 || weight.k == 4352 ||
-                                weight.k == 3072 || weight.k == 8704))) ||
+                                weight.k == 3072 || weight.k == 8704 || weight.k == 4096 ||
+                                weight.k == 17408 || weight.k == 25600))) ||
         weight.padded_shape[0] != weight.n || weight.padded_shape[1] != weight.k) {
-        throw std::invalid_argument("W8 QPN prepack requires a registered row-split vocabulary or TP2/TP4 MTP projection");
+        throw std::invalid_argument("W8 QPN prepack requires a registered row-split vocabulary, MTP or DFlash projection");
     }
     const auto code_bytes = static_cast<std::size_t>(weight.n) * weight.k;
     const auto scale_bytes = code_bytes / 32 * sizeof(std::uint16_t);
@@ -273,7 +275,12 @@ void launch_w8_prepacked_sm70(const Tensor& x, const Weight& weight, Tensor& out
     const auto* scales = static_cast<const std::uint16_t*>(weight.scales);
     const auto* input = static_cast<const __nv_bfloat16*>(x.data);
     auto* output = static_cast<__nv_bfloat16*>(out.data);
-    const bool mtp = weight.n <= 17408;
+    // DFlash's native W8 projections previously used the four-part row-major
+    // QPN contraction. Keep that exact K association after permuting addresses;
+    // the MTP-specific 8/16-way profiles have a different reduction tree.
+    const bool dflash = (weight.k == 5120 && (weight.n == 4096 || weight.n == 34816)) ||
+        (weight.n == 5120 && (weight.k == 4096 || weight.k == 17408 || weight.k == 25600));
+    const bool mtp = weight.n <= 17408 && !dflash;
     if (workspace != nullptr && w8_prepacked_workspace_bytes(weight.n, weight.k, t, t) != 0) {
         auto scope = workspace->scope();
         Tensor image = workspace->alloc(DType::FP16, {weight.k, t});

@@ -114,7 +114,8 @@ std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t cap
 
 std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t capacity,
                                                                   std::uint32_t draft_window,
-                                                                  std::uint32_t batch_size) {
+                                                                  std::uint32_t batch_size,
+                                                                  bool) {
     std::vector<GraphExecutionProfile> profiles = dflash_base_profiles(capacity, draft_window);
     for (GraphExecutionProfile& profile : profiles) {
         const std::uint32_t target_max = static_cast<std::uint32_t>(std::min<std::uint64_t>(

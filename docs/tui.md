@@ -96,7 +96,10 @@ prefix and actual-85K Graph/eager, replay-logit/counter and committed-frontier c
 IQ/task-accuracy impact is unknown; the current combination has no GPQA result. Gains are not
 independent per-switch ratios and do not describe Vision throughput. `Long attention (Text/Vision)`
 also supports TP2 images/video with either GPU or CPU vision encoding and complete INT8 KV;
-`Fast math (Text only)` excludes Vision. DFlash rejects both experiments.
+`Fast math (Text only)` excludes Vision. TP2 DFlash admits both experiments,
+independently or together: long attention changes target verification, while fast math
+changes target NVFP4 arithmetic and retains the native W8/BF16 drafter. Outputs and
+acceptance can change; DFlash measurements are separate from the historical MTP rates.
 Relative edited paths are resolved from the repository root, matching the child working directory.
 The [QUASAR measurements](performance.md) describe its 85K coding workload and quality limits.
 TP4 needs four suitable devices and the corresponding artifact; see [TP4/NVLink](tp4.md).

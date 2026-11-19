@@ -73,8 +73,10 @@ enum class LinearPolicy : std::uint8_t {
  * MTP packed-weight problems accept every positive column extent T. Registered Vision problems
  * accept raw-patch P in `{4,8,...,131072}` or merged-token V in `[1,32768]`; a matrix column does
  * not inherently represent a text token. FP32_CTRL is unsupported.
- * SM70 W8 vocabulary heads additionally admit an exact load-time VoltaQpnPrepacked layout;
- * codes and FP16 scales are permuted without requantization, with consumers for all positive T.
+ * SM70 W8 vocabulary, MTP and registered 27B DFlash2 projections additionally admit an exact
+ * load-time VoltaQpnPrepacked layout; codes and FP16 scales are permuted without requantization,
+ * with consumers for all positive T. DFlash2's narrow contractions retain the original
+ * four-part K reduction; this differs from the MTP-specific 8/16-part compute profiles.
  *
  * @par Numerical contract
  * Test fixture code materializes the persistent weight as its logical FP32 dequantized matrix.

@@ -17,6 +17,7 @@
 // NINFER_V100X2_ARTIFACT=/path/to/qwen3_8_27b_q4_k_m.ninfer ctest -R v100x2_real
 // Add NINFER_V100X2_PROPOSAL_HEAD=optimized to exercise the shortlist proposal head.
 // NINFER_V100X2_SPEC=dflash selects DFlash7 with the full vocabulary head.
+// --dflash-batches checks C2/C4/C8 independent requests in ordinary and long/fast modes.
 
 #include "ninfer/engine.h"
 #include "v100x2_test_profile.h"
@@ -66,6 +67,8 @@ ninfer::EngineOptions engine_options(const char* artifact, bool speculation, boo
     options.prefill_chunk = kChunk;
     options.kv_cache = ninfer::KvCacheStorage::Int8Group64;
     options.use_cuda_graph = graphs;
+    options.volta_long_attention = std::getenv("NINFER_TEST_LONG_ATTENTION") != nullptr;
+    options.volta_fast_decode = std::getenv("NINFER_TEST_FAST_DECODE") != nullptr;
     if (speculation) { options.speculative = profile; }
     return options;
 }
@@ -194,11 +197,13 @@ void compare_rounds(const ninfer::GenerationResult& captured,
             "graph/eager speculative acceptance or fallback patterns differ");
 }
 
-void exercise_mtp_batches(const char* artifact, ninfer::SpeculativeOptions profile,
+void exercise_speculative_batches(const char* artifact, ninfer::SpeculativeOptions profile,
                            const std::array<Tokens, kProbes>& inputs,
                            unsigned concurrency = 2, bool long_fast = false) {
     std::array<std::array<ninfer::GenerationResult, 8>, 2> captured;
-    const unsigned outputs = concurrency > 2 ? 128 : kOutputs;
+    // Keep early DFlash streams alive while the remaining mixed-length prompts prefill.
+    const unsigned outputs = profile.backend == ninfer::SpeculativeBackend::DFlash
+        ? (concurrency == 8 ? 256 : 128) : (concurrency > 2 ? 128 : kOutputs);
     for (bool graphs : {true, false}) {
         auto options = engine_options(artifact, true, graphs, profile);
         options.max_concurrency = concurrency;
@@ -232,13 +237,13 @@ void exercise_mtp_batches(const char* artifact, ninfer::SpeculativeOptions profi
             observer.request_stop();
             observer.join();
             const auto after = engine.runtime_stats();
-            require(peak_ready == concurrency, "MTP batch probe did not reach its full batch");
+            require(peak_ready == concurrency, "speculative batch probe did not reach its full batch");
             require(after.decode_row_rounds - before.decode_row_rounds >
                         after.decode_rounds - before.decode_rounds,
-                    "greedy/mixed MTP probe did not execute a multi-row decode round");
+                    "greedy/mixed speculative probe did not execute a multi-row decode round");
             for (unsigned lane = 0; lane < concurrency; ++lane) {
                 require(results[lane].generated_token_ids.size() == outputs,
-                        "MTP batch probe ended before its output budget");
+                        "speculative batch probe ended before its output budget");
                 require_speculation(results[lane], profile);
                 if (graphs) {
                     captured[mixed][lane] = std::move(results[lane]);
@@ -249,7 +254,8 @@ void exercise_mtp_batches(const char* artifact, ninfer::SpeculativeOptions profi
         }
         v100x2_test::check_peer_egress(engine, profile.backend);
     }
-    std::cout << "MTP B=" << concurrency << (long_fast ? " long/fast" : " normal")
+    std::cout << (profile.backend == ninfer::SpeculativeBackend::Mtp ? "MTP" : "DFlash")
+              << " B=" << concurrency << (long_fast ? " long/fast" : " normal")
               << " greedy/mixed graph/eager outputs and acceptance PASS" << std::endl;
 }
 
@@ -393,7 +399,7 @@ int exercise(const char* artifact, ninfer::SpeculativeOptions profile) {
         require(disagreements == 0, "outputs failed strict non-speculative teacher-forced argmax");
     }
     if (profile.backend == ninfer::SpeculativeBackend::Mtp && v100x2_test::pp() == 1) {
-        exercise_mtp_batches(artifact, profile, inputs);
+        exercise_speculative_batches(artifact, profile, inputs);
     }
     return 0;
 }
@@ -404,6 +410,44 @@ int exercise(const char* artifact, ninfer::SpeculativeOptions profile) {
 // this gate protects graph replay, MTP commits and exact saved frontiers.
 int exercise_long_attention(const char* artifact, ninfer::SpeculativeOptions profile,
                             bool fast_decode) {
+    if (profile.backend == ninfer::SpeculativeBackend::DFlash) {
+        require(v100x2_test::tp() == 2 && v100x2_test::pp() == 1,
+                "DFlash long state gate requires TP2/PP1");
+        Tokens input;
+        ninfer::GenerationResult captured;
+        Logits captured_logits;
+        for (const bool graphs : {true, false}) {
+            auto options = engine_options(artifact, true, graphs, profile);
+            options.max_context = 90000;
+            options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(90000);
+            options.prefill_chunk = 1024;
+            options.prefix_cache_tokens = 0;
+            options.volta_long_attention = true;
+            options.volta_fast_decode = fast_decode;
+            ninfer::Engine engine(options);
+            engine.debug_enable_logit_capture(true);
+            if (input.empty()) {
+                const auto seed = prompts(engine)[1];
+                for (std::size_t i = 0; i < 85000; ++i) { input.push_back(seed[i % seed.size()]); }
+            }
+            std::cout << "85K DFlash state graphs=" << graphs << " begin" << std::endl;
+            auto result = engine.generate(engine.prepare_tokens(input, false), request_options(73));
+            require(result.generated_token_ids.size() == 73 && result.reused_prompt_tokens == 0,
+                    "DFlash long state gate changed the cold request budget/prefix");
+            require_speculation(result, profile);
+            if (graphs) {
+                captured = std::move(result);
+                captured_logits = engine.debug_last_round_logits_bf16();
+            } else {
+                compare_rounds(captured, result);
+                require(captured_logits == engine.debug_last_round_logits_bf16(),
+                        "DFlash long graph/eager target logits differ");
+            }
+        }
+        std::cout << "85K DFlash long" << (fast_decode ? "+fast" : "")
+                  << " Graph/eager IDs, target logits and acceptance counters PASS" << std::endl;
+        return 0;
+    }
     require(profile.backend == ninfer::SpeculativeBackend::Mtp && v100x2_test::pp() == 1,
             "long attention state gate requires Text/MTP without pipeline parallelism");
     std::array<ninfer::GenerationResult, 3> captured;
@@ -497,7 +541,8 @@ int main(int argc, char** argv) {
     const bool long_attention = argc == 2 && std::string(argv[1]) == "--long-attention";
     const bool long_fast = argc == 2 && std::string(argv[1]) == "--long-fast-decode";
     const bool batches = argc == 2 && std::string(argv[1]) == "--mtp-batches";
-    if (argc != 1 && !long_attention && !long_fast && !batches) { return 2; }
+    const bool dflash_batches = argc == 2 && std::string(argv[1]) == "--dflash-batches";
+    if (argc != 1 && !long_attention && !long_fast && !batches && !dflash_batches) { return 2; }
     const char* artifact = std::getenv("NINFER_V100X2_ARTIFACT");
     if (artifact == nullptr || *artifact == '\0') {
         std::cout << "skip: NINFER_V100X2_ARTIFACT is not set\n";
@@ -511,10 +556,13 @@ int main(int argc, char** argv) {
     }
     try {
         const auto profile = v100x2_test::profile(ninfer::ProposalHead::Full);
-        if (batches) {
-            require((v100x2_test::tp() == 2 || v100x2_test::tp() == 4) && v100x2_test::pp() == 1 &&
-                        profile.backend == ninfer::SpeculativeBackend::Mtp,
-                    "batch gate requires TP2/TP4 PP1 MTP");
+        if (batches || dflash_batches) {
+            require(v100x2_test::pp() == 1 &&
+                        (batches ? (v100x2_test::tp() == 2 || v100x2_test::tp() == 4) &&
+                                       profile.backend == ninfer::SpeculativeBackend::Mtp
+                                 : v100x2_test::tp() == 2 &&
+                                       profile.backend == ninfer::SpeculativeBackend::DFlash),
+                    "batch gate requires TP2/TP4 MTP or TP2 DFlash, PP1");
             std::array<Tokens, kProbes> inputs;
             {
                 ninfer::Engine engine(engine_options(artifact, true, false, profile));
@@ -523,7 +571,7 @@ int main(int argc, char** argv) {
             }
             for (bool fast : {false, true}) {
                 for (unsigned concurrency : {2U, 4U, 8U}) {
-                    exercise_mtp_batches(artifact, profile, inputs, concurrency, fast);
+                    exercise_speculative_batches(artifact, profile, inputs, concurrency, fast);
                 }
             }
             return 0;

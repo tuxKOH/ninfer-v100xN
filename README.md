@@ -281,7 +281,9 @@ env LD_LIBRARY_PATH="$PWD/build/_deps/install/lib:/usr/local/cuda-12.8/lib64${LD
 ```
 
 For DFlash7 use capacity 98304, chunk 1024 and `--spec dflash --draft-tokens 7`, omitting
-`--lm-head-draft`. Output is bounded by remaining context.
+`--lm-head-draft`. TP2 DFlash also admits the default-off `--volta-long-attention`
+and `--volta-fast-decode` experiments; both can change output and acceptance.
+[DFlash measurements and limits](docs/performance.md). Output is bounded by remaining context.
 For CLI use `build-v100/apps/ninfer` with the same inference flags and `--prompt TEXT --max-new N`.
 Installed GPU count does not fix runtime width: `--tp 2 --devices 4,6` selects a pair on an
 eight-card host. With `CUDA_VISIBLE_DEVICES=4,6`, use logical devices `0,1`.

@@ -56,8 +56,9 @@ inline std::vector<GraphExecutionProfile> mtp_graph_profiles(std::uint32_t capac
 
 inline std::vector<GraphExecutionProfile> dflash_graph_profiles(std::uint32_t capacity,
                                                                 std::uint32_t draft_window,
-                                                                std::uint32_t batch_size) {
-    return Variant::dflash_graph_profiles(capacity, draft_window, batch_size);
+                                                                std::uint32_t batch_size,
+                                                                bool long_attention) {
+    return Variant::dflash_graph_profiles(capacity, draft_window, batch_size, long_attention);
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

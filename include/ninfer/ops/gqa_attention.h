@@ -36,7 +36,8 @@ inline constexpr std::uint32_t kGqaAttentionMaximumVisibleKeys = 1048576;
 struct GqaExecutionEnvelope {
     std::uint32_t min_visible_keys = 0;
     std::uint32_t max_visible_keys = 0;
-    // Optional SM70 12|2 INT8 single/five-query implementation profile. Full key domain.
+    // Optional SM70 12|2 / 6|1 INT8 complete-history profile. TP2 also admits
+    // one-traversal seven/eight-query verification; softmax/PV association changes.
     bool volta_long_attention = false;
 };
 

@@ -408,6 +408,9 @@ GqaAttentionRoute gqa_attention_resolve_route(std::int32_t q_heads, std::int32_t
                                               std::int32_t batch_size, DType cache_dtype,
                                               GqaExecutionEnvelope envelope) {
     if (width >= 1 && width <= kSmallTChunkTokens) { return GqaAttentionRoute::SmallT; }
+    if (gqa_attention_uses_wide_long_verify(q_heads, width, cache_dtype, envelope)) {
+        return GqaAttentionRoute::SmallT;
+    }
     if (batch_size > 1) { return GqaAttentionRoute::ChunkedSmallT; }
 #ifdef NINFER_VOLTA_BUILD
     // Volta tiled flash attention, for single-batch prefill wide enough to pay for
@@ -711,7 +714,7 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
         launch_cached_chunked_small_t(q, positions, scale, cache, envelope, workspace, out, stream);
         return;
     }
-    if (detail::gqa_attention_uses_small_t(q.ne[2])) {
+    if (route == detail::GqaAttentionRoute::SmallT) {
         const std::int32_t splits =
             detail::gqa_attention_split_capacity(q.ne[1], q.ne[2], cache.dtype, envelope);
         SmallTWorkspace partial = allocate_small_t_workspace(workspace, q.ne[1], q.ne[2], splits);

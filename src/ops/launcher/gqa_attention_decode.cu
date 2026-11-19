@@ -390,11 +390,11 @@ PagedKVBatchLayerView single_row_batch_view(const PagedKVLayerView& cache) {
 
 } // namespace
 
-bool gqa_attention_uses_small_t(std::int32_t tokens) { return tokens >= 1 && tokens <= 6; }
-
 std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
                                           DType cache_dtype, GqaExecutionEnvelope envelope) {
-    if (tokens < 1 || tokens > 6 || (cache_dtype != DType::BF16 && cache_dtype != DType::I8) ||
+    if (tokens < 1 || (tokens > 6 && !gqa_attention_uses_wide_long_verify(
+            q_heads, tokens, cache_dtype, envelope)) ||
+        (cache_dtype != DType::BF16 && cache_dtype != DType::I8) ||
         envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys) {
         throw std::invalid_argument("gqa_attention split capacity: invalid profile");
     }
@@ -465,6 +465,26 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
     case 6:
         NINFER_GQA_SMALL_T_DISPATCH(6, 4);
         break;
+#ifdef NINFER_VOLTA_BUILD
+    case 7:
+    case 8:
+        if constexpr (Geometry::QHeads == 12) {
+            if (!gqa_attention_uses_wide_long_verify(Geometry::QHeads, invocation.width,
+                                                     cache.dtype, envelope)) {
+                throw std::invalid_argument("wide verifier requires the TP2 INT8 long profile");
+            }
+            const __nv_bfloat16* new_k = nullptr;
+            const __nv_bfloat16* new_v = nullptr;
+            if constexpr (CacheInput::writes_cache) {
+                new_k = input.k;
+                new_v = input.v;
+            }
+            gqa_attention_verify_qpn_volta_launch(q, new_k, new_v, pos, scale, cache,
+                invocation, logical_capacity, splits, partial_acc, partial_m, partial_l, stream);
+            break;
+        }
+        throw std::invalid_argument("wide verifier requires TP2 head geometry");
+#endif
     default:
         throw std::invalid_argument("gqa_attention_small_t_launch: unsupported T");
     }

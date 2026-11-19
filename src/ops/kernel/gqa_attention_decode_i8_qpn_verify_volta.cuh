@@ -6,11 +6,14 @@
 
 namespace ninfer::ops {
 
-// Six TP2/TP4 queries span 36 GQA rows. Five independent 8-row QK tiles share
-// one KV traversal; eight dimension warps accumulate every tile in FP32.
-inline constexpr int kGqaVerifyQpnDynamicBytes = (5 * 8 + 2 * 32) * 264 * sizeof(half);
+// Six TP2/TP4 queries span 36 GQA rows; TP2 DFlash's seven/eight queries span
+// 42/48 rows. Independent 8-row QK tiles share one KV traversal, with eight
+// dimension warps accumulating every PV tile in FP32.
+template <typename G, int Tokens>
+inline constexpr int kGqaVerifyQpnDynamicBytes =
+    (((Tokens * G::GroupSize + 7) / 8) * 8 + 2 * 32) * 264 * sizeof(half);
 
-template <typename G, bool MultiBatch, bool Masked, typename CacheInput>
+template <typename G, bool MultiBatch, bool Masked, typename CacheInput, int Tokens = 6>
 __global__ __launch_bounds__(256, 1) void gqa_attention_verify_qpn_volta_partial_i8_kernel(
     const __nv_bfloat16* q, CacheInput input, const std::int32_t* positions,
     std::int8_t* keys, std::int8_t* values, half* key_scales, half* value_scales,
@@ -20,7 +23,8 @@ __global__ __launch_bounds__(256, 1) void gqa_attention_verify_qpn_volta_partial
     float scale, __nv_bfloat16* partial, float* partial_m, float* partial_l) {
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700
     static_assert(G::QHeads == 12 || G::QHeads == 6);
-    constexpr int T = 6, D = kGqaHeadDim, Bc = 32, Stride = D + 8, PStride = Bc + 8;
+    static_assert(Tokens == 6 || (G::QHeads == 12 && (Tokens == 7 || Tokens == 8)));
+    constexpr int T = Tokens, D = kGqaHeadDim, Bc = 32, Stride = D + 8, PStride = Bc + 8;
     constexpr int Rows = T * G::GroupSize, RowTiles = (Rows + 7) / 8;
     constexpr float Log2E = 1.4426950408889634074f;
     constexpr unsigned Mask = 0xffffffffu;

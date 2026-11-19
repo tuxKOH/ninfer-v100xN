@@ -2204,7 +2204,8 @@ void ProgramImplCore::prepare_graphs() {
         }
     }
     if (speculative_backend == SpeculativeBackend::DFlash) {
-        const auto batch_one_profiles = dflash_graph_profiles(capacity, draft_window, 1);
+        const auto batch_one_profiles =
+            dflash_graph_profiles(capacity, draft_window, 1, volta_long_attention);
         validate_graph_profiles(batch_one_profiles, capacity - 1, "DFlash");
         schedule::DFlashBatchContext dflash_state{
             execution_core(),     decoder->text_kv,    *dflash,          *io.dflash_decode,
@@ -2238,7 +2239,8 @@ void ProgramImplCore::prepare_graphs() {
             for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
                 const auto planned_profiles =
                     batch_size == 1 ? batch_one_profiles
-                                    : dflash_graph_profiles(capacity, draft_window, batch_size);
+                                    : dflash_graph_profiles(capacity, draft_window, batch_size,
+                                                            volta_long_attention);
                 validate_graph_profiles(planned_profiles, capacity - 1, "DFlash");
                 for (const GraphExecutionProfile planned : planned_profiles) {
                     dflash_graphs.profiles.emplace_back();

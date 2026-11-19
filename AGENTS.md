@@ -172,7 +172,7 @@ The 27B draft window is at most seven. On this V100X2, the verified DFlash profi
 capacity with a 1024-token prefill chunk, not the 180000-capacity MTP acceptance profile.
 
 The optional `volta_long_attention` profile admits SM70 27B TP2/TP4, PP1 experimental 1–8-request
-Text/None/MTP and TP2 Vision/None/MTP with complete INT8 group-64 KV, without RAM-KV. It retains every
+Text/None/MTP and TP2 Text/DFlash or Vision/None/MTP with complete INT8 group-64 KV, without RAM-KV. It retains every
 causally visible key but changes split partitioning, softmax association and PV accumulation;
 it is default-off and not bit-equivalent to ordinary attention. The 104-question local GPQA
 comparison is behavioral evidence, not a full 198-question evaluation or proof of losslessness.
@@ -193,7 +193,9 @@ Release 0.1.2 contains these Vision changes and an optional qualified Linux SM70
 QUASAR TP4 qualification is recorded separately and ships in release 0.2.0.
 
 The optional `volta_fast_decode` profile is default-off and admits QUASAR SM70 TP2/TP4
-Text/None/MTP. It selects packed NVFP4 parents with FP32 scale-after-K-reduction and
+Text/None/MTP and TP2 Text/DFlash. DFlash keeps its native W8/BF16 drafter; its target verifier
+separately admits the optional seven/eight-query complete-history long-attention profile.
+Fast decode selects packed NVFP4 parents with FP32 scale-after-K-reduction and
 shape-specific packed MTP W8 reductions. The normal profile retains per-group FP16 scaling
 with the same exact weight layout, fusion and communication optimizations. Both paths keep
 original codes/scales/divisors and one resident copy. The fast profile can change logits and
@@ -204,6 +206,14 @@ removed the fixed speed goal and requested six decode trials, retaining MTP4: at
 overlap, MTP tail fusion, TP2 communication/norm, NVFP4 QPN scheduling, GDN value tiles,
 and verified history lookup. Neither 200 nor 250 tok/s is a completion condition or measured limit.
 No current-combination GPQA result is available.
+The 2026-11-15 TP2 DFlash7 follow-up ports both default-off numerical experiments.
+At the saved 85K raw-prefix fixture, ordinary/long/fast/both measure
+122.647/167.494/128.106/168.149 committed wall tok/s, two repetitions each.
+These are changed-output profiles, not exact-output kernel gains or quality scores.
+Long-only and combined actual-85K Graph/eager ID/logit/counter gates pass;
+short state/teacher-forced and independent FP64 Op checks pass. The HumanEval
+32-task throughput subset measures 301.212->302.380 with both; 2/64 outputs change.
+No new GPQA or pass@1 is established. See docs/performance.md for workload limits.
 The earlier remote TP4 campaign retains MTP4 and that host's 220 W / 1200 MHz limits. After the
 216.934 tok/s result, the user requested a measured same-host 1Cat comparison and reopened
 optimization toward a 300 committed tok/s stretch target at 85000 occupied input tokens.

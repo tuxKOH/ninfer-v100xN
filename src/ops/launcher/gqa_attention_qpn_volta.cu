@@ -93,9 +93,21 @@ void gqa_attention_verify_qpn_volta_launch(
         };
         if (invocation.width == 5) {
             issue(gqa_attention_verify5_qpn_volta_partial_i8_kernel<Geometry, MultiBatch, Masked, CacheInput>, 0);
-        } else {
+        } else if (invocation.width == 6) {
             issue(gqa_attention_verify_qpn_volta_partial_i8_kernel<Geometry, MultiBatch, Masked, CacheInput>,
-                  kGqaVerifyQpnDynamicBytes);
+                  kGqaVerifyQpnDynamicBytes<Geometry, 6>);
+        } else if constexpr (Geometry::QHeads == 12) {
+            if (invocation.width == 7) {
+                issue(gqa_attention_verify_qpn_volta_partial_i8_kernel<Geometry, MultiBatch, Masked, CacheInput, 7>,
+                      kGqaVerifyQpnDynamicBytes<Geometry, 7>);
+            } else if (invocation.width == 8) {
+                issue(gqa_attention_verify_qpn_volta_partial_i8_kernel<Geometry, MultiBatch, Masked, CacheInput, 8>,
+                      kGqaVerifyQpnDynamicBytes<Geometry, 8>);
+            } else {
+                throw std::invalid_argument("unsupported QPN verifier width");
+            }
+        } else {
+            throw std::invalid_argument("unsupported QPN verifier geometry/width");
         }
         CUDA_CHECK(cudaGetLastError());
     };

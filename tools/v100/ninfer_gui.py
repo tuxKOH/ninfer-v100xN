@@ -304,7 +304,7 @@ class NInferGui(QWidget):
                                       "CPU 模式将 API 准备/排队超时设为 10 分钟，以容纳慢速媒体编码。")
         self.vision_max_tokens = self._spin(1024, 1, 32768, 128)
         self.vision_max_tokens.setToolTip("每个请求的图片/视频合计视觉 token 上限；增加会占用更多显存。")
-        self.volta_fast_decode = QCheckBox("实验：NVFP4 / MTP 快速数值路径")
+        self.volta_fast_decode = QCheckBox("实验：NVFP4 快速数值路径（MTP / DFlash）")
         self.volta_long_attention = QCheckBox("实验：完整历史长注意力（文本 / 图片 / 视频）")
         self.ram_kv = QCheckBox("实验：RAM-KV 近似历史检索")
         self.ram_window = self._spin(32768, 64, 262144, 64)
@@ -313,8 +313,10 @@ class NInferGui(QWidget):
                                "本配置无确定速度/GPQA数据；RAM archive 预算不等于进程 RSS 限制。\n"
                                "KV 容量启用时自动等于 GPU window。与视觉、DFlash、TP4、长注意力互斥。")
         self.volta_fast_decode.setToolTip(
-            "对应 --volta-fast-decode；QUASAR / SM70 / TP2/TP4 / 纯文本 None/MTP。\n"
+            "对应 --volta-fast-decode；QUASAR / SM70 / TP2/TP4 / 纯文本 None/MTP，DFlash 仅 TP2。\n"
             "NVFP4 FP32 末尾缩放、MTP W8 重排与归约；可能改变 logits、草稿接受和输出。\n"
+            "DFlash7：85K 122.65→128.11 tok/s（+4.45%）；长注意力组合 168.15（+37.10%）。\n"
+            "DFlash 仅改目标 NVFP4，保留 W8/BF16 drafter；HumanEval 64 次有 2 次输出变化，质量未测。\n"
             "85K / MTP4 组合：本机 TP2 约 198.1 tok/s；远端 TP4 / 220 W 约 267.5 tok/s。\n"
             "TP4 比 231.3 组合约 +12.46%；prefill 约 2337 tok/s，Split-D 可能改变输出。\n"
             "TP4 普通、前缀及实际 85K Graph/eager 状态检查均通过；不代表质量无损。\n"
@@ -322,10 +324,12 @@ class NInferGui(QWidget):
             "前序近无损界限仅9/25点通过；当前组合GPQA未跑，智力影响未知。\n"
             "默认关闭，需重启 API。")
         self.volta_long_attention.setToolTip(
-            "对应 --volta-long-attention；SM70 27B / TP2/TP4（视觉仅 TP2）/ INT8 KV / 并发1–8 / 文本或视觉 None/MTP。\n"
+            "对应 --volta-long-attention；SM70 27B / TP2/TP4 / INT8 KV / 并发1–8；视觉和 DFlash 仅 TP2。\n"
             "保留全部历史 KV，改变 softmax/PV 累加顺序；可能改变输出。\n"
+            "DFlash7：85K 原始代码前缀 122.65→167.49 tok/s（+36.57%），输出改变，质量未测。\n"
+            "DFlash 与快速数值组合 168.15 tok/s；HumanEval 短输入约 301→302，非质量分数。\n"
             "纯文本与快速数值路径组合约 198.1 tok/s，不代表视觉或此开关单项收益；当前组合 GPQA 未测。\n"
-            "默认关闭，需重启 API；不能与 DFlash 或 RAM-KV 一起使用；视觉可用，快速数值路径仍仅限文本。")
+            "默认关闭，需重启 API；不能与 RAM-KV 一起使用；DFlash 数值/接受率可能改变，质量未评估。")
         self.max_concurrency = self._spin(1, 1, 8, 1)
         self.default_max_tokens = self._spin(65536, 1, 1048576, 1024)
         self.api_key = QLineEdit()
@@ -842,8 +846,12 @@ class NInferGui(QWidget):
 
     def show_experimental_details(self) -> None:
         QMessageBox.information(self, "实验说明",
-            "完整历史长注意力支持 TP2 文本、图片和视频，None/MTP、完整 INT8 KV；GPU/CPU 视觉塔均可用。\n"
+            "完整历史长注意力支持 TP2 文本（None/MTP/DFlash）、图片和视频（None/MTP）、完整 INT8 KV。\n"
+            "GPU/CPU 视觉塔均可用。DFlash 快速数值路径只修改目标模型，保留原生 W8/BF16 drafter。\n"
             "开启视觉会保留长注意力；快速数值路径仍仅限文本。两项实验默认关闭，修改后需重启 API。\n\n"
+            "DFlash7 / TP2：85K 原始代码前缀普通 122.65、长注意力 167.49、快速数值 128.11、组合 168.15 tok/s。\n"
+            "组合 +37.10%；HumanEval 32题×2 约 301.21→302.38，非 pass@1。\n"
+            "组合改变 2/64 个短请求输出及全部 85K 请求输出；质量影响未知，未测 GPQA。\n\n"
             "纯文本数值路径 + 长注意力：85K 输入、MTP4、greedy 下组合约 198.1 tok/s；末步 W8 约 +0.84%。\n"
             "不是各开关的独立增幅。前序组合 25 点 argmax 一致，最小 cosine 0.998831，最大 KL 0.001903；\n"
             "near-lossless 仅 9/25 通过，当前组合未测 GPQA。可能改变输出和草稿接受位置。\n\n"
@@ -874,12 +882,12 @@ class NInferGui(QWidget):
             return "实验 PP2 要求 TP1、两卡、并发1、NVFP4/QUASAR 纯文本 None/MTP；关闭两个数值实验"
         if self.volta_long_attention.isChecked() and (
                 tp not in (2, 4) or self.kv_dtype.currentText() != "int8" or
-                self.ram_kv.isChecked() or spec not in {"none", "mtp"}):
-            return ("实验性长上下文注意力要求 TP2/TP4、INT8 KV、并发 1–8、后端为 none 或 mtp、视觉仅支持 TP2；"
+                self.ram_kv.isChecked() or (spec == "dflash" and tp != 2)):
+            return ("实验性长上下文注意力要求 TP2/TP4、INT8 KV、并发 1–8、视觉和 DFlash 仅支持 TP2；"
                     "请调整配置或取消勾选该开关。硬件和模型还须为 SM70 27B。")
         if self.volta_fast_decode.isChecked() and (tp not in (2, 4) or self.vision.isChecked() or
-                                                    spec not in {"none", "mtp"}):
-            return "实验性快速数值路径要求 QUASAR / SM70 / TP2/TP4 / 纯文本 None 或 MTP"
+                                                    (spec == "dflash" and tp != 2)):
+            return "实验性快速数值路径要求 QUASAR / SM70 / TP2/TP4 / 纯文本；DFlash 仅 TP2"
         if self.vision.isChecked() and (tp != 2 or spec == "dflash"):
             return "视觉要求 TP2，后端为 none 或 mtp；不能与 DFlash 一起使用"
         if self.vision.isChecked() and artifact.name in {"qwen3_8_27b_q4_k_m.ninfer", "qwen3_8_27b_fp8.ninfer"}:

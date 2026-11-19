@@ -243,8 +243,7 @@ class GuiCacheDisplay(unittest.TestCase):
 
     def test_experimental_attention_rejects_incompatible_configuration(self):
         initial = self.gui.configuration()
-        for name, value in (("tp", "1"), ("kv_dtype", "bf16"),
-                            ("spec", "dflash")):
+        for name, value in (("tp", "1"), ("kv_dtype", "bf16")):
             with self.subTest(name=name, value=value):
                 self.gui.apply_configuration(initial)
                 self.gui.volta_long_attention.setChecked(True)
@@ -260,6 +259,18 @@ class GuiCacheDisplay(unittest.TestCase):
         self.gui.apply_configuration(initial)
         self.gui.spec.setCurrentText("none")
         self.assertIsNone(self.gui._validate())
+
+    def test_dflash_tp2_accepts_both_experimental_profiles(self):
+        self.gui.spec.setCurrentText("dflash")
+        self.gui.draft_tokens.setValue(7)
+        self.gui.volta_long_attention.setChecked(True)
+        self.gui.volta_fast_decode.setChecked(True)
+        self.assertIsNone(self.gui._validate())
+        self.assertIn('--volta-long-attention', self.gui._command())
+        self.assertIn('--volta-fast-decode', self.gui._command())
+        self.gui.tp.setCurrentText("4")
+        self.gui.devices.setText("0,1,2,3")
+        self.assertIsNotNone(self.gui._validate())
 
     def test_named_configuration_replaces_previous_execution_and_sampling(self):
         initial = self.gui.configuration()
