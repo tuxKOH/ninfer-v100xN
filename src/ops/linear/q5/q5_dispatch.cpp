@@ -1,5 +1,9 @@
 #include "ops/linear/q5/q5_dispatch.h"
 
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/q5/q5_cutlass_sm70.h"
+#endif
+
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -171,7 +175,20 @@ Q5Launch select_q5_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
 }
 
 void q5_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
-                 cudaStream_t stream) {
+                 WorkspaceArena* workspace, cudaStream_t stream) {
+#ifdef NINFER_VOLTA_BUILD
+    // Registered Vision geometries at wide T, which the table alone resolves to q5_simt_r8_c8 on
+    // sm_70; see the Q4 sibling. The workspace is sized by linear_workspace_capacity_bytes().
+    if (workspace != nullptr && q5_uses_cutlass_sm70(out.ne[0], x.ne[0], x.ne[1])) {
+        // Resolved for its policy and registry checks only, so the route admits exactly what
+        // the table does.
+        (void)select_q5_launch(w.n, w.k, x.ne[1], policy);
+        q5_cutlass_sm70_launch(x, w, out, *workspace, stream);
+        return;
+    }
+#else
+    (void)workspace;
+#endif
     const Q5Launch launch = select_q5_launch(w.n, w.k, x.ne[1], policy);
     launch(x, w, out, stream);
 }

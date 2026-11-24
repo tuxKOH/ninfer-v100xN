@@ -186,6 +186,14 @@ including CUDA Graph replay, output guards and unchanged activation/weight bytes
 head against the independent FP64 oracle and original staged GEMV output, with
 CUDA Graph replay and unchanged activation, weight and output-guard bytes.
 
+`ninfer_linear_q4_q5_cutlass_sm70_test` checks the SM70 CUTLASS route of the four
+registered Vision block projections (Q4 `[3456,1152]`, `[4304,1152]`; Q5 `[1152,1152]`,
+`[1152,4304]`) through public `linear()` at T=68, 2048, 2052 and 4096: the routed band's
+lower edge, one column chunk, a four-column last chunk and two chunks. Each point is compared
+with the independent FP64 oracle under the A16 Linear criterion, as is the workspace-free
+call form, and the two forms are compared over the whole output. It also checks the reported
+workspace capacity, CUDA Graph replay and unchanged activation, weight and output-guard bytes.
+
 `ninfer_long_attention_real_test` is an opt-in SM70 TP2 QUASAR 85K full-history
 logit/state check, not a routine CTest. It uses one explicit artifact, corpus,
 captured continuation report and output prefix. Set
@@ -413,3 +421,23 @@ and MTP4 settings to exercise real cross-chunk media, continuation, edited media
 `--output-tokens N`; set the exact `NINFER_QUASAR_ARTIFACT` path. Its default is 85,000 occupied
 text tokens with GPU Vision enabled, long attention and MTP4; it prints JSON wall timing,
 acceptance, memory and committed IDs. These checks are not GPQA or proof of checkpoint quality.
+
+`ninfer_qwen3_6_27b_vision_encode_real_test` is an opt-in Vision-tower-only check: it binds the
+frontend resources and Vision tensors of one explicit 27B artifact, runs frames of one explicit
+clip through the real frontend processor and the production `VisionContext::encode`, and
+compares the final `[5120,V]` embeddings with the host FP32 schedule. It needs about 300 MB of
+device weights plus the Vision workspace, not the language model. Optional trailing arguments
+select the frame count and a resample size; 1376x768 gives a 48x86 grid of 4128 patches:
+
+```bash
+TEST=build/tests/ninfer_qwen3_6_27b_vision_encode_real_test
+ARTIFACT=/path/to/qwen3_8_27b_nvfp4.ninfer
+$TEST gpu "$ARTIFACT" clip.mp4 gpu.bin 3 1376 768
+$TEST cpu "$ARTIFACT" clip.mp4 cpu.bin 3 1376 768
+$TEST compare gpu.bin cpu.bin
+```
+
+`compare` prints relative L2, maximum error and cosine per item and fails on a non-finite value
+or a cosine below 0.999. This is a gross bound that catches a broken schedule, such as scratch
+aliasing a live block tensor, which the Op tests with their private arenas cannot see; it is not
+a rounding criterion and does not replace the per-Op oracles.

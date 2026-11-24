@@ -14,6 +14,10 @@
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
 #include "ops/linear/q4/q4_dispatch.h"
 #include "ops/linear/q5/q5_dispatch.h"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/q4/q4_cutlass_sm70.h"
+#include "ops/linear/q5/q5_cutlass_sm70.h"
+#endif
 #include "ops/linear/q6/q6_dispatch.h"
 #include "ops/linear/w8/w8_dispatch.h"
 
@@ -119,7 +123,7 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         detail::q4_dispatch(x, w, out, policy, workspace, stream);
         return;
     case QType::Q5G64_F16S:
-        detail::q5_dispatch(x, w, out, policy, stream);
+        detail::q5_dispatch(x, w, out, policy, workspace, stream);
         return;
     case QType::Q6G64_F16S:
         detail::q6_dispatch(x, w, out, policy, stream);
@@ -181,6 +185,12 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
                         detail::q4_volta_mma_workspace_bytes(output_rows, input_rows, t));
                 }
             }
+            // Monotonic in T up to the launcher's column chunk and flat beyond it, so the
+            // interval's upper end is its maximum.
+            if (detail::q4_uses_cutlass_sm70(output_rows, input_rows, max_tokens)) {
+                capacity = std::max(capacity, detail::q4_cutlass_sm70_workspace_bytes(
+                                                  output_rows, input_rows, max_tokens));
+            }
             return capacity;
         }
 #endif
@@ -188,6 +198,11 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     case QType::Q5G64_F16S:
         (void)detail::select_q5_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_q5_launch(output_rows, input_rows, max_tokens, policy);
+#ifdef NINFER_VOLTA_BUILD
+        if (detail::q5_uses_cutlass_sm70(output_rows, input_rows, max_tokens)) {
+            return detail::q5_cutlass_sm70_workspace_bytes(output_rows, input_rows, max_tokens);
+        }
+#endif
         return 0;
     case QType::Q6G64_F16S:
         (void)detail::select_q6_launch(output_rows, input_rows, min_tokens, policy);

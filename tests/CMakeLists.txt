@@ -180,6 +180,19 @@ if(UNIX)
 endif()
 set_tests_properties(ninfer_qwen3_6_27b_vision_tp2_real_test PROPERTIES
   SKIP_RETURN_CODE 77 TIMEOUT 1800 ENVIRONMENT "NINFER_TEST_TP2=1")
+# Vision tower only, on a real artifact and real clip frames: reaches the production
+# VisionContext::encode without loading the language model and compares its embeddings with the
+# host FP32 schedule. Skips (77) without arguments; see tests/README.md for the invocations.
+ninfer_add_test(ninfer_qwen3_6_27b_vision_encode_real_test
+  SOURCES targets/qwen3_6_27b/test_vision_encode_real.cpp
+  LIBRARIES ninfer_engine ninfer_artifact ninfer_core ninfer_ops ninfer_media_decode)
+target_include_directories(ninfer_qwen3_6_27b_vision_encode_real_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/impl)
+target_link_libraries(ninfer_qwen3_6_27b_vision_encode_real_test PRIVATE CUDA::cudart)
+set_tests_properties(ninfer_qwen3_6_27b_vision_encode_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_8_27b_tp2_real_test
   SOURCES targets/qwen3_6_27b/test_engine_tp2_real.cpp
   LIBRARIES ninfer_engine)
@@ -506,6 +519,9 @@ ninfer_add_op_test(ninfer_linear_w8_volta_decode_test
   LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_linear_q4_volta_proposal_test
   SOURCES ops/linear/test_q4_volta_proposal.cu
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_linear_q4_q5_cutlass_sm70_test
+  SOURCES ops/linear/test_q4_q5_cutlass_sm70.cpp
   LIBRARIES ninfer_ops)
 ninfer_add_linear_test(ninfer_linear_nvfp4_a16_test ops/linear/test_nvfp4_a16.cpp)
 ninfer_add_op_test(ninfer_nvfp4_volta_batch_test

@@ -1,5 +1,9 @@
 #include "ops/linear/q4/q4_dispatch.h"
 
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/q4/q4_cutlass_sm70.h"
+#endif
+
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -182,6 +186,17 @@ void q4_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy pol
                  WorkspaceArena* workspace, cudaStream_t stream) {
     const std::int32_t t = x.ne[1];
 #ifdef NINFER_VOLTA_BUILD
+    // Registered Vision geometries at wide T. Their table entries are MMA launchers that are not
+    // sm_70 kernels, so the table alone resolves them to q4_simt_r8_c8: scalar FP32 that re-reads
+    // the weight once per eight columns. With a caller workspace, sized by
+    // linear_workspace_capacity_bytes(), they take the CUTLASS Sm70 route instead.
+    if (workspace != nullptr && q4_uses_cutlass_sm70(out.ne[0], x.ne[0], t)) {
+        // Resolved for its policy and registry checks only, so the route admits exactly what
+        // the table does.
+        (void)select_q4_launch(w.n, w.k, t, policy);
+        q4_cutlass_sm70_launch(x, w, out, *workspace, stream);
+        return;
+    }
     // Quadpair-split-N maps T to the 8-row axis instead of the 32-row one, so it is the right
     // geometry exactly where the companion kernel pads its A rows away. Needs no workspace at
     // all, so unlike that route there is nothing to fall back from.
