@@ -36,6 +36,33 @@ std::size_t checked_mul(std::size_t a, std::size_t b, const char* label) {
 
 constexpr std::size_t kWorkspaceAlignment = 256;
 
+// Transient the encoder-block linears (qkv, attention output, MLP fc1 and fc2) require from the
+// caller at any patch count up to `patches`; zero when Linear has no workspace-backed route for
+// these problems. Asking for the whole interval rather than the one count keeps the layout
+// monotonic in the patch count, which workspace_capacity_bytes() relies on.
+std::size_t block_linear_workspace_bytes(std::int32_t patches) {
+    struct Projection {
+        QType qtype;
+        std::int32_t rows;
+        std::int32_t inner;
+    };
+    // Formats are the ones bind_vision_backbone() binds (targets/qwen3_6/impl/vision/bindings.cpp).
+    constexpr Projection kProjections[] = {
+        {QType::Q4G64_F16S, 3 * VisionScheduleConfig::hidden, VisionScheduleConfig::hidden},
+        {QType::Q5G64_F16S, VisionScheduleConfig::hidden, VisionScheduleConfig::hidden},
+        {QType::Q4G64_F16S, VisionScheduleConfig::intermediate, VisionScheduleConfig::hidden},
+        {QType::Q5G64_F16S, VisionScheduleConfig::hidden, VisionScheduleConfig::intermediate},
+    };
+    std::size_t bytes = 0;
+    for (const Projection& projection : kProjections) {
+        bytes = std::max(bytes, ops::linear_workspace_capacity_bytes(
+                                    projection.qtype, projection.rows, projection.inner,
+                                    ops::LinearPolicy::A16Only, VisionScheduleConfig::merge_unit,
+                                    patches));
+    }
+    return bytes;
+}
+
 struct VisionWorkspaceLayout {
     TensorRegion position_ids;
     TensorRegion cu_seqlens;
@@ -53,6 +80,7 @@ struct VisionWorkspaceLayout {
     TensorRegion mlp_norm;
     TensorRegion normalized;
     TensorRegion merger_hidden;
+    std::optional<LayoutRegion> block_linear_workspace;
     std::size_t bytes = 0;
 };
 
@@ -86,6 +114,15 @@ VisionWorkspaceLayout build_workspace_layout(std::size_t patches64, std::size_t 
     out.x           = add(DType::BF16, {VisionScheduleConfig::hidden, patches}, "vision residual");
     out.patch_bf16 =
         add(DType::BF16, {VisionScheduleConfig::patch_dim, patches}, "vision BF16 patches");
+    // One transient region shared by the four block linears, which are issued on one stream and
+    // each scope their own use of it. It precedes the block scopes because those rewind the
+    // builder when they close: a region added after them would start where the block tensors
+    // start and alias the operands of the very calls that use it.
+    if (const std::size_t linear_bytes = block_linear_workspace_bytes(patches);
+        linear_bytes != 0) {
+        out.block_linear_workspace =
+            builder.add(linear_bytes, kWorkspaceAlignment, "vision block linear workspace");
+    }
     {
         auto attention_scope = builder.scope();
         out.attended = add(DType::BF16, {VisionScheduleConfig::hidden, patches}, "vision attended");
@@ -249,6 +286,21 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output,
     Tensor position_table = position_embed_->reshape(
         {VisionScheduleConfig::hidden, VisionScheduleConfig::position_embeddings});
     ops::vision_pos_embed_add(position_table, pos_indices, pos_weights, x, stream);
+
+    // Linear's policy/workspace form whenever it reports a transient requirement for these
+    // problems; its workspace-free form otherwise.
+    std::optional<WorkspaceArena> block_linear_workspace;
+    if (layout.block_linear_workspace) {
+        block_linear_workspace.emplace(layout.block_linear_workspace->bind(backing));
+    }
+    const auto block_linear = [&](const Tensor& input, const Weight& weight, Tensor& result) {
+        if (block_linear_workspace) {
+            ops::linear(input, weight, result, ops::LinearPolicy::A16Only,
+                        *block_linear_workspace, stream);
+        } else {
+            ops::linear(input, weight, result, stream);
+        }
+    };
     for (std::size_t layer = 0; layer < blocks_.size(); ++layer) {
         const BlockW& block = blocks_[layer];
         {
@@ -259,7 +311,7 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output,
                     Tensor h = layout.attention_norm.bind(backing);
                     ops::layer_norm(x, *block.norm1_weight, *block.norm1_bias,
                                     VisionScheduleConfig::norm_eps, h, stream);
-                    ops::linear(h, *block.qkv, qkv, stream);
+                    block_linear(h, *block.qkv, qkv);
                 }
                 ops::add_bias(*block.qkv_bias, qkv, stream);
                 const std::int32_t plane      = VisionScheduleConfig::hidden;
@@ -285,7 +337,7 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output,
                                       stream);
             }
             Tensor projected = layout.projected.bind(backing);
-            ops::linear(attended, *block.projection, projected, stream);
+            block_linear(attended, *block.projection, projected);
             ops::add_bias(*block.projection_bias, projected, stream);
             ops::residual_add(projected, x, stream);
         }
@@ -296,11 +348,11 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output,
                 Tensor h = layout.mlp_norm.bind(backing);
                 ops::layer_norm(x, *block.norm2_weight, *block.norm2_bias,
                                 VisionScheduleConfig::norm_eps, h, stream);
-                ops::linear(h, *block.fc1, up, stream);
+                block_linear(h, *block.fc1, up);
             }
             ops::add_bias(*block.fc1_bias, up, stream);
             ops::gelu(up, ops::GeluMode::Tanh, stream);
-            ops::linear(up, *block.fc2, down, stream);
+            block_linear(up, *block.fc2, down);
             ops::add_bias(*block.fc2_bias, down, stream);
             ops::residual_add(down, x, stream);
         }
