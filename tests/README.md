@@ -186,6 +186,14 @@ including CUDA Graph replay, output guards and unchanged activation/weight bytes
 head against the independent FP64 oracle and original staged GEMV output, with
 CUDA Graph replay and unchanged activation, weight and output-guard bytes.
 
+`ninfer_linear_q4_q5_cutlass_sm70_test` checks the SM70 CUTLASS route of the four
+registered Vision block projections (Q4 `[3456,1152]`, `[4304,1152]`; Q5 `[1152,1152]`,
+`[1152,4304]`) through public `linear()` at T=68, 2048, 2052 and 4096: the routed band's
+lower edge, one column chunk, a four-column last chunk and two chunks. Each point is compared
+with the independent FP64 oracle under the A16 Linear criterion, as is the workspace-free
+call form, and the two forms are compared over the whole output. It also checks the reported
+workspace capacity, CUDA Graph replay and unchanged activation, weight and output-guard bytes.
+
 `ninfer_long_attention_real_test` is an opt-in SM70 TP2 QUASAR 85K full-history
 logit/state check, not a routine CTest. It uses one explicit artifact, corpus,
 captured continuation report and output prefix. Set

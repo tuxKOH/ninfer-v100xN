@@ -507,6 +507,9 @@ ninfer_add_op_test(ninfer_linear_w8_volta_decode_test
 ninfer_add_op_test(ninfer_linear_q4_volta_proposal_test
   SOURCES ops/linear/test_q4_volta_proposal.cu
   LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_linear_q4_q5_cutlass_sm70_test
+  SOURCES ops/linear/test_q4_q5_cutlass_sm70.cpp
+  LIBRARIES ninfer_ops)
 ninfer_add_linear_test(ninfer_linear_nvfp4_a16_test ops/linear/test_nvfp4_a16.cpp)
 ninfer_add_op_test(ninfer_nvfp4_volta_batch_test
   SOURCES ops/linear/test_nvfp4_volta_batch.cpp
