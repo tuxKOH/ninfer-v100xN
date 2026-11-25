@@ -16,6 +16,7 @@
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
+#include "runtime/generation/token_grammar.h"
 #include "targets/qwen3_6/impl/vision/host.h"
 
 #include <cstdint>
@@ -73,6 +74,7 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint;
     bool allow_prefix_reuse = false;
     bool capture_prefix_checkpoints = false;
+    std::shared_ptr<const runtime::CompiledTokenGrammar> grammar;
 };
 
 template <>
@@ -92,6 +94,7 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     ops::SamplingConfig sampling;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
+    std::shared_ptr<const runtime::CompiledTokenGrammar> grammar;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail
@@ -174,6 +177,8 @@ struct DecodeGraphProfile {
     std::uint32_t max_execution_frontier = 0;
     std::uint32_t topology_class         = 0;
     bool greedy_target                   = false;
+    // Captured with the structured-output mask; unconstrained rounds replay graphs without it.
+    bool constrained                     = false;
     DecodeGraphDefinition definition;
 };
 
@@ -228,6 +233,8 @@ struct RequestControl {
     Lifecycle lifecycle = Lifecycle::Empty;
     PendingCandidate pending;
     ops::SamplingConfig sampling_host;
+    // Structured-output state over this request's committed tokens.
+    std::optional<runtime::TokenGrammarMatcher> grammar;
     GenerationTimings timings;
     SpeculativeStats speculative_stats;
 
@@ -429,6 +436,22 @@ public:
 
     PinnedHostBuffer round_host;
     TokenId* host_tokens = nullptr;
+    // Structured-output constraint image, read in place by every rank: flags [rows] followed by
+    // bitmasks [rows, words]. Decode rounds use rows [0,B*width) in round column order; the single
+    // prefill lane owns kTokenConstraintPrefillRow. Rows are rewritten before each round.
+    static constexpr std::int32_t kTokenConstraintDecodeRows =
+        static_cast<std::int32_t>(kMaximumConcurrency * qwen3_6::kMtpDecodeMaximumWidth);
+    static constexpr std::int32_t kTokenConstraintPrefillRow = kTokenConstraintDecodeRows;
+    static constexpr std::int32_t kTokenConstraintRows       = kTokenConstraintDecodeRows + 1;
+    PinnedHostBuffer token_constraint_host;
+    schedule::TokenConstraintView token_constraints;
+    // Writes `drafts.size() + 1` rows from `row` and returns the licensed draft prefix; a request
+    // without a grammar leaves its rows unconstrained and licenses every draft.
+    [[nodiscard]] std::uint32_t plan_token_constraints(RequestControl& request, std::int32_t row,
+                                                       std::span<const TokenId> drafts);
+    // The prefill row when this request selects tokens under a grammar, otherwise unbound.
+    [[nodiscard]] schedule::TokenConstraintView
+    prefill_token_constraints(const RequestControl& request) const noexcept;
     // Debug-only capture of the round's full-vocabulary logits, raw BF16 bits. OFF by default and
     // completely inert until enable_logits_capture(true) allocates the host buffer: with it off,
     // copy_round_logits() is a predictable branch and nothing is allocated or copied, so no

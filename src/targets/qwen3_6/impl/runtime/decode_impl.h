@@ -3,6 +3,7 @@
 
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/scatter.h"
+#include "ninfer/ops/token_bitmask.h"
 
 #include <optional>
 #include <stdexcept>
@@ -53,6 +54,11 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
         card.ordinary_decode_batch(tokens, cache_positions, rope_positions, kv_rows, lanes,
                                    envelope, hidden, logits);
         ops::scatter(hidden, lanes, state.continuation_hidden_store, state.execution.device.stream);
+        if (const TokenConstraintView& constraints = state.execution.token_constraints) {
+            ops::apply_token_bitmask(logits, TextConfig::token_domain, 0, constraints.constrained,
+                                     constraints.bitmask, constraints.words,
+                                     state.execution.device.stream);
+        }
         ops::sample(logits, sampled, TextConfig::token_domain, ordinary.sampling, cache_positions,
                     ops::kSamplePurposeDecode, state.execution.work, state.execution.device.stream);
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, ordinary.egress.data,

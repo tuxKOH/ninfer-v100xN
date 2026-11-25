@@ -238,6 +238,21 @@ int main() {
         check(!resolve_prompt_semantics(request, configured, prompt_capabilities).preserve_thinking,
               "request preserve-thinking override did not win");
 
+    const auto medium = parse({"ninfer-serve", "model.ninfer", "--reasoning-effort", "medium"});
+    prompt_capabilities.reasoning_effort.medium = true;
+    failures += check(resolve_prompt_semantics(request, medium, prompt_capabilities)
+                              .reasoning_effort == ninfer::ReasoningEffort::Medium,
+                      "server reasoning effort did not apply to a thinking request");
+    request.enable_thinking = false;
+    failures += check(!resolve_prompt_semantics(request, medium, prompt_capabilities)
+                           .reasoning_effort.has_value(),
+                      "server reasoning effort applied to a non-thinking request");
+    request.enable_thinking = std::nullopt;
+    bool effort_without_thinking = false;
+    try { (void)parse({"ninfer-serve", "model.ninfer", "--no-thinking", "--reasoning-effort", "low"}); }
+    catch (const std::invalid_argument&) { effort_without_thinking = true; }
+    failures += check(effort_without_thinking, "--reasoning-effort with --no-thinking was accepted");
+
     failures +=
         check(serve_usage_text("ninfer-serve").find("--no-prefix-reuse") != std::string::npos,
               "serve help omits --no-prefix-reuse");

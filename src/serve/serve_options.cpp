@@ -125,7 +125,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--ram-kv-window N] [--ram-kv-budget-bytes N] "
            "[--default-max-tokens N] [--max-output-tokens N] "
            "[--vision] [--vision-device gpu|cpu] [--vision-max-tokens N] [--no-cuda-graph] [--no-prefix-reuse] "
-           "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
+           "[--lm-head-draft] [--no-thinking] [--reasoning-effort low|medium|xhigh] "
+           "[--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
@@ -160,6 +161,8 @@ std::string serve_usage_text(const char* argv0) {
            "       (up to 2 GiB active state RAM); historical branches also retain exact host KV\n"
            "       under the token budget plus a separate 2 GiB archived state cap. Suffixes are recomputed.\n"
            "       Vision/DFlash/RAM-KV retain frontier and turn/response checkpoint reuse.\n"
+           "       --reasoning-effort sets the effort of thinking requests that omit one "
+           "(default: chat template's)\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
@@ -370,6 +373,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--no-thinking") {
             options.enable_thinking = false;
+        } else if (arg == "--reasoning-effort") {
+            const std::string selected = require_value("--reasoning-effort");
+            if (selected == "low") { options.reasoning_effort = ReasoningEffort::Low; }
+            else if (selected == "medium") { options.reasoning_effort = ReasoningEffort::Medium; }
+            else if (selected == "xhigh") { options.reasoning_effort = ReasoningEffort::XHigh; }
+            else { throw std::invalid_argument("--reasoning-effort must be low, medium or xhigh"); }
         } else if (arg == "--preserve-thinking") {
             options.preserve_thinking = true;
         } else if (arg == "--cors") {
@@ -450,6 +459,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.speculative.backend == SpeculativeBackend::DFlash && options.enable_vision) {
         throw std::invalid_argument("--spec dflash cannot be combined with --vision");
+    }
+    if (!options.enable_thinking && options.reasoning_effort) {
+        throw std::invalid_argument("--reasoning-effort cannot be combined with --no-thinking");
     }
     if (default_max_tokens_explicit) {
         if (options.default_max_tokens <= 0) {

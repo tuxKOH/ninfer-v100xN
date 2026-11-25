@@ -377,6 +377,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         limits.default_max_tokens = options_.default_max_tokens;
         limits.max_output_tokens = options_.max_output_tokens;
         request                   = parse_chat_completion_request(body, limits);
+        restore_schema_order(request.structured_output, req.body,
+                             {"response_format", "json_schema", "schema"});
         if (request.model != public_model_id_) {
             ApiError error;
             error.status  = 404;

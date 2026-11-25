@@ -1,13 +1,16 @@
 #include "serve/openai_schema.h"
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <initializer_list>
 #include <limits>
 #include <random>
 #include <string>
+#include <string_view>
 
 namespace ninfer::serve {
 namespace {
@@ -449,17 +452,14 @@ void reject_unsupported_features(const Json& body) {
             throw ApiException(std::move(error));
         }
     }
-    if (body.contains("response_format") && !body.at("response_format").is_null()) {
-        const Json& fmt  = body.at("response_format");
-        std::string type = fmt.is_object() && fmt.contains("type") && fmt.at("type").is_string()
-                               ? fmt.at("type").get<std::string>()
-                               : std::string();
-        if (type != "text") {
-            ApiError error;
-            error.message = "only response_format {type:text} is supported";
-            error.param   = "response_format";
-            error.code    = "response_format_not_supported";
-            throw ApiException(std::move(error));
+}
+
+void require_known_keys(const Json& object, std::initializer_list<std::string_view> known,
+                        const std::string& param) {
+    for (auto it = object.begin(); it != object.end(); ++it) {
+        if (std::find(known.begin(), known.end(), it.key()) == known.end()) {
+            bad_request(param + "." + it.key() + " is not supported", param,
+                        "response_format_not_supported");
         }
     }
 }
@@ -539,6 +539,52 @@ void parse_openai_reasoning_effort(const Json& body, GenerationRequest& out) {
     out.reasoning_effort_param = "reasoning_effort";
 }
 
+std::optional<ninfer::StructuredOutput>
+parse_structured_output_format(const Json& format, const std::string& param,
+                               bool nested_definition) {
+    if (!format.is_object() || !format.contains("type") || !format.at("type").is_string()) {
+        bad_request(param + " must be an object with a string type", param);
+    }
+    const std::string type = format.at("type").get<std::string>();
+    if (type == "text" || type == "json_object") {
+        require_known_keys(format, {"type"}, param);
+        if (type == "text") { return std::nullopt; }
+        return ninfer::StructuredOutput{.kind = ninfer::StructuredOutputKind::JsonObject};
+    }
+    if (type != "json_schema") {
+        bad_request("unsupported " + param + " type: " + type, param,
+                    "response_format_not_supported");
+    }
+    const Json* definition = &format;
+    std::string definition_param = param;
+    if (nested_definition) {
+        require_known_keys(format, {"type", "json_schema"}, param);
+        if (!format.contains("json_schema") || !format.at("json_schema").is_object()) {
+            bad_request(param + ".json_schema must be an object", param);
+        }
+        definition       = &format.at("json_schema");
+        definition_param = param + ".json_schema";
+        require_known_keys(*definition, {"name", "schema", "strict", "description"},
+                           definition_param);
+    } else {
+        require_known_keys(format, {"type", "name", "schema", "strict", "description"}, param);
+    }
+    if (!definition->contains("schema") || !definition->at("schema").is_object()) {
+        bad_request(definition_param + ".schema must be a JSON Schema object", param);
+    }
+    return ninfer::StructuredOutput{.kind        = ninfer::StructuredOutputKind::JsonSchema,
+                                    .json_schema = definition->at("schema").dump()};
+}
+
+void restore_schema_order(std::optional<ninfer::StructuredOutput>& output, const std::string& body,
+                          std::initializer_list<const char*> schema_path) {
+    if (!output || output->kind != ninfer::StructuredOutputKind::JsonSchema) { return; }
+    const nlohmann::ordered_json document = nlohmann::ordered_json::parse(body);
+    const nlohmann::ordered_json* schema  = &document;
+    for (const char* key : schema_path) { schema = &schema->at(key); }
+    output->json_schema = schema->dump();
+}
+
 GenerationRequest parse_chat_completion_request(const Json& body, const RequestLimits& limits) {
     require_object(body);
     reject_unsupported_features(body);
@@ -555,6 +601,10 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
     parse_messages(body, out);
     parse_stop(body, out);
     parse_sampling(body, out);
+    if (body.contains("response_format") && !body.at("response_format").is_null()) {
+        out.structured_output =
+            parse_structured_output_format(body.at("response_format"), "response_format", true);
+    }
 
     out.stream = get_bool(body, "stream", false);
     if (body.contains("stream_options") && body.at("stream_options").is_object()) {

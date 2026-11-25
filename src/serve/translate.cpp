@@ -109,7 +109,10 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
         .reasoning_effort  = std::nullopt,
         .preserve_thinking = request.preserve_thinking.value_or(server.preserve_thinking),
     };
-    if (!request.reasoning_effort) { return result; }
+    if (!request.reasoning_effort) {
+        if (result.enable_thinking) { result.reasoning_effort = server.reasoning_effort; }
+        return result;
+    }
 
     const RequestedReasoningEffort requested = *request.reasoning_effort;
     const bool enables_thinking              = requested != RequestedReasoningEffort::None;
@@ -238,6 +241,7 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     ninfer::RequestOptions options;
     options.execution.requested_output_tokens = static_cast<std::uint32_t>(request.max_tokens);
     options.execution.allow_prefix_reuse      = server.allow_prefix_reuse;
+    options.execution.structured_output       = request.structured_output;
     options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
     options.output.raw                     = false;
     options.output.preserve_special_tokens = request.uses_tools() || request.has_tool_history();
